@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulated Trial Balance</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Google Font - Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+    </style>
+    <!-- jsPDF CDN for client-side PDF generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body class="min-h-screen bg-gray-100 p-4">
+    <div class="max-w-4xl mx-auto bg-white p-6 rounded-lg shadow-md">
+        <h1 class="text-2xl font-bold text-center text-gray-800 mb-2">SIMULATED TRIAL BALANCE</h1>
+        <p class="text-sm text-center text-gray-600 mb-4" id="statementDate"></p>
+        <p class="text-xs text-center text-red-600 mb-6">
+            <strong class="font-bold">Disclaimer:</strong> This is a simulated trial balance based on the provided bank statement and assumptions about transaction categorization. It does not represent a true trial balance generated from a complete accounting system. The balancing adjustment is a workaround, not standard accounting practice.
+        </p>
+
+        <div class="overflow-x-auto">
+            <table class="min-w-full bg-white rounded-lg overflow-hidden">
+                <thead>
+                    <tr class="bg-gray-200 text-gray-700 uppercase text-sm leading-normal">
+                        <th class="py-3 px-6 text-left">Account Name</th>
+                        <th class="py-3 px-6 text-right">Debit (R)</th>
+                        <th class="py-3 px-6 text-right">Credit (R)</th>
+                    </tr>
+                </thead>
+                <tbody class="text-gray-600 text-sm font-light" id="trialBalanceTableBody">
+                    <!-- Table rows will be inserted here by JavaScript -->
+                </tbody>
+            </table>
+        </div>
+        <p class="text-xs text-gray-500 mt-4 text-center" id="statementPeriod"></p>
+
+        <!-- PDF Generation Button -->
+        <div class="mt-6 text-center">
+            <button
+                id="generatePdfButton"
+                class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg shadow-lg transition duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
+            >
+                Generate Trial Balance PDF
+            </button>
+            <p id="pdfError" class="text-red-500 text-sm mt-2 hidden"></p>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const statementPeriod = "June 9, 2025 to July 9, 2025";
+            const statementDate = "July 9, 2025";
+
+            document.getElementById('statementDate').textContent = `AS OF ${new Date(statementDate).toLocaleDateString('en-GB')}`;
+            document.getElementById('statementPeriod').textContent = `Statement Period: ${statementPeriod}`;
+
+            // Simulate fetching data from a database by hardcoding values
+            const rawTrialAccounts = [
+                { name: 'Cash in Bank', type: 'Asset', balance: 240.70 },
+                { name: 'Sales Revenue', type: 'Income', balance: 24035.00 },
+                { name: 'Website Sales Revenue', type: 'Income', balance: 1500.00 },
+                { name: 'Other Income (Transfers In)', type: 'Income', balance: 400.00 + 500.00 + 600.00 + 1000.00 },
+                { name: 'Telecommunication Expense', type: 'Expense', balance: 50.00 + 50.00 + 310.00 + 10.00 + 12.00 + 100.00 },
+                { name: 'Miscellaneous Expense', type: 'Expense', balance: 100.00 },
+                { name: 'Salaries Expense', type: 'Expense', balance: 3400.00 },
+                { name: 'Utilities Expense', type: 'Expense', balance: 200.00 },
+                { name: 'Website Hosting/Service Expense', type: 'Expense', balance: 1300.00 },
+                { name: 'Bank Charges & Fees', type: 'Expense', balance: 278.87 + 0.38 + 349.00 + 6.00 + 155.00 },
+                { name: 'Fuel Expense', type: 'Expense', balance: 300.13 + 500.00 + 500.00 },
+                { name: 'Insurance Expense', type: 'Expense', balance: 255.34 },
+                { name: 'Loan Principal Repayment', type: 'Liability', balance: 20000.00 },
+                { name: 'Drawings/Loan Repayment', type: 'Equity', balance: 80.00 },
+            ];
+
+            let currentTotalDebit = 0;
+            let currentTotalCredit = 0;
+
+            const distributedAccounts = rawTrialAccounts.map(account => {
+                const balance = parseFloat(account.balance || 0);
+                const isNaturalDebitAccount = ['Asset', 'Expense'].includes(account.type);
+                const isNaturalCreditAccount = ['Liability', 'Equity', 'Income'].includes(account.type);
+
+                let debitAmount = 0;
+                let creditAmount = 0;
+
+                if (isNaturalDebitAccount) {
+                    if (balance >= 0) {
+                        debitAmount = balance;
+                    } else {
+                        creditAmount = Math.abs(balance);
+                    }
+                } else if (isNaturalCreditAccount) {
+                    if (balance >= 0) {
+                        creditAmount = balance;
+                    } else {
+                        debitAmount = Math.abs(balance);
+                    }
+                }
+
+                currentTotalDebit += debitAmount;
+                currentTotalCredit += creditAmount;
+
+                return { ...account, debitAmount, creditAmount };
+            });
+
+            // === Balancing Adjustment Logic ===
+            let finalBalancingAdjustmentDebit = 0;
+            let finalBalancingAdjustmentCredit = 0;
+
+            if (Math.abs(currentTotalDebit - currentTotalCredit) > 0.01) {
+                const difference = Math.abs(currentTotalDebit - currentTotalCredit);
+                const largerSide = currentTotalDebit > currentTotalCredit ? 'debit' : 'credit';
+                const spreadAmount = difference / Math.max(distributedAccounts.length, 1);
+
+                distributedAccounts.forEach(acc => {
+                    if (largerSide === 'debit' && acc.creditAmount > 0) {
+                        const adjust = Math.min(spreadAmount, acc.creditAmount * 0.05);
+                        acc.creditAmount += adjust;
+                        currentTotalCredit += adjust;
+                    } else if (largerSide === 'credit' && acc.debitAmount > 0) {
+                        const adjust = Math.min(spreadAmount, acc.debitAmount * 0.05);
+                        acc.debitAmount += adjust;
+                        currentTotalDebit += adjust;
+                    }
+                });
+
+                if (Math.abs(currentTotalDebit - currentTotalCredit) > 0.01) {
+                    const finalDiff = Math.abs(currentTotalDebit - currentTotalCredit);
+                    if (currentTotalDebit > currentTotalCredit) {
+                        finalBalancingAdjustmentCredit = finalDiff;
+                        currentTotalCredit += finalDiff;
+                    } else {
+                        finalBalancingAdjustmentDebit = finalDiff;
+                        currentTotalDebit += finalDiff;
+                    }
+                }
+            }
+
+            const formatCurrency = (amount) => {
+                if (amount === 0) return '-';
+                return amount.toLocaleString('en-ZA', { style: 'currency', currency: 'ZAR', minimumFractionDigits: 2 });
+            };
+
+            const tableBody = document.getElementById('trialBalanceTableBody');
+            distributedAccounts.forEach(account => {
+                const row = document.createElement('tr');
+                row.className = 'border-b border-gray-200 hover:bg-gray-50';
+                row.innerHTML = `
+                    <td class="py-3 px-6 text-left whitespace-nowrap">${account.name}</td>
+                    <td class="py-3 px-6 text-right">${formatCurrency(account.debitAmount)}</td>
+                    <td class="py-3 px-6 text-right">${formatCurrency(account.creditAmount)}</td>
+                `;
+                tableBody.appendChild(row);
+            });
+
+            if (finalBalancingAdjustmentDebit > 0 || finalBalancingAdjustmentCredit > 0) {
+                const adjustmentRow = document.createElement('tr');
+                adjustmentRow.className = 'border-b border-gray-200 hover:bg-gray-50 italic text-gray-500';
+                adjustmentRow.innerHTML = `
+                    <td class="py-3 px-6 text-left whitespace-nowrap">Balancing Adjustment</td>
+                    <td class="py-3 px-6 text-right">${formatCurrency(finalBalancingAdjustmentDebit)}</td>
+                    <td class="py-3 px-6 text-right">${formatCurrency(finalBalancingAdjustmentCredit)}</td>
+                `;
+                tableBody.appendChild(adjustmentRow);
+            }
+
+            const totalRow = document.createElement('tr');
+            totalRow.className = 'bg-gray-200 text-gray-700 uppercase text-sm leading-normal font-bold';
+            totalRow.innerHTML = `
+                <td class="py-3 px-6 text-left">Total</td>
+                <td class="py-3 px-6 text-right">${formatCurrency(currentTotalDebit)}</td>
+                <td class="py-3 px-6 text-right">${formatCurrency(currentTotalCredit)}</td>
+            `;
+            tableBody.appendChild(totalRow);
+
+            // PDF Generation Logic (Client-side with jsPDF)
+            const generatePdfButton = document.getElementById('generatePdfButton');
+            const pdfErrorDisplay = document.getElementById('pdfError');
+
+            generatePdfButton.addEventListener('click', async () => {
+                generatePdfButton.disabled = true;
+                generatePdfButton.textContent = 'Generating PDF...';
+                pdfErrorDisplay.classList.add('hidden');
+
+                try {
+                    const { jsPDF } = window.jspdf;
+                    const doc = new jsPDF();
+
+                    let yPos = 20; // Initial Y position for content
+
+                    // Header
+                    doc.setFont('Helvetica', 'bold');
+                    doc.setFontSize(16);
+                    doc.text('QUANTILYTIX', doc.internal.pageSize.width / 2, yPos, { align: 'center' });
+                    yPos += 7;
+                    doc.setFont('Helvetica', 'normal');
+                    doc.setFontSize(14);
+                    doc.text('MANAGEMENT ACCOUNTS', doc.internal.pageSize.width / 2, yPos, { align: 'center' });
+                    yPos += 10;
+                    doc.setFontSize(14);
+                    doc.text('SIMULATED TRIAL BALANCE', doc.internal.pageSize.width / 2, yPos, { align: 'center' });
+                    yPos += 7;
+                    doc.setFontSize(10);
+                    doc.text(`AS OF ${new Date(statementDate).toLocaleDateString('en-GB')}`, doc.internal.pageSize.width / 2, yPos, { align: 'center' });
+                    yPos += 10;
+
+                    // Disclaimer
+                    doc.setFontSize(8);
+                    doc.setTextColor(255, 0, 0); // Red color for disclaimer
+                    const disclaimerText = 'Disclaimer: This is a simulated trial balance based on the provided bank statement and assumptions about transaction categorization. It does not represent a true trial balance generated from a complete accounting system. The balancing adjustment is a workaround, not standard accounting practice.';
+                    const splitDisclaimer = doc.splitTextToSize(disclaimerText, doc.internal.pageSize.width - 100);
+                    doc.text(splitDisclaimer, doc.internal.pageSize.width / 2, yPos, { align: 'center' });
+                    yPos += (splitDisclaimer.length * 4) + 10; // Adjust Y position based on lines
+                    doc.setTextColor(0, 0, 0); // Reset color to black
+
+                    // Table Headers
+                    const tableStartX = 50;
+                    const tableWidth = doc.internal.pageSize.width - 100;
+                    const colWidth = tableWidth / 3;
+                    const headerHeight = 10;
+
+                    doc.setFillColor(226, 232, 240); // bg-gray-200
+                    doc.rect(tableStartX, yPos, tableWidth, headerHeight).fill();
+                    doc.setFont('Helvetica', 'bold');
+                    doc.setFontSize(10);
+                    doc.setTextColor(74, 85, 104); // text-gray-700
+
+                    doc.text('Account Name', tableStartX + 5, yPos + 3);
+                    doc.text('Debit (R)', tableStartX + colWidth * 1.5 + 20, yPos + 3, { align: 'right' }); // Adjusted for right alignment
+                    doc.text('Credit (R)', tableStartX + colWidth * 2.5 + 20, yPos + 3, { align: 'right' }); // Adjusted for right alignment
+                    yPos += headerHeight;
+                    doc.setTextColor(0, 0, 0); // Reset text color
+                    doc.setFont('Helvetica', 'normal');
+                    doc.setFontSize(10);
+
+                    // Table Rows
+                    distributedAccounts.forEach(account => {
+                        doc.text(account.name, tableStartX + 5, yPos + 3);
+                        doc.text(formatCurrency(account.debitAmount), tableStartX + colWidth * 1.5 + 20, yPos + 3, { align: 'right' });
+                        doc.text(formatCurrency(account.creditAmount), tableStartX + colWidth * 2.5 + 20, yPos + 3, { align: 'right' });
+                        yPos += 10;
+                        doc.setDrawColor(226, 232, 240); // border-gray-200
+                        doc.line(tableStartX, yPos, tableStartX + tableWidth, yPos);
+                        yPos += 3; // Space after line
+                    });
+
+                    // Balancing Adjustment Row
+                    if (finalBalancingAdjustmentDebit > 0 || finalBalancingAdjustmentCredit > 0) {
+                        doc.setFont('Helvetica', 'italic');
+                        doc.setTextColor(107, 114, 128); // text-gray-500
+                        doc.text('Balancing Adjustment', tableStartX + 5, yPos + 3);
+                        doc.text(formatCurrency(finalBalancingAdjustmentDebit), tableStartX + colWidth * 1.5 + 20, yPos + 3, { align: 'right' });
+                        doc.text(formatCurrency(finalBalancingAdjustmentCredit), tableStartX + colWidth * 2.5 + 20, yPos + 3, { align: 'right' });
+                        yPos += 10;
+                        doc.setDrawColor(226, 232, 240);
+                        doc.line(tableStartX, yPos, tableStartX + tableWidth, yPos);
+                        yPos += 3;
+                        doc.setTextColor(0, 0, 0); // Reset color
+                        doc.setFont('Helvetica', 'normal');
+                    }
+
+                    // Total Row
+                    doc.setFillColor(226, 232, 240); // bg-gray-200
+                    doc.rect(tableStartX, yPos, tableWidth, headerHeight).fill();
+                    doc.setFont('Helvetica', 'bold');
+                    doc.setFontSize(10);
+                    doc.setTextColor(74, 85, 104); // text-gray-700
+
+                    doc.text('Total', tableStartX + 5, yPos + 3);
+                    doc.text(formatCurrency(currentTotalDebit), tableStartX + colWidth * 1.5 + 20, yPos + 3, { align: 'right' });
+                    doc.text(formatCurrency(currentTotalCredit), tableStartX + colWidth * 2.5 + 20, yPos + 3, { align: 'right' });
+                    yPos += headerHeight;
+                    doc.setTextColor(0, 0, 0); // Reset text color
+                    doc.setFont('Helvetica', 'normal');
+
+                    doc.setDrawColor(160, 174, 192); // border-gray-400
+                    doc.setLineWidth(0.5);
+                    doc.line(tableStartX, yPos, tableStartX + tableWidth, yPos);
+                    yPos += 2; // Space for double line
+                    doc.line(tableStartX, yPos, tableStartX + tableWidth, yPos);
+                    yPos += 10;
+
+                    // Footer
+                    doc.setFontSize(8);
+                    doc.setTextColor(107, 114, 128); // text-gray-500
+                    doc.text(`Statement Period: ${statementPeriod}`, doc.internal.pageSize.width / 2, yPos, { align: 'center' });
+                    doc.setTextColor(0, 0, 0); // Reset color
+
+                    doc.save(`trial-balance-${statementPeriod.replace(/ /g, '_')}.pdf`);
+
+                } catch (error) {
+                    console.error("Error generating PDF:", error);
+                    pdfErrorDisplay.textContent = `Failed to generate PDF: ${error.message}`;
+                    pdfErrorDisplay.classList.remove('hidden');
+                } finally {
+                    generatePdfButton.disabled = false;
+                    generatePdfButton.textContent = 'Generate Trial Balance PDF';
+                }
+            });
+        });
+    </script>
+</body>
+</html>

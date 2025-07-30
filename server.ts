@@ -1,0 +1,5592 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
+
+import cors from 'cors';
+import { Pool } from 'pg';
+import multer from 'multer';
+import nodemailer from 'nodemailer';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { v4 as uuidv4 } from 'uuid';
+
+import express, { Request, Response, NextFunction } from 'express';
+
+const app = express();
+const PORT = 3000;
+const PDFDocument = require('pdfkit');
+
+app.use(cors({
+  origin: '*',
+}));
+app.use(express.json());
+
+const pool = new Pool({
+  connectionString:
+    "postgresql://qbeta_db:AWfyl8R0jJLUaZtwKtoOtzX3kfMXhZS8@dpg-d22i2sbe5dus739mklbg-a.oregon-postgres.render.com/qbeta_db",
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
+
+pool.connect((err, client, release) => {
+    if (err) {
+        return console.error('Error acquiring client', err.stack);
+    }
+    if (client) {
+        client.query('SELECT NOW()', (queryErr, result) => {
+            release();
+            if (queryErr) {
+                return console.error('Error executing query', queryErr.stack);
+            }
+            console.log('Connected to PostgreSQL database:', result.rows[0].now);
+        });
+    } else {
+        release();
+        console.error('Client is undefined after successful pool.connect');
+    }
+});
+
+// Extend the Request interface to include the user property
+
+declare global {
+  namespace Express {
+    interface Request {
+      user?: {
+        user_id: string;
+      };
+    }
+  }
+}
+
+// AUTHENTICATION MIDDLEWARE (on your backend server)
+const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  console.log('--- Inside authMiddleware ---');
+  console.log('Request Headers:', req.headers); // Log all headers
+  const authHeader = req.headers.authorization;
+  console.log('Authorization Header:', authHeader); // Log the Authorization header directly
+
+  const token = authHeader?.split(' ')[1];
+  console.log('Extracted Token:', token ? token.substring(0, 10) + '...' : 'No token extracted'); // Log first 10 chars of token for brevity
+
+  const secret = process.env.JWT_SECRET;
+  console.log('JWT_SECRET (first 5 chars):', secret ? secret.substring(0, 5) + '...' : 'NOT DEFINED'); // Log part of secret
+
+  if (!secret) {
+    console.error('❌ JWT_SECRET not defined in .env');
+    return res.status(500).json({ error: 'Server misconfiguration' });
+  }
+
+  if (!token) {
+    console.warn('Authentication Failed: No token provided in header.');
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, secret);
+    console.log('Token Decoded Successfully:', decoded);
+    req.user = decoded as { user_id: string };
+    next();
+  } catch (err) {
+    console.error('Authentication Failed: Invalid token', err);
+    return res.status(403).json({ error: 'Invalid token' });
+  }
+};
+
+// Configure Nodemailer transporter with OAuth2
+const transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_SERVICE_HOST,
+    port: Number(process.env.EMAIL_SERVICE_PORT),
+    secure: Number(process.env.EMAIL_SERVICE_PORT) === 465, // true for 465 (SSL/TLS)
+    auth: {
+        user: process.env.EMAIL_SERVICE_USER,
+        pass: process.env.EMAIL_SERVICE_PASS, // <--- Use the App Password here
+    },
+});
+
+// Optional: Verify transporter connection (good for debugging)
+transporter.verify(function (error, success) {
+    if (error) {
+        console.error("Nodemailer transporter verification failed:", error);
+    } else {
+        console.log("Nodemailer transporter is ready to send messages.");
+    }
+});
+
+// --- Generic Email Sending Function ---
+interface EmailOptions {
+  to: string;
+  subject: string;
+  text?: string;
+  html?: string;
+  attachments?: nodemailer.SendMailOptions['attachments'];
+}
+
+async function sendEmail(options: EmailOptions) {
+  try {
+    const info = await transporter.sendMail({
+      from: `"${process.env.APP_NAME || 'Your Company'}" <${process.env.EMAIL_SERVICE_USER}>`,
+      to: options.to,
+      subject: options.subject,
+      text: options.text,
+      html: options.html,
+      attachments: options.attachments,
+    });
+    console.log('Email sent successfully! Message ID: %s', info.messageId);
+    return true; // Indicate success
+  } catch (error) {
+    console.error('Failed to send email:', error);
+    if (error instanceof Error) {
+        console.error('Error name:', error.name);
+        console.error('Error message:', error.message);
+        // @ts-ignore // Nodemailer specific properties
+        if (error.responseCode) console.error('Response Code:', error.responseCode);
+        // @ts-ignore
+        if (error.response) console.error('Response:', error.response);
+    }
+    return false; // Indicate failure
+  }
+}
+
+
+
+const upload = multer({ storage: multer.memoryStorage() }); // Use memory storage for file uploads
+
+/* --- Type Definitions (Minimal, but necessary for ts-node) --- */
+/* Placing them here ensures they are available before the routes use them */
+
+interface SupplierDB { // Represents how data comes from the DB (public.suppliers table)
+    id: number;
+    name: string;
+    email: string | null;
+    phone: string | null;
+    address: string | null;
+    vat_number: string | null; // Matches DB column name
+    total_purchased: number; // Matches DB column name, NOT NULL with default 0.00
+    created_at?: Date;
+    updated_at?: Date;
+}
+
+// Utility function to map DB schema to frontend interface
+const mapSupplierToFrontend = (supplier: SupplierDB) => ({
+    id: supplier.id.toString(), // Convert number ID to string for React
+    name: supplier.name,
+    email: supplier.email || '', // Ensure it's a string, not null
+    phone: supplier.phone || '',
+    address: supplier.address || '',
+    vatNumber: supplier.vat_number || '', // Map snake_case to camelCase
+    totalPurchased: supplier.total_purchased, // Map snake_case to camelCase
+});
+// Add these interfaces and the mapping function near your SupplierDB and mapSupplierToFrontend
+
+// Interface matching the public.products_services table structure
+interface ProductDB {
+    id: number;
+    name: string;
+    description: string | null;
+    unit_price: number; // From DB
+    cost_price: number | null;
+    sku: string | null;
+    is_service: boolean;
+    stock_quantity: number; // From DB
+    created_at: Date;
+    updated_at: Date;
+    tax_rate_id: number | null; // Foreign key
+    category: string | null;
+    unit: string | null;
+    // Potentially include the tax rate itself from the joined table
+    tax_rate_value?: number; // The actual rate (e.g., 0.15) from tax_rates table
+}
+
+// Interface for what the frontend expects (camelCase)
+interface ProductFrontend {
+    id: string; // React often prefers string IDs
+    name: string;
+    description: string; // Frontend might expect string, even if DB has null
+    price: number;
+    costPrice?: number; // Optional for frontend if not always displayed
+    sku?: string; // Optional for frontend
+    isService: boolean; // camelCase
+    stock: number; // camelCase
+    vatRate: number; // Actual percentage (e.g., 0.15)
+    category: string;
+    unit: string;
+}
+
+// Interface for what the frontend sends when creating/updating a product
+// Note: id and totalPurchased (if any, though not for products) are excluded.
+// vatRate is the *value*, not the ID.
+interface CreateUpdateProductBody {
+    name: string;
+    description?: string;
+    price: number; // Corresponds to unit_price
+    costPrice?: number;
+    sku?: string;
+    isService?: boolean;
+    stock?: number; // Corresponds to stock_quantity
+    vatRate?: number; // The actual tax rate value (e.g., 0.15)
+    category?: string;
+    unit?: string;
+}
+
+// Helper function to map database product object to frontend product object
+const mapProductToFrontend = (product: ProductDB): ProductFrontend => ({
+    id: product.id.toString(),
+    name: product.name,
+    description: product.description || '', // Ensure it's a string for frontend
+    price: Number(product.unit_price), // Convert numeric to number
+    costPrice: product.cost_price ? Number(product.cost_price) : undefined,
+    sku: product.sku || undefined,
+    isService: product.is_service,
+    stock: Number(product.stock_quantity), // Convert numeric to number
+    vatRate: product.tax_rate_value !== undefined && product.tax_rate_value !== null ? Number(product.tax_rate_value) : 0, // Default to 0 if null/undefined
+    category: product.category || '',
+    unit: product.unit || '',
+});
+interface CustomerDB {
+    id: number;
+    name: string;
+    contact_person: string | null;
+    email: string | null;
+    phone: string | null;
+    address: string | null;
+    tax_id: string | null; // Matches DB column name
+    total_invoiced: number; // Matches DB column name
+    created_at?: Date;
+    updated_at?: Date;
+}
+
+// Interface for what the frontend expects (camelCase)
+interface CustomerFrontend {
+    id: string; // React often prefers string IDs
+    name: string;
+    email: string;
+    phone: string;
+    address: string;
+    vatNumber: string; // camelCase, maps to tax_id
+    totalInvoiced: number; // camelCase, maps to total_invoiced
+}
+
+// Interface for what the frontend sends when creating/updating a customer
+// contactPerson and vatNumber are camelCase for frontend consistency
+interface CreateUpdateCustomerBody {
+    name: string;
+    contactPerson?: string; // Maps to contact_person
+    email?: string;
+    phone?: string;
+    address?: string;
+    vatNumber?: string; // Maps to tax_id
+}
+
+// Helper function to map database customer object to frontend customer object
+const mapCustomerToFrontend = (customer: CustomerDB): CustomerFrontend => ({
+    id: customer.id.toString(), // Convert number ID to string
+    name: customer.name,
+    email: customer.email || '',
+    phone: customer.phone || '',
+    address: customer.address || '',
+    vatNumber: customer.tax_id || '', // Map tax_id to vatNumber
+    totalInvoiced: Number(customer.total_invoiced), // Ensure it's a number
+});
+ export interface ProductService {
+  id: string;
+  name: string;
+  description: string;
+  price: number; // This is 'price' (number) from ProductFrontend, not 'unit_price' (string) from DB
+  costPrice?: number;
+  sku?: string;
+  isService: boolean;
+  stock: number;
+  vatRate: number; // Decimal (e.g., 0.15)
+  category: string;
+  unit: string;
+}
+
+
+
+app.post('/register', async (req: Request, res: Response) => {
+  const { name, email, password } = req.body;
+
+  if (!name || !email || !password)
+    return res.status(400).json({ error: 'Missing name, email, or password' });
+
+  const user_id = uuidv4();
+  const password_hash = await bcrypt.hash(password, 10);
+
+  try {
+    await pool.query(`
+      INSERT INTO public.users (name, email, user_id, password_hash)
+      VALUES ($1, $2, $3, $4)
+    `, [name, email, user_id, password_hash]);
+
+    res.status(201).json({ message: 'User registered' });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+
+app.post('/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body;
+
+  try {
+const result = await pool.query('SELECT * FROM public.users WHERE email = $1', [email]);
+const user = result.rows[0];
+
+const hash = typeof user?.password_hash === 'string' ? user.password_hash : user?.password_hash?.toString();
+
+if (!user || !hash || !(await bcrypt.compare(password, hash))) {
+  return res.status(401).json({ error: 'Invalid credentials' });
+}
+
+
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+      console.error('❌ JWT_SECRET not defined in .env');
+      return res.status(500).json({ error: 'Server misconfiguration' });
+    }
+
+    const token = jwt.sign({ user_id: user.user_id }, secret, { expiresIn: '7d' });
+    res.json({ token });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+
+// Generic PDF generation endpoint for invoices and statements
+app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
+    const { documentType, id } = req.params;
+    const { startDate, endDate } = req.query;
+    const user_id = req.user!.user_id;
+
+    const doc = new PDFDocument({ margin: 50 });
+
+    try {
+        switch (documentType) {
+            case 'invoices':
+            case 'invoice': {
+                const invoiceQueryResult = await pool.query(
+                    `SELECT
+                        i.*,
+                        c.name AS customer_name,
+                        c.email AS customer_email
+                    FROM invoices i
+                    JOIN customers c ON i.customer_id = c.id
+                    WHERE i.id = $1 AND i.user_id = $2`,
+                    [id, user_id]
+                );
+
+                if (invoiceQueryResult.rows.length === 0) {
+                    res.status(404).json({ error: 'Invoice not found' });
+                    doc.end();
+                    return;
+                }
+
+                const invoice = invoiceQueryResult.rows[0];
+
+                res.setHeader('Content-Type', 'application/pdf');
+                res.setHeader('Content-Disposition', `attachment; filename="invoice_${invoice.invoice_number}.pdf"`);
+
+                doc.pipe(res);
+
+                // Fetch line items
+                const lineItemsResult = await pool.query(
+                    `SELECT
+                        li.*,
+                        ps.name AS product_service_name
+                    FROM invoice_line_items li
+                    LEFT JOIN products_services ps ON li.product_service_id = ps.id
+                    WHERE li.invoice_id = $1
+                    ORDER BY li.created_at`,
+                    [id]
+                );
+                invoice.line_items = lineItemsResult.rows;
+
+                // --- PDF Content Generation for Invoice ---
+                doc.fontSize(24).font('Helvetica-Bold').text('Invoice', { align: 'center' });
+                doc.moveDown(1.5);
+
+                doc.fontSize(12).font('Helvetica-Bold').text('Invoice Details:', { underline: true });
+                doc.font('Helvetica')
+                    .text(`Invoice Number: ${invoice.invoice_number}`)
+                    .text(`Customer: ${invoice.customer_name}`)
+                    .text(`Invoice Date: ${new Date(invoice.invoice_date).toLocaleDateString('en-GB')}`)
+                    .text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-GB')}`);
+                doc.moveDown(1.5);
+
+                doc.fontSize(14).font('Helvetica-Bold').text('Line Items:', { underline: true });
+                doc.moveDown(0.5);
+
+                // Table Headers
+                const tableTop = doc.y;
+                const col1X = 50;
+                const col2X = 250;
+                const col3X = 300;
+                const col4X = 400;
+                const col5X = 470;
+
+                doc.fontSize(10)
+                    .font('Helvetica-Bold')
+                    .text('Description', col1X, tableTop)
+                    .text('Qty', col2X, tableTop)
+                    .text('Unit Price', col3X, tableTop, { width: 70, align: 'right' })
+                    .text('Tax Rate', col4X, tableTop, { width: 60, align: 'right' })
+                    .text('Line Total', col5X, tableTop, { width: 70, align: 'right' });
+
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+
+                let yPos = tableTop + 25;
+
+                // Line Items Table Rows
+                invoice.line_items.forEach((item: any) => {
+                    if (yPos + 20 > doc.page.height - doc.page.margins.bottom) {
+                        doc.addPage();
+                        yPos = doc.page.margins.top;
+                        doc.fontSize(10)
+                            .font('Helvetica-Bold')
+                            .text('Description', col1X, yPos)
+                            .text('Qty', col2X, yPos)
+                            .text('Unit Price', col3X, yPos, { width: 70, align: 'right' })
+                            .text('Tax Rate', col4X, yPos, { width: 60, align: 'right' })
+                            .text('Line Total', col5X, yPos, { width: 70, align: 'right' });
+                        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos + 15).lineTo(550, yPos + 15).stroke();
+                        yPos += 25;
+                    }
+
+                    doc.fontSize(10).font('Helvetica')
+                        .text(item.description, col1X, yPos, { width: 190 })
+                        .text(item.quantity.toString(), col2X, yPos, { width: 40, align: 'right' })
+                        .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, yPos, { width: 70, align: 'right' })
+                        .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, yPos, { width: 60, align: 'right' })
+                        .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, yPos, { width: 70, align: 'right' });
+                    yPos += 20;
+                });
+
+                doc.moveDown();
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos).lineTo(550, yPos).stroke();
+
+                yPos += 10;
+                doc.fontSize(14).font('Helvetica-Bold')
+                    .text(`Total Amount: ${invoice.currency} ${(parseFloat(invoice.total_amount)).toFixed(2)}`, col1X, yPos, { align: 'right', width: 500 });
+
+                if (invoice.notes) {
+                    doc.moveDown(1.5);
+                    doc.fontSize(10).font('Helvetica-Oblique').text(`Notes: ${invoice.notes}`);
+                }
+
+                doc.end();
+                return;
+            }
+
+            case 'statement': {
+                res.setHeader('Content-Type', 'application/pdf');
+                doc.pipe(res);
+                doc.text('Statement generation not fully implemented in this example.', { align: 'center' });
+                doc.end();
+                return;
+            }
+
+            default:
+                res.status(400).json({ error: 'Document type not supported.' });
+                doc.end();
+                return;
+        }
+
+    } catch (error: unknown) {
+        console.error(`Error generating ${documentType}:`, error);
+
+        if (res.headersSent) {
+            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
+            doc.end();
+            return;
+        }
+
+        res.status(500).json({
+            error: `Failed to generate ${documentType}`,
+            details: error instanceof Error ? error.message : String(error)
+        });
+        doc.end();
+        return;
+    }
+});
+
+// --- Specific Quotation PDF generation endpoint (MUST BE BEFORE generic one) ---
+app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const user_id = req.user!.user_id;
+    const doc = new PDFDocument({ margin: 50 });
+
+    try {
+        const quotationQueryResult = await pool.query(
+            `SELECT
+                q.*,
+                c.name AS customer_name,
+                c.email AS customer_email
+            FROM quotations q
+            JOIN customers c ON q.customer_id = c.id
+            WHERE q.id = $1 AND q.user_id = $2`,
+            [id, user_id]
+        );
+
+        if (quotationQueryResult.rows.length === 0) {
+            res.status(404).json({ error: 'Quotation not found' });
+            doc.end();
+            return;
+        }
+
+        const quotation = quotationQueryResult.rows[0];
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="quotation_${quotation.quotation_number}.pdf"`);
+
+        doc.pipe(res);
+
+        // Fetch line items for the quotation
+        const lineItemsResult = await pool.query(
+            `SELECT
+                li.*,
+                ps.name AS product_service_name
+            FROM quotation_line_items li
+            LEFT JOIN products_services ps ON li.product_service_id = ps.id
+            WHERE li.quotation_id = $1
+            ORDER BY li.created_at`,
+            [id]
+        );
+        quotation.line_items = lineItemsResult.rows;
+
+        // --- PDF Content Generation for Quotation (adapt from invoice) ---
+        doc.fontSize(24).font('Helvetica-Bold').text('Quotation', { align: 'center' });
+        doc.moveDown(1.5);
+
+        doc.fontSize(12).font('Helvetica-Bold').text('Quotation Details:', { underline: true });
+        doc.font('Helvetica')
+            .text(`Quotation Number: ${quotation.quotation_number}`)
+            .text(`Customer: ${quotation.customer_name}`)
+            .text(`Quotation Date: ${new Date(quotation.quotation_date).toLocaleDateString('en-GB')}`)
+            .text(`Expiry Date: ${quotation.expiry_date ? new Date(quotation.expiry_date).toLocaleDateString('en-GB') : 'N/A'}`);
+        doc.moveDown(1.5);
+
+        doc.fontSize(14).font('Helvetica-Bold').text('Line Items:', { underline: true });
+        doc.moveDown(0.5);
+
+        // Table Headers (adjust columns as per quotation_line_items schema)
+        const tableTop = doc.y;
+        const col1X = 50;
+        const col2X = 250;
+        const col3X = 300;
+        const col4X = 400;
+        const col5X = 470;
+
+        doc.fontSize(10)
+            .font('Helvetica-Bold')
+            .text('Description', col1X, tableTop)
+            .text('Qty', col2X, tableTop)
+            .text('Unit Price', col3X, tableTop, { width: 70, align: 'right' })
+            .text('Tax Rate', col4X, tableTop, { width: 60, align: 'right' })
+            .text('Line Total', col5X, tableTop, { width: 70, align: 'right' });
+
+        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+
+        let yPos = tableTop + 25;
+
+        // Line Items Table Rows
+        quotation.line_items.forEach((item: any) => {
+            if (yPos + 20 > doc.page.height - doc.page.margins.bottom) {
+                doc.addPage();
+                yPos = doc.page.margins.top;
+                doc.fontSize(10)
+                    .font('Helvetica-Bold')
+                    .text('Description', col1X, yPos)
+                    .text('Qty', col2X, yPos)
+                    .text('Unit Price', col3X, yPos, { width: 70, align: 'right' })
+                    .text('Tax Rate', col4X, yPos, { width: 60, align: 'right' })
+                    .text('Line Total', col5X, yPos, { width: 70, align: 'right' });
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos + 15).lineTo(550, yPos + 15).stroke();
+                yPos += 25;
+            }
+
+            doc.fontSize(10).font('Helvetica')
+                .text(item.description, col1X, yPos, { width: 190 })
+                .text(item.quantity.toString(), col2X, yPos, { width: 40, align: 'right' })
+                .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, yPos, { width: 70, align: 'right' })
+                .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, yPos, { width: 60, align: 'right' })
+                .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, yPos, { width: 70, align: 'right' });
+            yPos += 20;
+        });
+
+        doc.moveDown();
+        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos).lineTo(550, yPos).stroke();
+
+        yPos += 10;
+        doc.fontSize(14).font('Helvetica-Bold')
+            .text(`Total Amount: ${quotation.currency} ${(parseFloat(quotation.total_amount)).toFixed(2)}`, col1X, yPos, { align: 'right', width: 500 });
+
+        if (quotation.notes) {
+            doc.moveDown(1.5);
+            doc.fontSize(10).font('Helvetica-Oblique').text(`Notes: ${quotation.notes}`);
+        }
+
+        doc.end();
+    } catch (error: unknown) {
+        console.error(`Error generating quotation PDF:`, error);
+        if (res.headersSent) {
+            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
+            doc.end();
+            return;
+        }
+        res.status(500).json({
+            error: `Failed to generate quotation PDF`,
+            details: error instanceof Error ? error.message : String(error)
+        });
+        doc.end();
+    }
+});
+
+
+// Generic PDF generation endpoint for invoices and statements
+app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
+    const { documentType, id } = req.params;
+    const { startDate, endDate } = req.query;
+    const user_id = req.user!.user_id;
+
+    const doc = new PDFDocument({ margin: 50 });
+
+    try {
+        switch (documentType) {
+            case 'invoices':
+            case 'invoice': {
+                const invoiceQueryResult = await pool.query(
+                    `SELECT
+                        i.*,
+                        c.name AS customer_name,
+                        c.email AS customer_email
+                    FROM invoices i
+                    JOIN customers c ON i.customer_id = c.id
+                    WHERE i.id = $1 AND i.user_id = $2`,
+                    [id, user_id]
+                );
+
+                if (invoiceQueryResult.rows.length === 0) {
+                    res.status(404).json({ error: 'Invoice not found' });
+                    doc.end();
+                    return;
+                }
+
+                const invoice = invoiceQueryResult.rows[0];
+
+                res.setHeader('Content-Type', 'application/pdf');
+                res.setHeader('Content-Disposition', `attachment; filename="invoice_${invoice.invoice_number}.pdf"`);
+
+                doc.pipe(res);
+
+                // Fetch line items
+                const lineItemsResult = await pool.query(
+                    `SELECT
+                        li.*,
+                        ps.name AS product_service_name
+                    FROM invoice_line_items li
+                    LEFT JOIN products_services ps ON li.product_service_id = ps.id
+                    WHERE li.invoice_id = $1
+                    ORDER BY li.created_at`,
+                    [id]
+                );
+                invoice.line_items = lineItemsResult.rows;
+
+                // --- PDF Content Generation for Invoice ---
+                doc.fontSize(24).font('Helvetica-Bold').text('Invoice', { align: 'center' });
+                doc.moveDown(1.5);
+
+                doc.fontSize(12).font('Helvetica-Bold').text('Invoice Details:', { underline: true });
+                doc.font('Helvetica')
+                    .text(`Invoice Number: ${invoice.invoice_number}`)
+                    .text(`Customer: ${invoice.customer_name}`)
+                    .text(`Invoice Date: ${new Date(invoice.invoice_date).toLocaleDateString('en-GB')}`)
+                    .text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-GB')}`);
+                doc.moveDown(1.5);
+
+                doc.fontSize(14).font('Helvetica-Bold').text('Line Items:', { underline: true });
+                doc.moveDown(0.5);
+
+                // Table Headers
+                const tableTop = doc.y;
+                const col1X = 50;
+                const col2X = 250;
+                const col3X = 300;
+                const col4X = 400;
+                const col5X = 470;
+
+                doc.fontSize(10)
+                    .font('Helvetica-Bold')
+                    .text('Description', col1X, tableTop)
+                    .text('Qty', col2X, tableTop)
+                    .text('Unit Price', col3X, tableTop, { width: 70, align: 'right' })
+                    .text('Tax Rate', col4X, tableTop, { width: 60, align: 'right' })
+                    .text('Line Total', col5X, tableTop, { width: 70, align: 'right' });
+
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+
+                let yPos = tableTop + 25;
+
+                // Line Items Table Rows
+                invoice.line_items.forEach((item: any) => {
+                    if (yPos + 20 > doc.page.height - doc.page.margins.bottom) {
+                        doc.addPage();
+                        yPos = doc.page.margins.top;
+                        doc.fontSize(10)
+                            .font('Helvetica-Bold')
+                            .text('Description', col1X, yPos)
+                            .text('Qty', col2X, yPos)
+                            .text('Unit Price', col3X, yPos, { width: 70, align: 'right' })
+                            .text('Tax Rate', col4X, yPos, { width: 60, align: 'right' })
+                            .text('Line Total', col5X, yPos, { width: 70, align: 'right' });
+                        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos + 15).lineTo(550, yPos + 15).stroke();
+                        yPos += 25;
+                    }
+
+                    doc.fontSize(10).font('Helvetica')
+                        .text(item.description, col1X, yPos, { width: 190 })
+                        .text(item.quantity.toString(), col2X, yPos, { width: 40, align: 'right' })
+                        .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, yPos, { width: 70, align: 'right' })
+                        .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, yPos, { width: 60, align: 'right' })
+                        .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, yPos, { width: 70, align: 'right' });
+                    yPos += 20;
+                });
+
+                doc.moveDown();
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos).lineTo(550, yPos).stroke();
+
+                yPos += 10;
+                doc.fontSize(14).font('Helvetica-Bold')
+                    .text(`Total Amount: ${invoice.currency} ${(parseFloat(invoice.total_amount)).toFixed(2)}`, col1X, yPos, { align: 'right', width: 500 });
+
+                if (invoice.notes) {
+                    doc.moveDown(1.5);
+                    doc.fontSize(10).font('Helvetica-Oblique').text(`Notes: ${invoice.notes}`);
+                }
+
+                doc.end();
+                return;
+            }
+
+            case 'statement': {
+                res.setHeader('Content-Type', 'application/pdf');
+                doc.pipe(res);
+                doc.text('Statement generation not fully implemented in this example.', { align: 'center' });
+                doc.end();
+                return;
+            }
+
+            default:
+                res.status(400).json({ error: 'Document type not supported.' });
+                doc.end();
+                return;
+        }
+
+    } catch (error: unknown) {
+        console.error(`Error generating ${documentType}:`, error);
+
+        if (res.headersSent) {
+            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
+            doc.end();
+            return;
+        }
+
+        res.status(500).json({
+            error: `Failed to generate ${documentType}`,
+            details: error instanceof Error ? error.message : String(error)
+        });
+        doc.end();
+        return;
+    }
+});
+
+interface QuotationDetailsForPdf {
+  quotation_number: string;
+  customer_name: string;
+  customer_email?: string;
+  customer_address?: string;
+  quotation_date: string;
+  expiry_date?: string;
+  total_amount: number;
+  currency: string;
+  notes?: string;
+  line_items: Array<{
+    product_service_name?: string;
+    description: string;
+    quantity: number;
+    unit_price: number;
+    line_total: number;
+    tax_rate: number;
+  }>;
+  companyName: string;
+  companyAddress?: string;
+  companyVat?: string;
+}
+
+async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50 });
+    const buffers: Buffer[] = [];
+
+    doc.on('data', buffers.push.bind(buffers));
+    doc.on('end', () => resolve(Buffer.concat(buffers)));
+    doc.on('error', reject);
+
+    // Header (Company details)
+    doc.fontSize(24).font('Helvetica-Bold').text(quotationData.companyName, { align: 'right' });
+    if (quotationData.companyAddress) {
+      doc.fontSize(10).font('Helvetica').text(quotationData.companyAddress, { align: 'right' });
+    }
+    if (quotationData.companyVat) {
+      doc.fontSize(10).font('Helvetica').text(`VAT No: ${quotationData.companyVat}`, { align: 'right' });
+    }
+    doc.moveDown(1);
+    doc.fontSize(10).text(`Quotation Date: ${new Date(quotationData.quotation_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+    if (quotationData.expiry_date) {
+      doc.fontSize(10).text(`Expiry Date: ${new Date(quotationData.expiry_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+    }
+    doc.moveDown(2);
+
+    // Title
+    doc.fontSize(30).font('Helvetica-Bold').text(`QUOTATION #${quotationData.quotation_number}`, { align: 'center' });
+    doc.moveDown(2);
+
+    // Customer Details
+    doc.fontSize(12).font('Helvetica-Bold').text('Quotation For:');
+    doc.fontSize(12).font('Helvetica').text(quotationData.customer_name);
+    if (quotationData.customer_address) {
+      doc.fontSize(10).text(quotationData.customer_address);
+    }
+    if (quotationData.customer_email) {
+      doc.fontSize(10).text(quotationData.customer_email);
+    }
+    doc.moveDown(2);
+
+    // Table Header
+    const tableTop = doc.y;
+    const itemCol = 50;
+    const descCol = 150;
+    const qtyCol = 320;
+    const priceCol = 370;
+    const taxCol = 430;
+    const totalCol = 500;
+
+    doc.font('Helvetica-Bold').fontSize(10);
+    doc.text('Item', itemCol, tableTop);
+    doc.text('Description', descCol, tableTop);
+    doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
+    doc.text('Unit Price', priceCol, tableTop, { width: 50, align: 'right' });
+    doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
+    doc.text('Line Total', totalCol, tableTop, { width: 50, align: 'right' });
+
+    doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
+    doc.moveDown();
+
+    // Table Body
+    doc.font('Helvetica').fontSize(9);
+    let currentY = doc.y;
+    let subtotal = 0;
+    let totalTax = 0;
+
+    quotationData.line_items.forEach(item => {
+      currentY = doc.y;
+      const itemDescription = item.product_service_name || item.description;
+      const taxAmount = (item.line_total * item.tax_rate);
+      const lineTotalExclTax = item.line_total - taxAmount;
+
+      doc.text(itemDescription, itemCol, currentY, { width: 140 });
+      doc.text(item.description, descCol, currentY, { width: 160 });
+      doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
+      doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
+      doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
+      doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
+
+      doc.moveDown();
+      subtotal += lineTotalExclTax;
+      totalTax += taxAmount;
+    });
+
+    // Totals
+    doc.moveDown();
+    const totalsY = doc.y;
+    doc.font('Helvetica-Bold').fontSize(10);
+
+    doc.text('Subtotal:', 400, totalsY, { width: 80, align: 'right' });
+    doc.text(formatCurrency(subtotal, quotationData.currency), 500, totalsY, { width: 50, align: 'right' });
+    doc.moveDown();
+
+    doc.text('Tax:', 400, doc.y, { width: 80, align: 'right' });
+    doc.text(formatCurrency(totalTax, quotationData.currency), 500, doc.y, { width: 50, align: 'right' });
+    doc.moveDown();
+
+    doc.fontSize(14).text('Total Amount:', 400, doc.y, { width: 80, align: 'right' });
+    doc.text(formatCurrency(quotationData.total_amount, quotationData.currency), 500, doc.y, { width: 50, align: 'right' });
+    doc.moveDown(3);
+
+    // Notes
+    if (quotationData.notes) {
+      doc.fontSize(10).font('Helvetica-Bold').text('Notes:');
+      doc.font('Helvetica').fontSize(10).text(quotationData.notes, { align: 'left' });
+      doc.moveDown(2);
+    }
+
+    // Footer
+    doc.fontSize(10).text(`Thank you for considering our quotation!`, doc.page.width / 2, doc.page.height - 50, {
+      align: 'center',
+      width: doc.page.width - 100,
+    });
+
+    doc.end();
+  });
+}
+
+
+app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { recipientEmail, subject, body } = req.body;
+  const user_id = req.user!.user_id;
+
+  if (!recipientEmail || !subject || !body) {
+    return res.status(400).json({ error: 'Recipient email, subject, and body are required.' });
+  }
+
+  try {
+    // Fetch quotation details to generate PDF
+    const quotationQueryResult = await pool.query(
+      `SELECT
+          q.*,
+          c.name AS customer_name,
+          c.email AS customer_email,
+          c.address AS customer_address
+       FROM quotations q
+       JOIN customers c ON q.customer_id = c.id
+       WHERE q.id = $1 AND q.user_id = $2`,
+      [id, user_id]
+    );
+
+    if (quotationQueryResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Quotation not found.' });
+    }
+    const quotation = quotationQueryResult.rows[0];
+
+    const lineItemsResult = await pool.query(
+      `SELECT
+          li.*,
+          ps.name AS product_service_name
+       FROM quotation_line_items li
+       LEFT JOIN products_services ps ON li.product_service_id = ps.id
+       WHERE li.quotation_id = $1
+       ORDER BY li.created_at`,
+      [id]
+    );
+    quotation.line_items = lineItemsResult.rows;
+
+    // Prepare data for PDF generation
+    const quotationDataForPdf: QuotationDetailsForPdf = {
+      quotation_number: quotation.quotation_number,
+      customer_name: quotation.customer_name,
+      customer_email: quotation.customer_email,
+      customer_address: quotation.customer_address,
+      quotation_date: quotation.quotation_date,
+      expiry_date: quotation.expiry_date,
+      total_amount: parseFloat(quotation.total_amount),
+      currency: quotation.currency,
+      notes: quotation.notes,
+      line_items: quotation.line_items.map((item: any) => ({
+        product_service_name: item.product_service_name,
+        description: item.description,
+        quantity: parseFloat(item.quantity),
+        unit_price: parseFloat(item.unit_price),
+        line_total: parseFloat(item.line_total),
+        tax_rate: parseFloat(item.tax_rate),
+      })),
+      companyName: process.env.APP_NAME || 'Your Company',
+    };
+
+    // Generate PDF Buffer using the new function
+    const pdfBuffer = await generateQuotationPdf(quotationDataForPdf);
+
+    // Send email with PDF attachment
+    const emailSent = await sendEmail({
+      to: recipientEmail,
+      subject: subject,
+      html: body,
+      attachments: [
+        {
+          filename: `Quotation_${quotation.quotation_number}.pdf`,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        },
+      ],
+    });
+
+    if (emailSent) {
+      res.status(200).json({ message: 'Email sent successfully!' });
+    } else {
+      res.status(500).json({ error: 'Failed to send quotation email.' });
+    }
+
+  } catch (error: unknown) {
+    console.error('Error in send-pdf-email endpoint:', error);
+    if (res.headersSent) {
+      console.error('Headers already sent in send-pdf-email. Cannot send JSON error.');
+      return;
+    }
+    if (error instanceof Error) {
+      res.status(500).json({ error: 'Failed to process email request', details: error.message });
+    } else {
+      res.status(500).json({ error: 'Failed to process email request', details: String(error) });
+    }
+  }
+});
+
+/* --- Transactions API (Fetching) --- */
+app.get('/transactions', authMiddleware, async (req: Request, res: Response) => {
+  const { type, category, accountId, search, fromDate, toDate } = req.query;
+  const user_id = req.user!.user_id;
+
+  if (fromDate && toDate && typeof fromDate === 'string' && typeof toDate === 'string') {
+    const parsedFromDate = new Date(fromDate);
+    const parsedToDate = new Date(toDate);
+    if (parsedFromDate > parsedToDate) {
+      console.warn(`Invalid date range requested: fromDate (${fromDate}) is after toDate (${toDate}). Returning empty transactions.`);
+      return res.json([]);
+    }
+  }
+
+  let query = `
+    SELECT
+      t.id,
+      t.type,
+      t.amount,
+      t.description,
+      t.date,
+      t.category,
+      t.created_at,
+      t.account_id,
+      t.original_text,
+      t.source,
+      t.confirmed,
+      acc.name AS account_name,
+      acc.type AS account_type
+    FROM
+      transactions t
+    LEFT JOIN
+      accounts acc ON t.account_id = acc.id
+    WHERE t.user_id = $1
+  `;
+
+  const queryParams: (string | number)[] = [user_id];
+  let paramIndex = 2;
+
+  if (type && typeof type === 'string' && type !== 'all') {
+    query += ` AND t.type = $${paramIndex++}`;
+    queryParams.push(type);
+  }
+
+  if (category && typeof category === 'string' && category !== 'all') {
+    query += ` AND t.category = $${paramIndex++}`;
+    queryParams.push(category);
+  }
+
+  if (accountId && typeof accountId === 'string' && accountId !== 'all') {
+    query += ` AND t.account_id = $${paramIndex++}`;
+    queryParams.push(accountId);
+  }
+
+  if (search && typeof search === 'string') {
+    query += ` AND (t.description ILIKE $${paramIndex} OR t.type ILIKE $${paramIndex} OR acc.name ILIKE $${paramIndex})`;
+    queryParams.push(`%${search}%`);
+  }
+
+  if (fromDate && typeof fromDate === 'string') {
+    query += ` AND t.date >= $${paramIndex++}`;
+    queryParams.push(fromDate);
+  }
+
+  if (toDate && typeof toDate === 'string') {
+    query += ` AND t.date <= $${paramIndex++}`;
+    queryParams.push(toDate);
+  }
+
+  query += ` ORDER BY t.date DESC, t.created_at DESC`;
+
+  try {
+    const result = await pool.query(query, queryParams);
+    res.json(result.rows);
+  } catch (error: unknown) {
+    console.error('Error fetching transactions:', error);
+    res.status(500).json({ error: 'Failed to fetch transactions', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// MODIFIED: Added authMiddleware and user_id to INSERT/UPDATE
+app.post('/transactions/manual', authMiddleware, async (req: Request, res: Response) => {
+  const { id, type, amount, description, date, category, account_id, original_text, source, confirmed } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!type || !amount || !date) {
+    return res.status(400).json({ detail: 'type, amount, and date are required' });
+  }
+
+  try {
+    let result;
+    if (id) {
+      // If ID is provided, perform an UPDATE
+      result = await pool.query(
+        `UPDATE transactions
+         SET
+           "type" = $1,
+           amount = $2,
+           description = $3,
+           "date" = $4,
+           category = $5,
+           account_id = $6,
+           original_text = $7,
+           source = $8,
+           confirmed = $9
+         WHERE id = $10 AND user_id = $11 -- Added user_id to WHERE clause for update
+         RETURNING id, "type", amount, description, "date", category, account_id, created_at, original_text, source, confirmed`,
+        [type, amount, description || null, date, category || null, account_id || null, original_text || null, source || 'manual', confirmed !== undefined ? confirmed : true, id, user_id]
+      );
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Transaction not found or unauthorized for update' });
+      }
+    } else {
+      // If no ID, perform an INSERT
+      result = await pool.query(
+        `INSERT INTO transactions ("type", amount, description, "date", category, account_id, original_text, source, confirmed, user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, "type", amount, description, "date", category, account_id, created_at, original_text, source, confirmed`,
+        [type, amount, description || null, date, category || null, account_id || null, original_text || null, source || 'manual', confirmed !== undefined ? confirmed : true, user_id] // Added user_id
+      );
+    }
+
+    // Fetch the full transaction with account_name for consistent response
+    const fullTransaction = await pool.query(`
+      SELECT
+        t.id, t.type, t.amount, t.description, t.date, t.category, t.created_at, t.account_id, t.original_text, t.source, t.confirmed, acc.name AS account_name
+      FROM
+        transactions t
+      LEFT JOIN
+        accounts acc ON t.account_id = acc.id
+      WHERE t.id = $1
+    `, [result.rows[0].id]);
+
+    res.json(fullTransaction.rows[0]);
+  } catch (error: unknown) {
+    console.error('DB operation error:', error);
+    res.status(500).json({ detail: 'Failed to perform transaction operation', error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/* --- Accounts API --- */
+app.get('/accounts', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  try {
+    // Select 'type' and 'code' to match frontend's expected Account interface
+    const result = await pool.query('SELECT id, name, type, code FROM accounts WHERE user_id = $1 ORDER BY id', [user_id]); // ADDED user_id filter
+    res.json(result.rows);
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error fetching accounts:', error);
+    res.status(500).json({ error: 'Failed to fetch accounts', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post('/accounts', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  // Expect 'type', 'name', and 'code' from the frontend
+  const { type, name, code } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  // Validate all required fields based on your DB schema
+  if (!type || !name || !code) {
+    return res.status(400).json({ error: 'Missing required account fields: type, name, code' });
+  }
+
+  try {
+    const insert = await pool.query(
+      // Insert into 'type', 'name', 'code' columns
+      `INSERT INTO accounts (type, name, code, user_id) VALUES ($1, $2, $3, $4) RETURNING id`, // ADDED user_id
+      [type, name, code, user_id]
+    );
+    const insertedId = insert.rows[0].id;
+
+    const fullAccount = await pool.query(
+      // Select the inserted account, including 'type' and 'code'
+      `SELECT id, name, type, code FROM accounts WHERE id = $1 AND user_id = $2`, // ADDED user_id filter
+      [insertedId, user_id]
+    );
+    res.json(fullAccount.rows[0]);
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error adding account:', error);
+    res.status(500).json({ error: 'Failed to add account', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+const formatCurrency = (amount: number, currency: string = 'R'): string => {
+  return `${currency}${amount.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+interface InvoiceDetailsForPdf {
+  invoice_number: string;
+  customer_name: string;
+  customer_email?: string; // Optional for PDF itself
+  customer_address?: string;
+  invoice_date: string;
+  due_date: string;
+  total_amount: number;
+  currency: string;
+  notes?: string;
+  line_items: Array<{
+    product_service_name?: string;
+    description: string;
+    quantity: number;
+    unit_price: number;
+    line_total: number;
+    tax_rate: number;
+  }>;
+  companyName: string; // From your .env or DB
+  companyAddress?: string;
+  companyVat?: string;
+}
+
+async function generateInvoicePdf(invoiceData: InvoiceDetailsForPdf): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50 });
+    const buffers: Buffer[] = [];
+
+    doc.on('data', buffers.push.bind(buffers));
+    doc.on('end', () => resolve(Buffer.concat(buffers)));
+    doc.on('error', reject);
+
+    // Header
+    doc.fontSize(24).font('Helvetica-Bold').text(invoiceData.companyName, { align: 'right' });
+    if (invoiceData.companyAddress) {
+      doc.fontSize(10).font('Helvetica').text(invoiceData.companyAddress, { align: 'right' });
+    }
+    if (invoiceData.companyVat) {
+      doc.fontSize(10).font('Helvetica').text(`VAT No: ${invoiceData.companyVat}`, { align: 'right' });
+    }
+    doc.moveDown(1);
+    doc.fontSize(10).text(`Invoice Date: ${new Date(invoiceData.invoice_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+    doc.fontSize(10).text(`Due Date: ${new Date(invoiceData.due_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+    doc.moveDown(2);
+
+    // Title
+    doc.fontSize(30).font('Helvetica-Bold').text(`INVOICE #${invoiceData.invoice_number}`, { align: 'center' });
+    doc.moveDown(2);
+
+    // Bill To
+    doc.fontSize(12).font('Helvetica-Bold').text('Bill To:');
+    doc.fontSize(12).font('Helvetica').text(invoiceData.customer_name);
+    if (invoiceData.customer_address) {
+      doc.fontSize(10).text(invoiceData.customer_address);
+    }
+    if (invoiceData.customer_email) {
+      doc.fontSize(10).text(invoiceData.customer_email);
+    }
+    doc.moveDown(2);
+
+    // Table Header
+    const tableTop = doc.y;
+    const itemCol = 50;
+    const descCol = 150;
+    const qtyCol = 320;
+    const priceCol = 370;
+    const taxCol = 430;
+    const totalCol = 500;
+
+    doc.font('Helvetica-Bold').fontSize(10);
+    doc.text('Item', itemCol, tableTop);
+    doc.text('Description', descCol, tableTop);
+    doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
+    doc.text('Price', priceCol, tableTop, { width: 50, align: 'right' });
+    doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
+    doc.text('Total', totalCol, tableTop, { width: 50, align: 'right' });
+
+    doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
+    doc.moveDown();
+
+    // Table Body
+    doc.font('Helvetica').fontSize(9);
+    let currentY = doc.y;
+    let subtotal = 0;
+    let totalTax = 0;
+
+    invoiceData.line_items.forEach(item => {
+      currentY = doc.y;
+      const itemDescription = item.product_service_name || item.description;
+      const taxAmount = (item.line_total * item.tax_rate);
+      const lineTotalExclTax = item.line_total - taxAmount;
+
+      doc.text(itemDescription, itemCol, currentY, { width: 140 });
+      doc.text(item.description, descCol, currentY, { width: 160 }); // Full description if needed
+      doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
+      doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
+      doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
+      doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
+
+      doc.moveDown();
+      subtotal += lineTotalExclTax;
+      totalTax += taxAmount;
+    });
+
+    // Totals
+    doc.moveDown();
+    const totalsY = doc.y;
+    doc.font('Helvetica-Bold').fontSize(10);
+
+    doc.text('Subtotal:', 400, totalsY, { width: 80, align: 'right' });
+    doc.text(formatCurrency(subtotal, invoiceData.currency), 500, totalsY, { width: 50, align: 'right' });
+    doc.moveDown();
+
+    doc.text('Tax:', 400, doc.y, { width: 80, align: 'right' });
+    doc.text(formatCurrency(totalTax, invoiceData.currency), 500, doc.y, { width: 50, align: 'right' });
+    doc.moveDown();
+
+    doc.fontSize(14).text('Total Due:', 400, doc.y, { width: 80, align: 'right' });
+    doc.text(formatCurrency(invoiceData.total_amount, invoiceData.currency), 500, doc.y, { width: 50, align: 'right' });
+    doc.moveDown(3);
+
+    // Notes
+    if (invoiceData.notes) {
+      doc.fontSize(10).font('Helvetica-Bold').text('Notes:');
+      doc.font('Helvetica').fontSize(10).text(invoiceData.notes, { align: 'left' });
+      doc.moveDown(2);
+    }
+
+    // Footer
+    doc.fontSize(10).text(`Thank you for your business!`, doc.page.width / 2, doc.page.height - 50, {
+      align: 'center',
+      width: doc.page.width - 100,
+    });
+
+    doc.end();
+  });
+}
+
+app.post('/api/invoices/:id/send-pdf-email', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const invoiceId = req.params.id;
+  const { customerEmail } = req.body; // Expect customerEmail in the request body
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!customerEmail) {
+    return res.status(400).json({ error: 'Customer email is required to send the invoice.' });
+  }
+
+  try {
+    // 1. Fetch Invoice Details from Database (including line items and customer info)
+    const invoiceResult = await pool.query(
+      `SELECT
+          i.id, i.invoice_number, i.invoice_date, i.due_date, i.total_amount, i.status, i.currency, i.notes,
+          c.name AS customer_name, c.email AS customer_email, c.address AS customer_address
+       FROM public.invoices i
+       JOIN public.customers c ON i.customer_id = c.id
+       WHERE i.id = $1 AND i.user_id = $2;`, // ADDED user_id filter
+      [invoiceId, user_id]
+    );
+
+    if (invoiceResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found.' });
+    }
+    const invoice = invoiceResult.rows[0];
+
+    const lineItemsResult = await pool.query(
+      `SELECT
+          il.product_service_id, il.description, il.quantity, il.unit_price, il.line_total, il.tax_rate,
+          ps.name AS product_service_name
+       FROM public.invoice_line_items il
+       LEFT JOIN public.products_services ps ON il.product_service_id = ps.id
+       WHERE il.invoice_id = $1;`,
+      [invoiceId]
+    );
+    invoice.line_items = lineItemsResult.rows;
+
+    // Prepare data for PDF generation
+    const invoiceDataForPdf: InvoiceDetailsForPdf = {
+      invoice_number: invoice.invoice_number,
+      customer_name: invoice.customer_name,
+      customer_email: invoice.customer_email,
+      customer_address: invoice.customer_address,
+      invoice_date: invoice.invoice_date,
+      due_date: invoice.due_date,
+      total_amount: parseFloat(invoice.total_amount),
+      currency: invoice.currency,
+      notes: invoice.notes,
+      line_items: invoice.line_items.map((item: any) => ({
+        product_service_name: item.product_service_name,
+        description: item.description,
+        quantity: parseFloat(item.quantity),
+        unit_price: parseFloat(item.unit_price),
+        line_total: parseFloat(item.line_total),
+        tax_rate: parseFloat(item.tax_rate),
+      })),
+      companyName: process.env.APP_NAME || 'Your Company',
+      // Add more company details from .env if you have them, e.g.:
+      // companyAddress: process.env.COMPANY_ADDRESS,
+      // companyVat: process.env.COMPANY_VAT_NUMBER,
+    };
+
+    // 2. Generate PDF
+    const pdfBuffer = await generateInvoicePdf(invoiceDataForPdf);
+
+    // 3. Send Email with PDF attachment
+    const emailSubject = `Invoice #${invoice.invoice_number} from ${process.env.APP_NAME || 'Your Company'}`;
+    const emailHtml = `
+      <p>Dear ${invoice.customer_name},</p>
+      <p>Please find attached your invoice (Invoice ID: <b>#${invoice.invoice_number}</b>) from ${process.env.APP_NAME || 'Your Company'}.</p>
+      <p>Total amount due: <b>${formatCurrency(invoiceDataForPdf.total_amount, invoiceDataForPdf.currency)}</b></p>
+      <p>Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-ZA')}</p>
+      <p>Thank you for your business!</p>
+      <p>Sincerely,<br>${process.env.APP_NAME || 'Your Company'}</p>
+    `;
+
+    const emailSent = await sendEmail({
+      to: customerEmail,
+      subject: emailSubject,
+      html: emailHtml,
+      attachments: [
+        {
+          filename: `Invoice_${invoice.invoice_number}.pdf`,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        },
+      ],
+    });
+
+    if (emailSent) {
+      // Optional: Update invoice status to 'Sent' in your DB
+      await pool.query(
+        `UPDATE public.invoices SET status = 'Sent', updated_at = CURRENT_TIMESTAMP WHERE id = $1;`,
+        [invoiceId]
+      );
+      res.status(200).json({ message: 'Invoice PDF generated and email sent successfully!' });
+    } else {
+      res.status(500).json({ error: 'Failed to send invoice email.' });
+    }
+
+  } catch (error: any) {
+    console.error('Error generating PDF or sending email:', error);
+    res.status(500).json({
+      error: 'Failed to generate PDF or send email.',
+      detail: error.message || String(error)
+    });
+  }
+});
+/* --- Assets API --- */
+
+// Updated Asset Interface to include depreciation fields
+interface Asset {
+  id: string;
+  type: string;
+  name: string;
+  number?: string;
+  cost: number;
+  date_received: string;
+  account_id: string;
+  account_name: string;
+  depreciation_method?: string; // New
+  useful_life_years?: number;   // New
+  salvage_value?: number;       // New
+  accumulated_depreciation: number; // New
+  last_depreciation_date?: string; // New
+}
+
+app.get('/assets', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  try {
+    const result = await pool.query(`
+      SELECT
+        a.id,
+        a.type,
+        a.name,
+        a.number,
+        a.cost,
+        a.date_received,
+        a.account_id,
+        acc.name AS account_name,
+        a.depreciation_method,      
+        a.useful_life_years,        
+        a.salvage_value,            
+        a.accumulated_depreciation, 
+        a.last_depreciation_date    
+      FROM assets a
+      JOIN accounts acc ON a.account_id = acc.id
+      WHERE a.user_id = $1 -- ADDED user_id filter
+      ORDER BY a.date_received DESC
+    `, [user_id]);
+    res.json(result.rows);
+  } catch (error: unknown) {
+    console.error('Error fetching assets:', error);
+    res.status(500).json({ error: 'Failed to fetch assets', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post('/assets', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const {
+    type, name, number, cost, date_received, account_id,
+    depreciation_method, useful_life_years, salvage_value
+  } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!type || !name || cost == null || !date_received || !account_id) {
+    return res.status(400).json({ error: 'Missing required asset fields: type, name, cost, date_received, account_id' });
+  }
+
+  try {
+    const insert = await pool.query(
+      `INSERT INTO assets (
+        type, name, number, cost, date_received, account_id,
+        depreciation_method, useful_life_years, salvage_value, accumulated_depreciation, last_depreciation_date, user_id
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`, // ADDED user_id
+      [
+        type, name, number || null, cost, date_received, account_id,
+        depreciation_method || null, useful_life_years || null, salvage_value || null,
+        0.00, // Initialize accumulated_depreciation to 0
+        null,  // Initialize last_depreciation_date to null
+        user_id // ADDED user_id
+      ]
+    );
+    const insertedId = insert.rows[0].id;
+
+    const fullAsset = await pool.query(`
+      SELECT
+        a.id, a.type, a.name, a.number, a.cost, a.date_received, a.account_id, acc.name AS account_name,
+        a.depreciation_method, a.useful_life_years, a.salvage_value, a.accumulated_depreciation, a.last_depreciation_date
+      FROM assets a
+      JOIN accounts acc ON a.account_id = acc.id
+      WHERE a.id = $1 AND a.user_id = $2 -- ADDED user_id filter
+    `, [insertedId, user_id]);
+
+    res.json(fullAsset.rows[0]);
+  } catch (error: unknown) {
+    console.error('Error adding asset:', error);
+    res.status(500).json({ error: 'Failed to add asset', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.put('/assets/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { id } = req.params;
+  const {
+    type, name, number, cost, date_received, account_id,
+    depreciation_method, useful_life_years, salvage_value, accumulated_depreciation, last_depreciation_date
+  } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  const updates = [];
+  const values = [];
+  let paramIndex = 1;
+
+  if (type !== undefined) { updates.push(`type = $${paramIndex++}`); values.push(type); }
+  if (name !== undefined) { updates.push(`name = $${paramIndex++}`); values.push(name); }
+  if (number !== undefined) { updates.push(`number = $${paramIndex++}`); values.push(number || null); }
+  if (cost !== undefined) { updates.push(`cost = $${paramIndex++}`); values.push(cost); }
+  if (date_received !== undefined) { updates.push(`date_received = $${paramIndex++}`); values.push(date_received); }
+  if (account_id !== undefined) { updates.push(`account_id = $${paramIndex++}`); values.push(account_id); }
+  if (depreciation_method !== undefined) { updates.push(`depreciation_method = $${paramIndex++}`); values.push(depreciation_method || null); }
+  if (useful_life_years !== undefined) { updates.push(`useful_life_years = $${paramIndex++}`); values.push(useful_life_years || null); }
+  if (salvage_value !== undefined) { updates.push(`salvage_value = $${paramIndex++}`); values.push(salvage_value || null); }
+  if (accumulated_depreciation !== undefined) { updates.push(`accumulated_depreciation = $${paramIndex++}`); values.push(accumulated_depreciation); }
+  if (last_depreciation_date !== undefined) { updates.push(`last_depreciation_date = $${paramIndex++}`); values.push(last_depreciation_date || null); }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No fields provided for update.' });
+  }
+
+  values.push(id); // Add ID for WHERE clause
+  values.push(user_id); // ADDED user_id for WHERE clause
+
+  try {
+    const result = await pool.query(
+      `UPDATE assets SET ${updates.join(', ')} WHERE id = $${paramIndex} AND user_id = $${paramIndex + 1} RETURNING *`, // ADDED user_id filter
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Asset not found or unauthorized' });
+    }
+    res.json(result.rows[0]);
+  } catch (error: unknown) {
+    console.error('Error updating asset:', error);
+    res.status(500).json({ error: 'Failed to update asset', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete('/assets/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { id } = req.params;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  try {
+    const result = await pool.query('DELETE FROM assets WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Asset not found or unauthorized' });
+    }
+    res.json({ message: 'Asset deleted successfully' });
+  } catch (error: unknown) {
+    console.error('Error deleting asset:', error);
+    res.status(500).json({ error: 'Failed to delete asset', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+
+/* --- Depreciation API --- */
+
+// Helper function to calculate straight-line depreciation for a period
+const calculateDepreciation = (
+  cost: number,
+  salvageValue: number,
+  usefulLifeYears: number,
+  startDate: Date,
+  endDate: Date
+): number => {
+  if (usefulLifeYears <= 0) return 0;
+
+  const depreciableBase = cost - salvageValue;
+  const annualDepreciation = depreciableBase / usefulLifeYears;
+  const monthlyDepreciation = annualDepreciation / 12;
+
+  // Calculate number of months in the period
+  let monthsToDepreciate = 0;
+  let currentMonth = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+
+  while (currentMonth <= endDate) {
+    monthsToDepreciate++;
+    currentMonth.setMonth(currentMonth.getMonth() + 1);
+  }
+
+  return monthlyDepreciation * monthsToDepreciate;
+};
+
+
+app.post('/api/depreciation/run', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { endDate } = req.body; // endDate: The date up to which depreciation should be calculated
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!endDate) {
+    return res.status(400).json({ error: 'endDate is required for depreciation calculation.' });
+  }
+
+  const calculationEndDate = new Date(endDate);
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Fetch all assets that are depreciable and haven't been depreciated up to the endDate
+    const assetsResult = await client.query(`
+      SELECT
+        id, cost, useful_life_years, salvage_value, date_received, accumulated_depreciation, last_depreciation_date
+      FROM assets
+      WHERE
+        user_id = $1 AND -- ADDED user_id filter
+        depreciation_method = 'straight-line' AND useful_life_years IS NOT NULL AND useful_life_years > 0
+        AND (last_depreciation_date IS NULL OR last_depreciation_date < $2)
+    `, [user_id, calculationEndDate.toISOString().split('T')[0]]); // Compare only date part
+
+    const depreciatedAssets: { assetId: number; amount: number; transactionId: number }[] = [];
+    let totalDepreciationExpense = 0;
+    let defaultExpenseAccountId: number | null = null;
+
+    // Try to find a suitable account for depreciation expense (e.g., 'Depreciation Expense' or 'Other Expenses')
+    const expenseAccountResult = await client.query(
+      `SELECT id FROM accounts WHERE (name ILIKE 'Depreciation Expense' OR name ILIKE 'Other Expenses') AND user_id = $1 LIMIT 1`, // ADDED user_id filter
+      [user_id]
+    );
+    if (expenseAccountResult.rows.length > 0) {
+      defaultExpenseAccountId = expenseAccountResult.rows[0].id;
+    } else {
+      await client.query('ROLLBACK');
+      return res.status(500).json({ error: 'Could not find a suitable expense account for depreciation for this user.' });
+    }
+
+    for (const asset of assetsResult.rows) {
+      const assetCost = parseFloat(asset.cost);
+      const assetSalvageValue = parseFloat(asset.salvage_value || 0);
+      const assetUsefulLifeYears = parseInt(asset.useful_life_years, 10);
+      const assetDateReceived = new Date(asset.date_received);
+      const assetLastDepreciationDate = asset.last_depreciation_date ? new Date(asset.last_depreciation_date) : null;
+
+      // Determine the start date for this depreciation calculation
+      // It's either the day after last_depreciation_date, or date_received if no prior depreciation
+      let depreciationStartDate = assetLastDepreciationDate
+        ? new Date(assetLastDepreciationDate.getFullYear(), assetLastDepreciationDate.getMonth(), assetLastDepreciationDate.getDate() + 1)
+        : assetDateReceived;
+
+      // Ensure depreciation doesn't start before the asset was received
+      if (depreciationStartDate < assetDateReceived) {
+        depreciationStartDate = assetDateReceived;
+      }
+
+      // Ensure we don't depreciate beyond the useful life
+      const usefulLifeEndDate = new Date(assetDateReceived.getFullYear() + assetUsefulLifeYears, assetDateReceived.getMonth(), assetDateReceived.getDate());
+      if (depreciationStartDate >= usefulLifeEndDate) {
+          console.log(`Asset ${asset.id} has reached end of useful life or already fully depreciated.`);
+          continue; // Skip if already fully depreciated or beyond useful life
+      }
+
+      // Adjust calculationEndDate if it's beyond the useful life end date
+      let effectiveCalculationEndDate = calculationEndDate;
+      if (effectiveCalculationEndDate > usefulLifeEndDate) {
+          effectiveCalculationEndDate = usefulLifeEndDate;
+      }
+
+      // Calculate depreciation only if the period is valid
+      if (depreciationStartDate <= effectiveCalculationEndDate) {
+        const depreciationAmount = calculateDepreciation(
+          assetCost,
+          assetSalvageValue,
+          assetUsefulLifeYears,
+          depreciationStartDate,
+          effectiveCalculationEndDate
+        );
+
+        if (depreciationAmount > 0) {
+          // 1. Update accumulated_depreciation on the asset
+          const newAccumulatedDepreciation = parseFloat(asset.accumulated_depreciation) + depreciationAmount;
+          await client.query(
+            `UPDATE assets SET accumulated_depreciation = $1, last_depreciation_date = $2 WHERE id = $3 AND user_id = $4`, // ADDED user_id filter
+            [newAccumulatedDepreciation, effectiveCalculationEndDate.toISOString().split('T')[0], asset.id, user_id]
+          );
+
+          // 2. Create a transaction for depreciation expense
+          const transactionResult = await client.query(
+            `INSERT INTO transactions (type, amount, description, date, category, account_id, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, // ADDED user_id
+            [
+              'expense',
+              depreciationAmount,
+              `Depreciation Expense for ${asset.name} (ID: ${asset.id})`,
+              effectiveCalculationEndDate.toISOString().split('T')[0], // Use end date of calculation period
+              'Depreciation Expense', // Use a specific category for depreciation
+              defaultExpenseAccountId, // Link to a general expense account
+              user_id // ADDED user_id
+            ]
+          );
+          const transactionId = transactionResult.rows[0].id;
+
+          // 3. Record the depreciation entry
+          await client.query(
+            `INSERT INTO depreciation_entries (asset_id, depreciation_date, amount, transaction_id, user_id)
+             VALUES ($1, $2, $3, $4, $5)`, // ADDED user_id
+            [asset.id, effectiveCalculationEndDate.toISOString().split('T')[0], depreciationAmount, transactionId, user_id]
+          );
+
+          totalDepreciationExpense += depreciationAmount;
+          depreciatedAssets.push({ assetId: asset.id, amount: depreciationAmount, transactionId: transactionId });
+        }
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({
+      message: 'Depreciation calculated and recorded successfully.',
+      totalDepreciationExpense: totalDepreciationExpense,
+      depreciatedAssets: depreciatedAssets
+    });
+
+  } catch (error: unknown) {
+    await client.query('ROLLBACK');
+    console.error('Error running depreciation:', error);
+    res.status(500).json({ error: 'Failed to run depreciation', detail: error instanceof Error ? error.message : String(error) });
+  } finally {
+    client.release();
+  }
+});
+
+
+/* --- Expenses API --- */
+app.get('/expenses', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  try {
+    // Select all fields relevant for an expense transaction + account_name
+    const result = await pool.query(`
+      SELECT e.id, e.name, e.details, e.category, e.amount, e.date, e.account_id, acc.name AS account_name
+      FROM expenses e
+      JOIN accounts acc ON e.account_id = acc.id
+      WHERE e.user_id = $1 -- ADDED user_id filter
+      ORDER BY e.date DESC
+    `, [user_id]);
+    res.json(result.rows);
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error fetching expenses:', error);
+    res.status(500).json({ error: 'Failed to fetch expenses', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post('/expenses', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  // Ensure all required fields for an expense transaction are captured
+  const { name, details, category, amount, date, account_id } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!name || amount == null || !date || !account_id) {
+    return res.status(400).json({ error: 'Missing required expense fields: name, amount, date, account_id' });
+  }
+
+  try {
+    const insert = await pool.query(
+      `INSERT INTO expenses (name, details, category, amount, date, account_id, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, // ADDED user_id
+      // Ensure details and category are correctly handled for nullable columns
+      [name, details || null, category || null, amount, date, account_id, user_id]
+    );
+    const insertedId = insert.rows[0].id;
+
+    const fullExpense = await pool.query(`
+      SELECT e.id, e.name, e.details, e.category, e.amount, e.date, e.account_id, acc.name AS account_name
+      FROM expenses e
+      JOIN accounts acc ON e.account_id = acc.id
+      WHERE e.id = $1 AND e.user_id = $2 -- ADDED user_id filter
+    `, [insertedId, user_id]);
+
+    res.json(fullExpense.rows[0]);
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error adding expense:', error);
+    res.status(500).json({ error: 'Failed to add expense', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// NEW: PUT Update Expense
+app.put('/expenses/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { id } = req.params;
+  const { name, details, category, amount, date, account_id } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  const updates = [];
+  const values = [];
+  let paramIndex = 1;
+
+  if (name !== undefined) { updates.push(`name = $${paramIndex++}`); values.push(name); }
+  if (details !== undefined) { updates.push(`details = $${paramIndex++}`); values.push(details || null); }
+  if (category !== undefined) { updates.push(`category = $${paramIndex++}`); values.push(category || null); }
+  if (amount !== undefined) { updates.push(`amount = $${paramIndex++}`); values.push(amount); }
+  if (date !== undefined) { updates.push(`date = $${paramIndex++}`); values.push(date); }
+  if (account_id !== undefined) { updates.push(`account_id = $${paramIndex++}`); values.push(account_id); }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No fields provided for update.' });
+  }
+
+  values.push(id); // Add ID for WHERE clause
+  values.push(user_id); // ADDED user_id for WHERE clause
+
+  try {
+    const result = await pool.query(
+      `UPDATE expenses SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIndex} AND user_id = $${paramIndex + 1} RETURNING *`, // ADDED user_id filter
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Expense not found or unauthorized' });
+    }
+    // Fetch with account_name for consistent response
+    const fullExpense = await pool.query(`
+      SELECT e.id, e.name, e.details, e.category, e.amount, e.date, e.account_id, acc.name AS account_name
+      FROM expenses e
+      JOIN accounts acc ON e.account_id = acc.id
+      WHERE e.id = $1 AND e.user_id = $2 -- ADDED user_id filter
+    `, [id, user_id]); // Use the ID from params directly
+
+    res.json(fullExpense.rows[0]);
+  } catch (error: unknown) {
+    console.error('Error updating expense:', error);
+    res.status(500).json({ error: 'Failed to update expense', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// NEW: DELETE Expense
+app.delete('/expenses/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { id } = req.params;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  try {
+    const result = await pool.query('DELETE FROM expenses WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Expense not found or unauthorized' });
+    }
+    res.json({ message: 'Expense deleted successfully' });
+  } catch (error: unknown) {
+    console.error('Error deleting expense:', error);
+    res.status(500).json({ error: 'Failed to delete expense', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/* --- File upload & processing --- */
+app.post('/transactions/upload', authMiddleware, upload.single('file'), async (req: Request, res: Response) => { // ADDED authMiddleware
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  if (!req.file) {
+    return res.status(400).json({ detail: 'No file uploaded' });
+  }
+  // In a real application, you would save the file with a user_id association
+  res.json({ message: 'File uploaded and processed (stub)', user_id: user_id }); // Include user_id for confirmation
+});
+
+/* --- Text description processing (UPDATED to use Gemini API) --- */
+app.post('/transactions/process-text', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { description } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!description) {
+    return res.status(400).json({ detail: 'Description is required' });
+  }
+
+  try {
+    // Fetch all existing account names and categories to guide the LLM, filtered by user_id
+    const accountsResult = await pool.query('SELECT name FROM accounts WHERE user_id = $1', [user_id]);
+    const categoriesResult = await pool.query('SELECT DISTINCT category FROM transactions WHERE category IS NOT NULL AND user_id = $1', [user_id]);
+
+    const accountNames = accountsResult.rows.map(row => row.name);
+    const existingCategories = categoriesResult.rows.map(row => row.category);
+
+    const prompt = `Extract transaction details from the following text.
+    
+    Text: "${description}"
+    
+    Rules for extraction:
+    - Determine if the transaction is 'income' or 'expense'.
+    - Extract the numerical 'amount'.
+    - Extract the 'date' in YYYY-MM-DD format. If no year is specified, assume the current year (${new Date().getFullYear()}). If no day or month is specified, assume the current month and day.
+    - Assign a relevant 'category' from the following list if applicable, otherwise suggest a new, concise, and appropriate accounting category: ${JSON.stringify(existingCategories)}. Common categories include: 'Sales Revenue', 'Fuel Expense', 'Salaries and Wages Expense', 'Rent Expense', 'Utilities Expense', 'Bank Charges & Fees', 'Interest Income', 'Projects Expenses', 'Accounting Fees Expense', 'Repairs & Maintenance Expense', 'Communication Expense', 'Miscellaneous Expense', 'Owner's Capital'.
+    - Provide a concise 'description' of the transaction.
+    - Identify the 'account' where the money moved (e.g., 'Bank', 'Cash'). If not explicitly mentioned, assume 'Bank'.
+    
+    Output the result as a JSON object with the following schema:
+    `;
+
+    const payload = {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: "OBJECT",
+          properties: {
+            type: { type: "STRING", enum: ["income", "expense"] },
+            amount: { type: "NUMBER" },
+            date: { type: "STRING", format: "date" },
+            category: { type: "STRING" },
+            description: { type: "STRING" },
+            account: { type: "STRING" }
+          },
+          required: ["type", "amount", "date", "category", "description", "account"]
+        }
+      }
+    };
+
+    const apiKey = ""; // Canvas will provide this at runtime
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+    const llmResponse = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const result = await llmResponse.json();
+
+    if (!result.candidates || result.candidates.length === 0 || !result.candidates[0].content || !result.candidates[0].content.parts || result.candidates[0].content.parts.length === 0) {
+      throw new Error('LLM response structure is unexpected or content is missing.');
+    }
+
+    const extractedData = JSON.parse(result.candidates[0].content.parts[0].text);
+
+    // Look up account_id based on the extracted account name, filtered by user_id
+    const accountLookupResult = await pool.query('SELECT id FROM accounts WHERE name ILIKE $1 AND user_id = $2', [extractedData.account, user_id]);
+    let account_id: number | null = null;
+
+    if (accountLookupResult.rows.length > 0) {
+      account_id = accountLookupResult.rows[0].id;
+    } else {
+      // If account not found, try to find a default 'Bank' account for this user
+      const defaultBankResult = await pool.query('SELECT id FROM accounts WHERE name ILIKE $1 AND user_id = $2 LIMIT 1', ['%bank%', user_id]);
+      if (defaultBankResult.rows.length > 0) {
+        account_id = defaultBankResult.rows[0].id;
+      } else {
+        // Fallback if no 'Bank' account exists for this user, or handle as an error
+        console.warn(`Account '${extractedData.account}' not found for user ${user_id}, and no default 'Bank' account. Transaction will be returned without account_id.`);
+      }
+    }
+
+    // Prepare the response for the frontend
+    res.json({
+      type: extractedData.type,
+      amount: extractedData.amount,
+      date: extractedData.date,
+      category: extractedData.category,
+      description: extractedData.description,
+      account_id: account_id, // Send the looked-up ID
+      account_name: extractedData.account // Send the name for display
+    });
+
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error processing text with LLM:', error);
+    res.status(500).json({ detail: 'Failed to process text description', error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/* --- Audio upload & processing --- */
+app.post('/transactions/process-audio', authMiddleware, upload.single('audio_file'), async (req: Request, res: Response) => { // ADDED authMiddleware
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  if (!req.file) {
+    return res.status(400).json({ detail: 'No audio file uploaded' });
+  }
+  // In a real application, you would send the audio file to a speech-to-text service
+  // and then send the transcribed text to the /transactions/process-text endpoint.
+  // For now, we'll just return a stub message.
+  res.json({ message: 'Audio uploaded and processed (stub)', user_id: user_id }); // Include user_id for confirmation
+});
+
+// POST Customer
+app.post('/customers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { name, contact_person, email, phone, address, tax_id } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!name) return res.status(400).json({ error: 'Customer name is required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO customers (name, contact_person, email, phone, address, tax_id, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`, // ADDED user_id
+      [name, contact_person || null, email || null, phone || null, address || null, tax_id || null, user_id]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error adding customer:', error);
+    res.status(500).json({ error: 'Failed to add customer', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+/* --- Customer API Endpoints --- */
+
+// GET All Customers (with optional search filter for the main table)
+// GET All Customers (with optional search filter for the main table)
+app.get('/api/customers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const searchTerm = req.query.search as string | undefined;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    let query = `
+        SELECT
+            c.id,
+            c.name,
+            c.contact_person,
+            c.email,
+            c.phone,
+            c.address,
+            c.tax_id,
+            COALESCE(SUM(i.total_amount), 0.00) AS total_invoiced /* Calculate total_invoiced */
+        FROM
+            public.customers c
+        LEFT JOIN
+            public.invoices i ON c.id = i.customer_id
+        WHERE c.user_id = $1 -- ADDED user_id filter
+    `;
+    const queryParams: (string | number)[] = [user_id]; // Initialize with user_id
+    let paramIndex = 2; // Start index at 2 because $1 is user_id
+
+    if (searchTerm) {
+        query += ` AND (LOWER(c.name) ILIKE $${paramIndex} OR LOWER(c.email) ILIKE $${paramIndex})`;
+        queryParams.push(`%${searchTerm.toLowerCase()}%`);
+    }
+
+    query += `
+        GROUP BY
+            c.id, c.name, c.contact_person, c.email, c.phone, c.address, c.tax_id
+        ORDER BY
+            c.name ASC;
+    `;
+
+    try {
+        // We use CustomerDB here because the query returns snake_case columns
+        const { rows } = await pool.query<CustomerDB>(query, queryParams);
+        const formattedRows = rows.map(mapCustomerToFrontend); // Map to frontend camelCase
+        res.json(formattedRows);
+    } catch (error: unknown) { // Explicitly type error as unknown
+        console.error('Error fetching all customers:', error);
+        res.status(500).json({ error: 'Failed to fetch customers', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Customers by Search Query (Still useful for specific search-as-you-type components if needed elsewhere)
+app.get('/api/customers/search', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const query = req.query.query as string | undefined;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!query) {
+        return res.status(400).json({ error: 'Search query is required' });
+    }
+    const searchTerm = `%${query.toLowerCase()}%`; // Already asserted as string or undefined above
+
+    try {
+        const result = await pool.query(
+            `SELECT id, name FROM public.customers WHERE LOWER(name) LIKE $1 AND user_id = $2 ORDER BY name`, // ADDED user_id filter
+            [searchTerm, user_id]
+        );
+        // Note: This returns only id and name, not full CustomerFrontend object
+        res.json(result.rows.map(row => ({ id: row.id.toString(), name: row.name })));
+    } catch (error: unknown) {
+        console.error('Error searching customers:', error);
+        res.status(500).json({ error: 'Failed to search customers', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Single Customer by ID
+app.get('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query<CustomerDB>('SELECT id, name, contact_person, email, phone, address, tax_id, total_invoiced FROM public.customers WHERE id = $1 AND user_id = $2', [id, user_id]); // ADDED user_id filter
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Customer not found or unauthorized' });
+        }
+        res.json(mapCustomerToFrontend(result.rows[0]));
+    } catch (error: unknown) {
+        console.error('Error fetching customer by ID:', error);
+        res.status(500).json({ error: 'Failed to fetch customer', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// POST Create Customer
+app.post('/api/customers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { name, contactPerson, email, phone, address, vatNumber }: CreateUpdateCustomerBody = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!name) { // Name is NOT NULL in DB
+        return res.status(400).json({ error: 'Customer name is required' });
+    }
+
+    try {
+        const result = await pool.query<CustomerDB>(
+            `INSERT INTO public.customers (name, contact_person, email, phone, address, tax_id, total_invoiced, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, 0.00, $7) RETURNING id, name, contact_person, email, phone, address, tax_id, total_invoiced`, // ADDED user_id
+            [name, contactPerson || null, email || null, phone || null, address || null, vatNumber || null, user_id]
+        );
+        res.status(201).json(mapCustomerToFrontend(result.rows[0]));
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error adding customer:', error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') { // Unique violation (e.g., duplicate email)
+            return res.status(409).json({ error: 'A customer with this email or VAT number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to add customer', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// PUT Update Customer
+app.put('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const { name, contactPerson, email, phone, address, vatNumber }: CreateUpdateCustomerBody = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!name) { // Name is required for update
+        return res.status(400).json({ error: 'Customer name is required for update.' });
+    }
+
+    try {
+        const result = await pool.query<CustomerDB>(
+            `UPDATE public.customers
+             SET name = $1, contact_person = $2, email = $3, phone = $4, address = $5, tax_id = $6, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $7 AND user_id = $8 RETURNING id, name, contact_person, email, phone, address, tax_id, total_invoiced`, // ADDED user_id filter
+            [name, contactPerson || null, email || null, phone || null, address || null, vatNumber || null, id, user_id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Customer not found or unauthorized.' });
+        }
+        res.json(mapCustomerToFrontend(result.rows[0]));
+    } catch (error: unknown) {
+        console.error(`Error updating customer with ID ${id}:`, error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') {
+            return res.status(409).json({ error: 'A customer with this email or VAT number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to update customer', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// DELETE Customer
+app.delete('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    try {
+        const { rowCount } = await pool.query(
+            'DELETE FROM public.customers WHERE id = $1 AND user_id = $2', // ADDED user_id filter
+            [id, user_id]
+        );
+
+        if (rowCount === 0) {
+            return res.status(404).json({ error: 'Customer not found or unauthorized.' });
+        }
+        res.status(204).send(); // No Content for successful deletion
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error(`Error deleting customer with ID ${id}:`, error);
+        if (error instanceof Error && 'code' in error && error.code === '23503') { // Foreign key violation (if customer is referenced)
+            return res.status(409).json({
+                error: 'Cannot delete customer: associated with existing invoices or other records.',
+                detail: error.message
+            });
+        }
+        res.status(500).json({ error: 'Failed to delete customer', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+// GET Vendors
+app.get('/vendors', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  try {
+    const result = await pool.query('SELECT id, name, contact_person, email, phone, address, tax_id FROM vendors WHERE user_id = $1 ORDER BY name', [user_id]); // ADDED user_id filter
+    res.json(result.rows);
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error fetching vendors:', error);
+    res.status(500).json({ error: 'Failed to fetch vendors', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// POST Vendor
+app.post('/vendors', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { name, contact_person, email, phone, address, tax_id } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  if (!name) return res.status(400).json({ error: 'Vendor name is required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO vendors (name, contact_person, email, phone, address, tax_id, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`, // ADDED user_id
+      [name, contact_person || null, email || null, phone || null, address || null, tax_id || null, user_id]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error adding vendor:', error);
+    res.status(500).json({ error: 'Failed to add vendor', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// PUT Update Vendor
+app.put('/vendors/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { id } = req.params;
+  const { name, contact_person, email, phone, address, tax_id } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!name) {
+    return res.status(400).json({ error: 'Vendor name is required for update.' });
+  }
+
+  const updates = [];
+  const values = [];
+  let paramIndex = 1;
+
+  if (name !== undefined) { updates.push(`name = $${paramIndex++}`); values.push(name); }
+  if (contact_person !== undefined) { updates.push(`contact_person = $${paramIndex++}`); values.push(contact_person || null); }
+  if (email !== undefined) { updates.push(`email = $${paramIndex++}`); values.push(email || null); }
+  if (phone !== undefined) { updates.push(`phone = $${paramIndex++}`); values.push(phone || null); }
+  if (address !== undefined) { updates.push(`address = $${paramIndex++}`); values.push(address || null); }
+  if (tax_id !== undefined) { updates.push(`tax_id = $${paramIndex++}`); values.push(tax_id || null); }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No fields provided for update.' });
+  }
+
+  values.push(id); // Add ID for WHERE clause
+  values.push(user_id); // ADDED user_id for WHERE clause
+
+  try {
+    const result = await pool.query(
+      `UPDATE vendors SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIndex} AND user_id = $${paramIndex + 1} RETURNING *`, // ADDED user_id filter
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Vendor not found or unauthorized' });
+    }
+    res.json(result.rows[0]);
+  } catch (error: unknown) {
+    console.error('Error updating vendor:', error);
+    res.status(500).json({ error: 'Failed to update vendor', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// DELETE Vendor
+app.delete('/vendors/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { id } = req.params;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  try {
+    const result = await pool.query('DELETE FROM vendors WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Vendor not found or unauthorized' });
+    }
+    res.json({ message: 'Vendor deleted successfully' });
+  } catch (error: unknown) {
+    console.error('Error deleting vendor:', error);
+    res.status(500).json({ error: 'Failed to delete vendor', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+
+// GET Products/Services
+app.get('/products-services', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  try {
+    const result = await pool.query(
+      'SELECT id, name, description, unit_price, cost_price, sku, is_service, stock_quantity, unit FROM products_services WHERE user_id = $1 ORDER BY name', [user_id] // ADDED user_id filter
+    );
+
+    // Map the rows to format stock_quantity as an integer
+    // and ensure all fields match the ProductDB interface structure
+    const formattedRows = result.rows.map(row => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      unit_price: Number(row.unit_price), // Ensure unit_price is a number
+      cost_price: row.cost_price ? Number(row.cost_price) : null, // Ensure cost_price is a number or null
+      sku: row.sku,
+      is_service: row.is_service,
+      stock_quantity: parseInt(row.stock_quantity, 10), // Convert to integer
+      created_at: row.created_at, // Assuming these are handled correctly by pg
+      updated_at: row.updated_at,
+      tax_rate_id: row.tax_rate_id,
+      category: row.category,
+      unit: row.unit, // Include the unit
+      tax_rate_value: row.tax_rate_value // If this is joined, ensure it's handled
+    }));
+
+    res.json(formattedRows);
+  } catch (error: unknown) {
+    console.error('Error fetching products/services:', error);
+    res.status(500).json({ error: 'Failed to fetch products/services', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// POST Product/Service
+app.post('/products-services', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { name, description, unit_price, cost_price, sku, is_service, stock_quantity } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  if (!name || unit_price == null) {
+    return res.status(400).json({ error: 'Product/Service name and unit_price are required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO products_services (name, description, unit_price, cost_price, sku, is_service, stock_quantity, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`, // ADDED user_id
+      [name, description || null, unit_price, cost_price || null, sku || null, is_service || false, stock_quantity || 0, user_id]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error('Error adding product/service:', error);
+    res.status(500).json({ error: 'Failed to add product/service', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// PUT Update Product Stock
+app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const { id } = req.params; // Product ID
+  const { adjustmentQuantity } = req.body; // Quantity to add (positive) or subtract (negative)
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  // 1. Explicitly convert adjustmentQuantity to a number
+  const parsedAdjustmentQuantity = Number(adjustmentQuantity);
+
+  if (typeof parsedAdjustmentQuantity !== 'number' || isNaN(parsedAdjustmentQuantity)) {
+    return res.status(400).json({ error: 'adjustmentQuantity must be a valid number.' });
+  }
+
+  try {
+    // Start a transaction for atomicity
+    await pool.query('BEGIN');
+
+    // 2. Get current stock quantity, filtered by user_id
+    const productResult = await pool.query(
+      'SELECT stock_quantity, name FROM public.products_services WHERE id = $1 AND user_id = $2 FOR UPDATE', // ADDED user_id filter
+      [id, user_id]
+    );
+
+    if (productResult.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'Product or service not found or unauthorized.' });
+    }
+
+    // 3. Explicitly convert currentStock to a number to prevent string concatenation
+    const currentStock = Number(productResult.rows[0].stock_quantity);
+    const productName = productResult.rows[0].name;
+
+    // 4. Perform numeric addition
+    const newStock = currentStock + parsedAdjustmentQuantity;
+
+    // 5. Check for insufficient stock if selling (adjustmentQuantity is negative)
+    if (parsedAdjustmentQuantity < 0 && newStock < 0) {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Insufficient stock for "${productName}". Current stock: ${currentStock}. Cannot sell ${Math.abs(parsedAdjustmentQuantity)}.`,
+        availableStock: currentStock,
+      });
+    }
+
+    // 6. Update stock quantity, filtered by user_id
+    const updateResult = await pool.query(
+      `UPDATE public.products_services
+       SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND user_id = $3
+       RETURNING id, name, stock_quantity`, // ADDED user_id filter
+      [newStock, id, user_id]
+    );
+
+    await pool.query('COMMIT');
+
+    res.json({
+      message: `Stock for "${updateResult.rows[0].name}" updated successfully.`,
+      product: updateResult.rows[0],
+    });
+
+  } catch (error: unknown) {
+    await pool.query('ROLLBACK'); // Rollback transaction in case of error
+    console.error(`Error updating stock for product ID ${id}:`, error);
+    res.status(500).json({
+      error: 'Failed to update product stock',
+      detail: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+// POST Create New Sale
+app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+  const {
+    cart,
+    paymentType,
+    total,
+    customer, // This will be selectedCustomer from frontend
+    amountPaid,
+    change,
+    dueDate,
+    tellerName, // From frontend (e.g., 'Dummy Teller')
+    branch,     // From frontend (e.g., 'Dummy Branch')
+    companyName // From frontend (e.g., 'DummyCo')
+  } = req.body;
+  const user_id = req.user!.user_id; // Get user_id from req.user
+
+  if (!cart || cart.length === 0 || total === undefined) {
+    return res.status(400).json({ error: 'Cart cannot be empty and total amount is required.' });
+  }
+
+  const actualAmountPaid = paymentType === 'Cash' ? Number(amountPaid) : null;
+  const actualChangeGiven = paymentType === 'Cash' ? Number(change) : null;
+  const actualCreditAmount = paymentType === 'Credit' ? Number(total) : null;
+  const actualDueDate = paymentType === 'Credit' ? dueDate : null;
+
+  const tellerId = null; // Replace with actual user ID if available from authentication system
+
+  try {
+    await pool.query('BEGIN'); // Start a transaction
+
+    // 1. Insert into the sales table, associating with user_id
+    const salesInsertResult = await pool.query(
+      `INSERT INTO public.sales (
+        customer_id, customer_name, total_amount, payment_type,
+        amount_paid, change_given, credit_amount, due_date,
+        teller_id, teller_name, branch, company_name, created_at, user_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP, $13)
+      RETURNING id, created_at;`, // ADDED user_id
+      [
+        customer?.id || null,
+        customer?.name || null,
+        Number(total),
+        paymentType,
+        actualAmountPaid,
+        actualChangeGiven,
+        actualCreditAmount,
+        actualDueDate,
+        tellerId,
+        tellerName,
+        branch,
+        companyName,
+        user_id // ADDED user_id
+      ]
+    );
+
+    const saleId = salesInsertResult.rows[0].id;
+    const saleTimestamp = salesInsertResult.rows[0].created_at; // Get the timestamp for the transaction date
+
+    // 2. Loop through cart items, deduct stock, and insert into sale_items
+    for (const item of cart) {
+      // Get current stock quantity, filtered by user_id
+      const productResult = await pool.query(
+        'SELECT stock_quantity, name FROM public.products_services WHERE id = $1 AND user_id = $2 FOR UPDATE', // ADDED user_id filter
+        [item.id, user_id]
+      );
+
+      if (productResult.rows.length === 0) {
+        await pool.query('ROLLBACK');
+        return res.status(404).json({ error: `Product or service with ID ${item.id} not found or unauthorized.` });
+      }
+
+      const currentStock = Number(productResult.rows[0].stock_quantity);
+      const productName = productResult.rows[0].name;
+      const quantityToDeduct = Number(item.quantity);
+
+      const newStock = currentStock - quantityToDeduct;
+
+      if (newStock < 0) {
+        await pool.query('ROLLBACK');
+        return res.status(400).json({
+          error: `Insufficient stock for "${productName}". Current stock: ${currentStock}. Cannot sell ${quantityToDeduct}.`,
+          availableStock: currentStock,
+        });
+      }
+
+      await pool.query(
+        `UPDATE public.products_services
+         SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2 AND user_id = $3;`, // ADDED user_id filter
+        [newStock, item.id, user_id]
+      );
+
+      await pool.query(
+        `INSERT INTO public.sale_items (
+          sale_id, product_id, product_name, quantity, unit_price_at_sale, subtotal
+        ) VALUES ($1, $2, $3, $4, $5, $6);`,
+        [
+          saleId,
+          item.id,
+          item.name,
+          Number(item.quantity),
+          Number(item.unit_price),
+          Number(item.subtotal)
+        ]
+      );
+    }
+
+    // --- NEW: Insert into the public.transactions table for Sales Revenue, associating with user_id ---
+    const salesRevenueAccountId = 5; // As specified: Sales Revenue Account ID is 5
+    const transactionType = 'Sales Revenue';
+    const transactionDescription = `POS Sale ID: ${saleId}`;
+    const transactionCategory = 'Revenue'; // Or 'Sales' as per your preference
+    const transactionDate = new Date(saleTimestamp).toISOString().split('T')[0]; // Format as YYYY-MM-DD
+
+    await pool.query(
+      `INSERT INTO public.transactions (
+        type, amount, description, date, category, account_id, source, confirmed, user_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);`, // Changed firebase_uid to user_id
+      [
+        transactionType,
+        Number(total),
+        transactionDescription,
+        transactionDate,
+        transactionCategory,
+        salesRevenueAccountId,
+        'POS', // Source can be 'POS'
+        true, // Confirmed
+        user_id // ADDED user_id
+      ]
+    );
+
+    await pool.query('COMMIT'); // Commit the transaction if all successful
+
+    res.status(201).json({
+      message: 'Sale submitted successfully and transaction recorded!',
+      saleId: saleId,
+      timestamp: saleTimestamp,
+    });
+
+  } catch (error: unknown) {
+    await pool.query('ROLLBACK'); // Rollback transaction in case of error
+    console.error('Error submitting sale:', error);
+    res.status(500).json({
+      error: 'Failed to submit sale',
+      detail: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+/* --- Invoice API Endpoints --- */
+
+// GET All Invoices (List View)
+app.get('/api/invoices', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query(`
+            SELECT
+                i.id,
+                i.invoice_number,
+                i.invoice_date,
+                i.due_date,
+                i.total_amount,
+                i.status,
+                i.currency,
+                c.name AS customer_name,
+                c.id AS customer_id
+            FROM public.invoices i
+            LEFT JOIN public.customers c ON i.customer_id = c.id
+            WHERE i.user_id = $1 -- ADDED user_id filter
+            ORDER BY i.invoice_date DESC, i.invoice_number DESC
+        `, [user_id]);
+        res.json(result.rows);
+    } catch (error: unknown) {
+        console.error('Error fetching invoices:', error);
+        res.status(500).json({ error: 'Failed to fetch invoices', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Single Invoice with Line Items
+app.get('/api/invoices/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const invoiceResult = await pool.query(`
+            SELECT
+                i.id,
+                i.invoice_number,
+                i.customer_id,
+                c.name AS customer_name,
+                c.email AS customer_email,
+                c.phone AS customer_phone,
+                c.address AS customer_address,
+                i.invoice_date,
+                i.due_date,
+                i.total_amount,
+                i.status,
+                i.currency,
+                i.notes,
+                i.created_at,
+                i.updated_at
+            FROM public.invoices i
+            LEFT JOIN public.customers c ON i.customer_id = c.id
+            WHERE i.id = $1 AND i.user_id = $2 -- ADDED user_id filter
+        `, [id, user_id]);
+
+        if (invoiceResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Invoice not found or unauthorized' });
+        }
+
+        const lineItemsResult = await pool.query(`
+            SELECT
+                ili.id,
+                ili.product_service_id,
+                ps.name AS product_service_name,
+                ili.description,
+                ili.quantity,
+                ili.unit_price,
+                ili.line_total,
+                ili.tax_rate
+            FROM public.invoice_line_items ili
+            LEFT JOIN public.products_services ps ON ili.product_service_id = ps.id
+            WHERE ili.invoice_id = $1
+            ORDER BY ili.id
+        `, [id]);
+
+        const invoice = invoiceResult.rows[0];
+        invoice.line_items = lineItemsResult.rows;
+
+        res.json(invoice);
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching invoice:', error);
+        res.status(500).json({ error: 'Failed to fetch invoice', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// POST Create Invoice
+app.post('/api/invoices', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { invoice_number, customer_id, customer_name, invoice_date, due_date, total_amount, status, currency, notes, line_items } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!invoice_number || !invoice_date || !due_date || total_amount == null || !line_items || line_items.length === 0) {
+        return res.status(400).json({ error: 'Missing required invoice fields or line items' });
+    }
+
+    if (!customer_id && (!customer_name || customer_name.trim() === '')) {
+        return res.status(400).json({ error: 'Customer ID or Customer Name is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        let finalCustomerId = customer_id;
+
+        if (!finalCustomerId) {
+            const existingCustomerResult = await client.query('SELECT id FROM public.customers WHERE LOWER(name) = LOWER($1) AND user_id = $2', [customer_name.trim(), user_id]); // ADDED user_id filter
+
+            if (existingCustomerResult.rows.length > 0) {
+                finalCustomerId = existingCustomerResult.rows[0].id;
+            } else {
+                const newCustomerResult = await client.query(
+                    `INSERT INTO public.customers (name, total_invoiced, user_id) VALUES ($1, 0.00, $2) RETURNING id`, // ADDED user_id
+                    [customer_name.trim(), user_id]
+                );
+                finalCustomerId = newCustomerResult.rows[0].id;
+            }
+        }
+
+        const invoiceResult = await client.query(
+            `INSERT INTO public.invoices (invoice_number, customer_id, invoice_date, due_date, total_amount, status, currency, notes, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`, // ADDED user_id
+            [invoice_number, finalCustomerId, invoice_date, due_date, total_amount, status || 'Draft', currency || 'ZAR', notes || null, user_id]
+        );
+        const invoiceId = invoiceResult.rows[0].id;
+
+        for (const item of line_items) {
+            if (!item.description || item.quantity == null || item.unit_price == null || item.line_total == null) {
+                throw new Error('Missing required line item fields');
+            }
+            await client.query(
+                `INSERT INTO public.invoice_line_items (invoice_id, product_service_id, description, quantity, unit_price, line_total, tax_rate)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [invoiceId, item.product_service_id || null, item.description, item.quantity, item.unit_price, item.line_total, item.tax_rate || 0.00]
+            );
+        }
+
+        await client.query('COMMIT');
+        res.status(201).json({ id: invoiceId, message: 'Invoice created successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        await client.query('ROLLBACK');
+        console.error('Error creating invoice:', error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') {
+            return res.status(409).json({ error: 'Invoice number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to create invoice', detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+// PUT Update Invoice
+app.put('/api/invoices/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const { invoice_number, customer_id, customer_name, invoice_date, due_date, total_amount, status, currency, notes, line_items } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!invoice_number || !invoice_date || !due_date || total_amount == null || !line_items) {
+        return res.status(400).json({ error: 'Missing required invoice fields or line items' });
+    }
+
+    if (!customer_id && (!customer_name || customer_name.trim() === '')) {
+        return res.status(400).json({ error: 'Customer ID or Customer Name is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        let finalCustomerId = customer_id;
+
+        if (!finalCustomerId) {
+            const existingCustomerResult = await client.query('SELECT id FROM public.customers WHERE LOWER(name) = LOWER($1) AND user_id = $2', [customer_name.trim(), user_id]); // ADDED user_id filter
+
+            if (existingCustomerResult.rows.length > 0) {
+                finalCustomerId = existingCustomerResult.rows[0].id;
+            } else {
+                const newCustomerResult = await client.query(
+                    `INSERT INTO public.customers (name, total_invoiced, user_id) VALUES ($1, 0.00, $2) RETURNING id`, // ADDED user_id
+                    [customer_name.trim(), user_id]
+                );
+                finalCustomerId = newCustomerResult.rows[0].id;
+            }
+        }
+
+        const updateInvoiceResult = await client.query(
+            `UPDATE public.invoices
+             SET
+               invoice_number = $1,
+               customer_id = $2,
+               invoice_date = $3,
+               due_date = $4,
+               total_amount = $5,
+               status = $6,
+               currency = $7,
+               notes = $8,
+               updated_at = CURRENT_TIMESTAMP
+             WHERE id = $9 AND user_id = $10 RETURNING id`, // ADDED user_id filter
+            [invoice_number, finalCustomerId, invoice_date, due_date, total_amount, status, currency || 'ZAR', notes || null, id, user_id]
+        );
+
+        if (updateInvoiceResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Invoice not found for update or unauthorized' });
+        }
+
+        await client.query('DELETE FROM public.invoice_line_items WHERE invoice_id = $1', [id]);
+
+        for (const item of line_items) {
+            if (!item.description || item.quantity == null || item.unit_price == null || item.line_total == null) {
+                throw new Error('Missing required line item fields');
+            }
+            await client.query(
+                `INSERT INTO public.invoice_line_items (invoice_id, product_service_id, description, quantity, unit_price, line_total, tax_rate)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [id, item.product_service_id || null, item.description, item.quantity, item.unit_price, item.line_total, item.tax_rate || 0.00]
+            );
+        }
+
+        await client.query('COMMIT');
+        res.json({ id: id, message: 'Invoice updated successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        await client.query('ROLLBACK');
+        console.error('Error updating invoice:', error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') {
+            return res.status(409).json({ error: 'Invoice number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to update invoice', detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+// DELETE Invoice
+app.delete('/api/invoices/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query('DELETE FROM public.invoices WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Invoice not found or unauthorized' });
+        }
+        res.json({ message: 'Invoice deleted successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error deleting invoice:', error);
+        res.status(500).json({ error: 'Failed to delete invoice', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// POST Record Invoice Payment
+app.post('/api/invoices/:id/payment', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params; // Invoice ID
+    const { amount_paid, payment_date, notes, account_id, transaction_description, transaction_category } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (amount_paid == null || !payment_date || !account_id) {
+        return res.status(400).json({ error: 'Amount paid, payment date, and account ID are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Check if the invoice belongs to the user
+        const invoiceCheck = await client.query('SELECT id FROM public.invoices WHERE id = $1 AND user_id = $2', [id, user_id]);
+        if (invoiceCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Invoice not found or unauthorized.' });
+        }
+
+        const transactionResult = await client.query(
+            `INSERT INTO public.transactions (type, amount, description, date, category, account_id, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, // ADDED user_id
+            ['income', amount_paid, transaction_description || `Payment for Invoice ${id}`, payment_date, transaction_category || 'Trading Income', account_id, user_id]
+        );
+        const transactionId = transactionResult.rows[0].id;
+
+        await client.query(
+            `INSERT INTO public.invoice_payments (invoice_id, transaction_id, amount_paid, payment_date, notes, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6)`, // ADDED user_id
+            [id, transactionId, amount_paid, payment_date, notes || null, user_id]
+        );
+
+        await client.query('COMMIT');
+        res.status(201).json({ message: 'Invoice payment recorded successfully', transaction_id: transactionId });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        await client.query('ROLLBACK');
+        console.error('Error recording invoice payment:', error);
+        res.status(500).json({ error: 'Failed to record invoice payment', detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+/* --- Quotations API Endpoints --- */
+
+// GET All Quotations (List View)
+app.get('/api/quotations', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query(`
+            SELECT
+                q.id,
+                q.quotation_number,
+                q.quotation_date,
+                q.expiry_date,
+                q.total_amount,
+                q.status,
+                q.currency,
+                c.name AS customer_name,
+                c.id AS customer_id
+            FROM public.quotations q
+            JOIN public.customers c ON q.customer_id = c.id
+            WHERE q.user_id = $1 -- ADDED user_id filter
+            ORDER BY q.quotation_date DESC, q.quotation_number DESC
+        `, [user_id]);
+        res.json(result.rows);
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching quotations:', error);
+        res.status(500).json({ error: 'Failed to fetch quotations', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Single Quotation with Line Items
+app.get('/api/quotations/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const quotationResult = await pool.query(`
+            SELECT
+                q.id,
+                q.quotation_number,
+                q.customer_id,
+                c.name AS customer_name,
+                c.email AS customer_email,
+                c.phone AS customer_phone,
+                c.address AS customer_address,
+                q.quotation_date,
+                q.expiry_date,
+                q.total_amount,
+                q.status,
+                q.currency,
+                q.notes,
+                q.created_at,
+                q.updated_at
+            FROM public.quotations q
+            JOIN public.customers c ON q.customer_id = c.id
+            WHERE q.id = $1 AND q.user_id = $2 -- ADDED user_id filter
+        `, [id, user_id]);
+
+        if (quotationResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Quotation not found or unauthorized' });
+        }
+
+        const lineItemsResult = await pool.query(`
+            SELECT
+                qli.id,
+                qli.product_service_id,
+                ps.name AS product_service_name,
+                qli.description,
+                qli.quantity,
+                qli.unit_price,
+                qli.line_total,
+                qli.tax_rate
+            FROM public.quotation_line_items qli
+            LEFT JOIN public.products_services ps ON qli.product_service_id = ps.id
+            WHERE qli.quotation_id = $1
+            ORDER BY qli.id
+        `, [id]);
+
+        const quotation = quotationResult.rows[0];
+        quotation.line_items = lineItemsResult.rows;
+
+        res.json(quotation);
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching quotation:', error);
+        res.status(500).json({ error: 'Failed to fetch quotation', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// POST Create Quotation
+app.post('/api/quotations', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { quotation_number, customer_id, customer_name, quotation_date, expiry_date, total_amount, status, currency, notes, line_items } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!quotation_number || !quotation_date || total_amount == null || !line_items || line_items.length === 0) {
+        return res.status(400).json({ error: 'Missing required quotation fields or line items' });
+    }
+
+    // Validate customer: either customer_id or customer_name must be present
+    if (!customer_id && (!customer_name || customer_name.trim() === '')) {
+        return res.status(400).json({ error: 'Customer ID or Customer Name is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        let finalCustomerId = customer_id;
+
+        // If customer_id is NOT provided, it means we need to create a new customer
+        if (!finalCustomerId) {
+            // Check if a customer with this name already exists to prevent duplicates, filtered by user_id
+            const existingCustomerResult = await client.query('SELECT id FROM public.customers WHERE LOWER(name) = LOWER($1) AND user_id = $2', [customer_name.trim(), user_id]); // ADDED user_id filter
+
+            if (existingCustomerResult.rows.length > 0) {
+                // If customer exists, use their ID
+                finalCustomerId = existingCustomerResult.rows[0].id;
+            } else {
+                // Otherwise, create a new customer, associating with user_id
+                const newCustomerResult = await client.query(
+                    `INSERT INTO public.customers (name, total_invoiced, user_id) VALUES ($1, 0.00, $2) RETURNING id`, // ADDED user_id
+                    [customer_name.trim(), user_id]
+                );
+                finalCustomerId = newCustomerResult.rows[0].id;
+            }
+        }
+
+        const quotationResult = await client.query(
+            `INSERT INTO public.quotations (quotation_number, customer_id, quotation_date, expiry_date, total_amount, status, currency, notes, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`, // ADDED user_id
+            [quotation_number, finalCustomerId, quotation_date, expiry_date || null, total_amount, status || 'Draft', currency || 'ZAR', notes || null, user_id]
+        );
+        const quotationId = quotationResult.rows[0].id;
+
+        for (const item of line_items) {
+            if (!item.description || item.quantity == null || item.unit_price == null || item.line_total == null) {
+                throw new Error('Missing required line item fields');
+            }
+            await client.query(
+                `INSERT INTO public.quotation_line_items (quotation_id, product_service_id, description, quantity, unit_price, line_total, tax_rate)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [quotationId, item.product_service_id || null, item.description, item.quantity, item.unit_price, item.line_total, item.tax_rate || 0.00]
+            );
+        }
+
+        await client.query('COMMIT');
+        res.status(201).json({ id: quotationId, message: 'Quotation created successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        await client.query('ROLLBACK');
+        console.error('Error creating quotation:', error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') {
+            return res.status(409).json({ error: 'Quotation number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to create quotation', detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+// PUT Update Quotation
+app.put('/api/quotations/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params; // Correctly extract 'id' from params
+    const { quotation_number, customer_id, customer_name, quotation_date, expiry_date, total_amount, status, currency, notes, line_items } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!quotation_number || !quotation_date || total_amount == null || !line_items) {
+        return res.status(400).json({ error: 'Missing required quotation fields or line items' });
+    }
+
+    // Validate customer: either customer_id or customer_name must be present
+    if (!customer_id && (!customer_name || customer_name.trim() === '')) {
+        return res.status(400).json({ error: 'Customer ID or Customer Name is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        let finalCustomerId = customer_id;
+
+        if (!finalCustomerId) {
+            const existingCustomerResult = await client.query('SELECT id FROM public.customers WHERE LOWER(name) = LOWER($1) AND user_id = $2', [customer_name.trim(), user_id]); // ADDED user_id filter
+
+            if (existingCustomerResult.rows.length > 0) {
+                finalCustomerId = existingCustomerResult.rows[0].id;
+            } else {
+                const newCustomerResult = await client.query(
+                    `INSERT INTO public.customers (name, total_invoiced, user_id) VALUES ($1, 0.00, $2) RETURNING id`, // ADDED user_id
+                    [customer_name.trim(), user_id]
+                );
+                finalCustomerId = newCustomerResult.rows[0].id;
+            }
+        }
+
+        const updateQuotationResult = await client.query(
+            `UPDATE public.quotations
+             SET
+               quotation_number = $1,
+               customer_id = $2,
+               quotation_date = $3,
+               expiry_date = $4,
+               total_amount = $5,
+               status = $6,
+               currency = $7,
+               notes = $8,
+               updated_at = CURRENT_TIMESTAMP
+             WHERE id = $9 AND user_id = $10 RETURNING id`, // ADDED user_id filter
+            [quotation_number, finalCustomerId, quotation_date, expiry_date || null, total_amount, status, currency || 'ZAR', notes || null, id, user_id]
+        );
+
+        if (updateQuotationResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Quotation not found for update or unauthorized' });
+        }
+
+        await client.query('DELETE FROM public.quotation_line_items WHERE quotation_id = $1', [id]);
+
+        for (const item of line_items) {
+            if (!item.description || item.quantity == null || item.unit_price == null || item.line_total == null) {
+                throw new Error('Missing required line item fields');
+            }
+            await client.query(
+                `INSERT INTO public.quotation_line_items (quotation_id, product_service_id, description, quantity, unit_price, line_total, tax_rate)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [id, item.product_service_id || null, item.description, item.quantity, item.unit_price, item.line_total, item.tax_rate || 0.00] // Use 'id' here
+            );
+        }
+
+        await client.query('COMMIT');
+        res.json({ id: id, message: 'Quotation updated successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        await client.query('ROLLBACK');
+        console.error('Error updating quotation:', error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') {
+            return res.status(409).json({ error: 'Quotation number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to update quotation', detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+// DELETE Quotation
+app.delete('/api/quotations/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query('DELETE FROM public.quotations WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Quotation not found or unauthorized' });
+        }
+        res.json({ message: 'Quotation deleted successfully' });
+    }
+    catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error deleting quotation:', error);
+        res.status(500).json({ error: 'Failed to delete quotation', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+
+/* --- Purchases API Endpoints --- */
+
+// GET All Purchases (List View)
+app.get('/api/purchases', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query(`
+            SELECT
+                p.id,
+                p.po_number,
+                p.order_date,
+                p.delivery_date,
+                p.total_amount,
+                p.status,
+                p.currency,
+                v.name AS vendor_name,
+                v.id AS vendor_id
+            FROM public.purchases p
+            JOIN public.vendors v ON p.vendor_id = v.id
+            WHERE p.user_id = $1 -- ADDED user_id filter
+            ORDER BY p.order_date DESC, p.po_number DESC
+        `, [user_id]);
+        res.json(result.rows);
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching purchases:', error);
+        res.status(500).json({ error: 'Failed to fetch purchases', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Single Purchase with Line Items
+app.get('/api/purchases/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const purchaseResult = await pool.query(`
+            SELECT
+                p.id,
+                p.po_number,
+                p.vendor_id,
+                v.name AS vendor_name,
+                v.email AS vendor_email,
+                v.phone AS vendor_phone,
+                v.address AS vendor_address,
+                p.order_date,
+                p.delivery_date,
+                p.total_amount,
+                p.status,
+                p.currency,
+                p.notes,
+                p.created_at,
+                p.updated_at
+            FROM public.purchases p
+            JOIN public.vendors v ON p.vendor_id = v.id
+            WHERE p.id = $1 AND p.user_id = $2 -- ADDED user_id filter
+        `, [id, user_id]);
+
+        if (purchaseResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Purchase not found or unauthorized' });
+        }
+
+        const lineItemsResult = await pool.query(`
+            SELECT
+                pli.id,
+                pli.product_service_id,
+                ps.name AS product_service_name,
+                pli.description,
+                pli.quantity,
+                pli.unit_cost,
+                pli.line_total,
+                pli.tax_rate
+            FROM public.purchase_line_items pli
+            LEFT JOIN public.products_services ps ON pli.product_service_id = ps.id
+            WHERE pli.purchase_id = $1
+            ORDER BY pli.id
+        `, [id]);
+
+        const purchase = purchaseResult.rows[0];
+        purchase.line_items = lineItemsResult.rows;
+
+        res.json(purchase);
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching purchase:', error);
+        res.status(500).json({ error: 'Failed to fetch purchase', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// POST Create Purchase
+app.post('/api/purchases', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    // Destructure vendor_name (manual input) from req.body
+    const { po_number, vendor_id, vendor_name, order_date, delivery_date, total_amount, status, currency, notes, line_items } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!order_date || total_amount == null || !line_items || line_items.length === 0) {
+        return res.status(400).json({ error: 'Missing required purchase fields or line items' });
+    }
+
+    // Validate vendor: either vendor_id or vendor_name must be present
+    if (!vendor_id && (!vendor_name || vendor_name.trim() === '')) {
+        return res.status(400).json({ error: 'Vendor ID or Vendor Name is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        let finalVendorId = vendor_id;
+
+        // If vendor_id is NOT provided, it means we need to create a new vendor
+        if (!finalVendorId) {
+            // Check if a vendor with this name already exists to prevent duplicates, filtered by user_id
+            const existingVendorResult = await pool.query('SELECT id FROM public.vendors WHERE LOWER(name) = LOWER($1) AND user_id = $2', [vendor_name.trim(), user_id]); // ADDED user_id filter
+
+            if (existingVendorResult.rows.length > 0) {
+                // If vendor exists, use their ID
+                finalVendorId = existingVendorResult.rows[0].id;
+            } else {
+                // Otherwise, create a new vendor, associating with user_id
+                const newVendorResult = await pool.query(
+                    `INSERT INTO public.vendors (name, user_id) VALUES ($1, $2) RETURNING id`, // ADDED user_id
+                    [vendor_name.trim(), user_id]
+                );
+                finalVendorId = newVendorResult.rows[0].id;
+            }
+        }
+
+        const purchaseResult = await client.query(
+            `INSERT INTO public.purchases (po_number, vendor_id, order_date, delivery_date, total_amount, status, currency, notes, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`, // ADDED user_id
+            [po_number || null, finalVendorId, order_date, delivery_date || null, total_amount, status || 'Draft', currency || 'ZAR', notes || null, user_id]
+        );
+        const purchaseId = purchaseResult.rows[0].id;
+
+        for (const item of line_items) {
+            if (!item.description || item.quantity == null || item.unit_cost == null || item.line_total == null) {
+                throw new Error('Missing required line item fields');
+            }
+            await client.query(
+                `INSERT INTO public.purchase_line_items (purchase_id, product_service_id, description, quantity, unit_cost, line_total, tax_rate)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [purchaseId, item.product_service_id || null, item.description, item.quantity, item.unit_cost, item.line_total, item.tax_rate || 0.00]
+            );
+        }
+
+        await client.query('COMMIT');
+        res.status(201).json({ id: purchaseId, message: 'Purchase created successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        await client.query('ROLLBACK');
+        console.error('Error creating purchase:', error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') {
+            return res.status(409).json({ error: 'Purchase order number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to create purchase', detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+// PUT Update Purchase
+app.put('/api/purchases/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const { po_number, vendor_id, vendor_name, order_date, delivery_date, total_amount, status, currency, notes, line_items } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!order_date || total_amount == null || !line_items) {
+        return res.status(400).json({ error: 'Missing required purchase fields or line items' });
+    }
+
+    // Validate vendor: either vendor_id or vendor_name must be present
+    if (!vendor_id && (!vendor_name || vendor_name.trim() === '')) {
+        return res.status(400).json({ error: 'Vendor ID or Vendor Name is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        let finalVendorId = vendor_id;
+
+        if (!finalVendorId) {
+            const existingVendorResult = await pool.query('SELECT id FROM public.vendors WHERE LOWER(name) = LOWER($1) AND user_id = $2', [vendor_name.trim(), user_id]); // ADDED user_id filter
+
+            if (existingVendorResult.rows.length > 0) {
+                finalVendorId = existingVendorResult.rows[0].id;
+            } else {
+                const newVendorResult = await pool.query(
+                    `INSERT INTO public.vendors (name, user_id) VALUES ($1, $2) RETURNING id`, // ADDED user_id
+                    [vendor_name.trim(), user_id]
+                );
+                finalVendorId = newVendorResult.rows[0].id;
+            }
+        }
+
+        const updatePurchaseResult = await client.query(
+            `UPDATE public.purchases
+             SET
+               po_number = $1,
+               vendor_id = $2,
+               order_date = $3,
+               delivery_date = $4,
+               total_amount = $5,
+               status = $6,
+               currency = $7,
+               notes = $8,
+               updated_at = CURRENT_TIMESTAMP
+             WHERE id = $9 AND user_id = $10 RETURNING id`, // ADDED user_id filter
+            [po_number || null, finalVendorId, order_date, delivery_date || null, total_amount, status, currency || 'ZAR', notes || null, id, user_id]
+        );
+
+        if (updatePurchaseResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Purchase not found for update or unauthorized' });
+        }
+
+        await client.query('DELETE FROM public.purchase_line_items WHERE purchase_id = $1', [id]);
+
+        for (const item of line_items) {
+            if (!item.description || item.quantity == null || item.unit_cost == null || item.line_total == null) {
+                throw new Error('Missing required line item fields');
+            }
+            await client.query(
+                `INSERT INTO public.purchase_line_items (purchase_id, product_service_id, description, quantity, unit_cost, line_total, tax_rate)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [id, item.product_service_id || null, item.description, item.quantity, item.unit_cost, item.line_total, item.tax_rate || 0.00]
+            );
+        }
+
+        await client.query('COMMIT');
+        res.json({ id: id, message: 'Purchase updated successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        await client.query('ROLLBACK');
+        console.error('Error updating purchase:', error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') {
+            return res.status(409).json({ error: 'Purchase order number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to update purchase', detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+// DELETE Purchase
+app.delete('/api/purchases/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query('DELETE FROM public.purchases WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Purchase not found or unauthorized' });
+        }
+        res.json({ message: 'Purchase deleted successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error deleting purchase:', error);
+        res.status(500).json({ error: 'Failed to delete purchase', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// POST Record Purchase Payment
+app.post('/api/purchases/:id/payment', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params; // Purchase ID
+    const { amount_paid, payment_date, notes, account_id, transaction_description, transaction_category } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (amount_paid == null || !payment_date || !account_id) {
+        return res.status(400).json({ error: 'Amount paid, payment date, and account ID are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Check if the purchase belongs to the user
+        const purchaseCheck = await client.query('SELECT id FROM public.purchases WHERE id = $1 AND user_id = $2', [id, user_id]);
+        if (purchaseCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Purchase not found or unauthorized.' });
+        }
+
+        // 1. Create a transaction entry
+        const transactionResult = await pool.query(
+            `INSERT INTO public.transactions (type, amount, description, date, category, account_id, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, // ADDED user_id
+            ['expense', amount_paid, transaction_description || `Payment for Purchase ${id}`, payment_date, transaction_category || 'Business Expenses', account_id, user_id]
+        );
+        const transactionId = transactionResult.rows[0].id;
+
+        // 2. Create a purchase payment entry
+        await client.query(
+            `INSERT INTO public.purchase_payments (purchase_id, transaction_id, amount_paid, payment_date, notes, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6)`, // ADDED user_id
+            [id, transactionId, amount_paid, payment_date, notes || null, user_id]
+        );
+
+        // Optional: Update purchase status if fully paid (requires more logic)
+
+        await client.query('COMMIT');
+        res.status(201).json({ message: 'Purchase payment recorded successfully', transaction_id: transactionId });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        await client.query('ROLLBACK');
+        console.error('Error recording purchase payment:', error);
+        res.status(500).json({ error: 'Failed to record purchase payment', detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+/* --- EMPLOYEES API (Existing, with slight modifications for clarity) --- */
+
+// GET All Employees (List View)
+app.get('/employees', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query(`
+            SELECT
+                e.id,
+                e.name,
+                e.position,
+                e.email,
+                e.id_number,
+                e.phone,
+                e.start_date,
+                e.payment_type,
+                e.base_salary,
+                e.hourly_rate,
+                /* Sum of approved hours for each employee for dashboard stats */
+                COALESCE((SELECT SUM(hours_worked) FROM time_entries WHERE employee_id = e.id AND status = 'approved' AND user_id = $1), 0) AS hours_worked_total, -- ADDED user_id filter
+                bd.account_holder,
+                bd.bank_name,
+                bd.account_number,
+                bd.branch_code
+            FROM employees e
+            LEFT JOIN bank_details bd ON e.id = bd.employee_id
+            WHERE e.user_id = $1 -- ADDED user_id filter
+            ORDER BY e.name ASC
+        `, [user_id]);
+        res.json(result.rows);
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching employees:', error);
+        res.status(500).json({ error: 'Failed to fetch employees', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// PUT Update Employee Details (including bank details and hours_worked_total)
+// Employee Registration Endpoint
+app.post('/employees', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.user_id; // Get user_id from req.user
+  const {
+    name,
+    position,
+    email,
+    idNumber,
+    phone,
+    startDate,
+    paymentType,
+    baseSalary,
+    hourlyRate,
+    bankDetails, // This will be an object
+  } = req.body;
+
+  // Basic validation
+  if (!name || !position || !email || !idNumber || !startDate || !paymentType || !bankDetails) {
+    return res.status(400).json({ error: 'Missing required employee fields.' });
+  }
+  if (paymentType === 'salary' && baseSalary === null) {
+    return res.status(400).json({ error: 'Base salary is required for salary-based employees.' });
+  }
+  if (paymentType === 'hourly' && hourlyRate === null) {
+    return res.status(400).json({ error: 'Hourly rate is required for hourly-based employees.' });
+  }
+  if (!bankDetails.accountHolder || !bankDetails.bankName || !bankDetails.accountNumber || !bankDetails.branchCode) {
+    return res.status(400).json({ error: 'Missing required bank details.' });
+  }
+
+  try {
+    // Check if an employee with the same ID number or email already exists for this user
+    const existingEmployee = await pool.query(
+      `SELECT id FROM employees WHERE user_id = $1 AND (id_number = $2 OR email = $3)`,
+      [user_id, idNumber, email]
+    );
+
+    if (existingEmployee.rows.length > 0) {
+      return res.status(409).json({ error: 'Employee with this ID number or email already exists for your account.' });
+    }
+
+    // Insert into employees table
+    const result = await pool.query(
+      `INSERT INTO employees (
+        user_id,
+        name,
+        position,
+        email,
+        id_number,
+        phone,
+        start_date,
+        payment_type,
+        base_salary,
+        hourly_rate,
+        bank_details,
+        created_at,
+        updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      RETURNING id, name;`, // Return id and name for confirmation
+      [
+        user_id,
+        name,
+        position,
+        email,
+        idNumber,
+        phone,
+        startDate,
+        paymentType,
+        baseSalary,
+        hourlyRate,
+        JSON.stringify(bankDetails), // Store bankDetails as JSONB
+      ]
+    );
+
+    res.status(201).json({
+      message: 'Employee registered successfully',
+      employee: {
+        id: result.rows[0].id,
+        name: result.rows[0].name,
+      },
+    });
+
+  } catch (error: unknown) {
+    console.error('Error adding employee:', error);
+    if (error instanceof Error) {
+      // Check for specific PostgreSQL unique constraint error if needed
+      // For example, if you had a unique constraint on (user_id, id_number)
+      // if ((error as any).code === '23505') {
+      //   return res.status(409).json({ error: 'An employee with this ID number already exists.' });
+      // }
+      res.status(500).json({ error: 'Failed to add employee', details: error.message });
+    } else {
+      res.status(500).json({ error: 'Failed to add employee', details: String(error) });
+    }
+  }
+});
+
+// DELETE Employee
+app.delete('/employees/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        // Due to ON DELETE CASCADE, bank_details and time_entries will be deleted automatically
+        // Ensure deletion is scoped by user_id
+        const result = await pool.query('DELETE FROM employees WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Employee not found or unauthorized' });
+        }
+        res.json({ message: 'Employee deleted successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error deleting employee:', error);
+        res.status(500).json({ error: 'Failed to delete employee', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+
+/* --- TIME ENTRIES API --- */
+
+// NEW: GET All Time Entries (for dashboard and general list)
+app.get('/time-entries', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query(`
+            SELECT te.id, te.employee_id, te.entry_date as date, te.hours_worked, te.notes as description, te.status, te.created_at, te.updated_at
+            FROM time_entries te
+            JOIN employees e ON te.employee_id = e.id
+            WHERE e.user_id = $1 -- Filter by user_id
+            ORDER BY te.entry_date DESC, te.created_at DESC
+        `, [user_id]); // Pass user_id as a parameter
+        res.json(result.rows);
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching all time entries:', error);
+        res.status(500).json({ error: 'Failed to fetch all time entries', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Time Entries for a specific employee
+app.get('/employees/:employeeId/time-entries', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { employeeId } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        // Ensure the employee belongs to the user before fetching their time entries
+        const employeeCheck = await pool.query('SELECT id FROM employees WHERE id = $1 AND user_id = $2', [employeeId, user_id]);
+        if (employeeCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Employee not found or unauthorized to view their time entries.' });
+        }
+
+        const result = await pool.query(
+            `SELECT id, employee_id, entry_date as date, hours_worked, notes as description, status, created_at, updated_at
+             FROM time_entries
+             WHERE employee_id = $1
+             ORDER BY entry_date DESC`,
+            [employeeId]
+        );
+        res.json(result.rows);
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching time entries for employee:', error);
+        res.status(500).json({ error: 'Failed to fetch time entries', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// POST Add a new Time Entry for an employee
+app.post('/employees/:employeeId/time-entries', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { employeeId } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    const { date, hours_worked, description } = req.body; // Use date, hours_worked, description to match frontend payload
+
+    if (!date || hours_worked == null || hours_worked <= 0) {
+        return res.status(400).json({ error: 'Date and positive hours worked are required.' });
+    }
+
+    try {
+        // Ensure the employee belongs to the user before adding a time entry for them
+        const employeeCheck = await pool.query('SELECT id FROM employees WHERE id = $1 AND user_id = $2', [employeeId, user_id]);
+        if (employeeCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Employee not found or unauthorized to add time entries for them.' });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO time_entries (employee_id, entry_date, hours_worked, notes, status)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id, employee_id, entry_date as date, hours_worked, notes as description, status`, // Return full object
+            [employeeId, date, hours_worked, description || null, 'pending'] // Explicitly set status to 'pending'
+        );
+        res.status(201).json(result.rows[0]); // Return the created time entry object
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error adding time entry:', error);
+        res.status(500).json({ error: 'Failed to add time entry', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// PUT Update a specific Time Entry
+app.put('/time-entries/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    const { date, hours_worked, description, status } = req.body; // Allow status to be updated
+
+    // Build dynamic query parts
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (date !== undefined) { updates.push(`entry_date = $${paramIndex++}`); values.push(date); }
+    if (hours_worked !== undefined) { updates.push(`hours_worked = $${paramIndex++}`); values.push(hours_worked); }
+    if (description !== undefined) { updates.push(`notes = $${paramIndex++}`); values.push(description); }
+    if (status !== undefined) { updates.push(`status = $${paramIndex++}`); values.push(status); }
+
+    if (updates.length === 0) {
+        return res.status(400).json({ error: 'No fields provided for update.' });
+    }
+
+    updates.push(`updated_at = CURRENT_TIMESTAMP`); // Always update timestamp
+
+    // Add user_id to the WHERE clause for security
+    values.push(id); // The ID for WHERE id = $X
+    values.push(user_id); // The user_id for WHERE user_id = $Y
+
+    try {
+        const result = await pool.query(
+            `UPDATE time_entries te
+             SET ${updates.join(', ')}
+             FROM employees e
+             WHERE te.employee_id = e.id AND te.id = $${paramIndex} AND e.user_id = $${paramIndex + 1}
+             RETURNING te.id, te.employee_id, te.entry_date as date, te.hours_worked, te.notes as description, te.status`, // Return updated object
+            values
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Time entry not found or unauthorized' });
+        }
+        res.json(result.rows[0]); // Return the updated time entry object
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error updating time entry:', error);
+        res.status(500).json({ error: 'Failed to update time entry', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// DELETE a specific Time Entry
+app.delete('/time-entries/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        // Ensure deletion is scoped by user_id by joining with employees table
+        const result = await pool.query(
+            `DELETE FROM time_entries te
+             USING employees e
+             WHERE te.employee_id = e.id AND te.id = $1 AND e.user_id = $2
+             RETURNING te.id`,
+            [id, user_id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Time entry not found or unauthorized' });
+        }
+        res.json({ message: 'Time entry deleted successfully' });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error deleting time entry:', error);
+        res.status(500).json({ error: 'Failed to delete time entry', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+/* **START OF REPLACED/MODIFIED SUPPLIER ROUTES** */
+
+/* --- Supplier API (Replacing existing /vendors routes) --- */
+
+// GET All Suppliers (and filter by search term if provided)
+app.get('/api/suppliers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    // Asserting req.query.search as string to allow .toLowerCase()
+    const searchTerm = req.query.search as string | undefined;
+
+    let query = 'SELECT id, name, email, phone, address, vat_number, total_purchased FROM public.suppliers WHERE user_id = $1'; // ADDED user_id filter
+    const queryParams: (string | number)[] = [user_id]; // Initialize with user_id
+    let paramIndex = 2; // Start index at 2 because $1 is user_id
+
+    if (searchTerm) {
+        query += ` AND (LOWER(name) ILIKE $${paramIndex} OR LOWER(email) ILIKE $${paramIndex})`;
+        queryParams.push(`%${searchTerm.toLowerCase()}%`);
+    }
+
+    query += ' ORDER BY name ASC';
+
+    try {
+        const { rows } = await pool.query<SupplierDB>(query, queryParams);
+        const formattedRows = rows.map(mapSupplierToFrontend);
+        res.json(formattedRows);
+    } catch (error: unknown) { // Explicitly type error as unknown
+        console.error('Error fetching suppliers:', error);
+        res.status(500).json({ error: 'Failed to fetch suppliers', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET a single supplier by ID (useful for "Eye" button or detailed view)
+app.get('/api/suppliers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const { rows } = await pool.query<SupplierDB>(
+            'SELECT id, name, email, phone, address, vat_number, total_purchased FROM public.suppliers WHERE id = $1 AND user_id = $2', // ADDED user_id filter
+            [id, user_id]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Supplier not found or unauthorized' });
+        }
+        res.json(mapSupplierToFrontend(rows[0]));
+    } catch (error: unknown) {
+        console.error(`Error fetching supplier with ID ${id}:`, error);
+        res.status(500).json({ error: 'Failed to fetch supplier', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+
+// POST Create New Supplier
+app.post('/api/suppliers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { name, email, phone, address, vatNumber } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!name) {
+        return res.status(400).json({ error: 'Supplier name is required' });
+    }
+
+    try {
+        const result = await pool.query<SupplierDB>(
+            `INSERT INTO public.suppliers (name, email, phone, address, vat_number, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, email, phone, address, vat_number, total_purchased`,
+            [name, email || null, phone || null, address || null, vatNumber || null, user_id] // ADDED user_id
+        );
+        res.status(201).json(mapSupplierToFrontend(result.rows[0]));
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error adding supplier:', error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') { // Check for unique violation
+            return res.status(409).json({ error: 'A supplier with this email or VAT number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to add supplier', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// PUT Update Existing Supplier
+app.put('/api/suppliers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    const { name, email, phone, address, vatNumber } = req.body;
+
+    if (!name) { // Name is required for update
+        return res.status(400).json({ error: 'Supplier name is required for update.' });
+    }
+
+    try {
+        const result = await pool.query<SupplierDB>(
+            `UPDATE public.suppliers
+             SET name = $1, email = $2, phone = $3, address = $4, vat_number = $5, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $6 AND user_id = $7 RETURNING id, name, email, phone, address, vat_number, total_purchased`, // ADDED user_id filter
+            [name, email || null, phone || null, address || null, vatNumber || null, id, user_id] // ADDED user_id
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Supplier not found or unauthorized.' });
+        }
+        res.json(mapSupplierToFrontend(result.rows[0]));
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error(`Error updating supplier with ID ${id}:`, error);
+        if (error instanceof Error && 'code' in error && error.code === '23505') {
+            return res.status(409).json({ error: 'A supplier with this email or VAT number already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to update supplier', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// DELETE a Supplier
+app.delete('/api/suppliers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    try {
+        const { rowCount } = await pool.query(
+            'DELETE FROM public.suppliers WHERE id = $1 AND user_id = $2', // ADDED user_id filter
+            [id, user_id]
+        );
+
+        if (rowCount === 0) {
+            return res.status(404).json({ error: 'Supplier not found or unauthorized.' });
+        }
+        res.status(204).send(); // No Content for successful deletion
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error(`Error deleting supplier with ID ${id}:`, error);
+        if (error instanceof Error && 'code' in error && error.code === '23503') { // PostgreSQL foreign key violation error
+            return res.status(409).json({
+                error: 'Cannot delete supplier: associated with existing purchase orders or other records.',
+                detail: error.message
+            });
+        }
+        res.status(500).json({ error: 'Failed to delete supplier', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+/* --- Product API Endpoints --- */
+
+// Helper function to get tax_rate_id from vatRate (value)
+// This will be used in POST and PUT operations
+const getTaxRateIdFromVatRate = async (rate: number | undefined): Promise<number | null> => {
+    if (rate === undefined || rate === null) {
+        return null;
+    }
+    try {
+        const { rows } = await pool.query<{ tax_rate_id: number }>('SELECT tax_rate_id FROM public.tax_rates WHERE rate = $1', [rate]);
+        if (rows.length > 0) {
+            return rows[0].tax_rate_id;
+        }
+        // Optionally, if the rate doesn't exist, you could insert it here,
+        // or return null and let the calling function handle it (e.g., error).
+        // For simplicity, we'll return null if not found.
+        return null;
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching tax_rate_id by rate:', error);
+        return null; // Or throw to propagate the error
+    }
+};
+// Interface for database product data
+interface ProductDB {
+  id: number;
+  name: string;
+  description: string | null;
+  unit_price: number;
+  cost_price: number | null;
+  sku: string | null;
+  is_service: boolean;
+  stock_quantity: number;
+  created_at: Date;
+  updated_at: Date;
+  tax_rate_id: number | null;
+  category: string | null;
+  unit: string | null;
+  tax_rate_value?: number; // Joined from tax_rates
+  min_quantity?: number | null; // Added
+  max_quantity?: number | null; // Added
+  available_value?: number | null; // Added
+  user_id: string; // Added user_id to ProductDB
+}
+
+// Interface for product data received in POST/PUT requests
+interface CreateUpdateProductBody {
+    name: string;
+    description?: string;
+    price: number; // Frontend sends sellingPrice as 'price'
+    costPrice?: number;
+    sku?: string;
+    isService?: boolean; // Frontend sends 'isService'
+    stock?: number; // Frontend sends 'qty' as 'stock'
+    vatRate?: number;
+    category?: string;
+    unit?: string;
+    minQty?: number; // ADDED
+    maxQty?: number; // ADDED
+    availableValue?: number; // ADDED
+}
+
+// GET All Products (with optional search)
+// Path: /api/products
+// GET All Products (with optional search)
+// Path: /api/products
+app.get('/api/products', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    const searchTerm = req.query.search as string | undefined;
+
+    let query = `
+        SELECT
+            ps.id, ps.name, ps.description, ps.unit_price, ps.cost_price, ps.sku,
+            ps.is_service, ps.stock_quantity, ps.created_at, ps.updated_at,
+            ps.tax_rate_id, ps.category, ps.unit, tr.rate AS tax_rate_value,
+            ps.min_quantity, ps.max_quantity, ps.available_value, ps.user_id -- ADDED min_quantity, max_quantity, available_value, user_id
+        FROM public.products_services ps
+        LEFT JOIN public.tax_rates tr ON ps.tax_rate_id = tr.tax_rate_id
+        WHERE ps.user_id = $1
+    `;
+    const queryParams: (string | number)[] = [user_id];
+    let paramIndex = 2;
+
+    if (searchTerm) {
+        query += ` AND (LOWER(ps.name) ILIKE $${paramIndex} OR LOWER(ps.description) ILIKE $${paramIndex} OR LOWER(ps.sku) ILIKE $${paramIndex} OR LOWER(ps.category) ILIKE $${paramIndex})`;
+        queryParams.push(`%${searchTerm.toLowerCase()}%`);
+    }
+
+    query += ' ORDER BY ps.name ASC';
+
+    try {
+        const { rows } = await pool.query<ProductDB>(query, queryParams);
+        const formattedRows = rows.map(mapProductToFrontend);
+        res.json(formattedRows);
+    } catch (error: unknown) {
+        console.error('Error fetching products:', error);
+        res.status(500).json({ error: 'Failed to fetch products', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET a single product by ID
+// Path: /api/products/:id
+app.get('/api/products/:id', authMiddleware, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const { rows } = await pool.query<ProductDB>(
+            `SELECT
+                ps.id, ps.name, ps.description, ps.unit_price, ps.cost_price, ps.sku,
+                ps.is_service, ps.stock_quantity, ps.created_at, ps.updated_at,
+                ps.tax_rate_id, ps.category, ps.unit, tr.rate AS tax_rate_value,
+                ps.min_quantity, ps.max_quantity, ps.available_value, ps.user_id -- ADDED min_quantity, max_quantity, available_value, user_id
+             FROM public.products_services ps
+             LEFT JOIN public.tax_rates tr ON ps.tax_rate_id = tr.tax_rate_id
+             WHERE ps.id = $1 AND ps.user_id = $2`,
+            [id, user_id]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Product not found or unauthorized' });
+        }
+        res.json(mapProductToFrontend(rows[0]));
+    } catch (error: unknown) {
+        console.error(`Error fetching product with ID ${id}:`, error);
+        res.status(500).json({ error: 'Failed to fetch product', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// POST Create New Product
+// Path: /api/products
+app.post('/api/products', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    const {
+        name, description, price, costPrice, sku,
+        isService = false, stock = 0, vatRate, category, unit,
+        minQty = 0, maxQty = 0, availableValue = 0 // ADDED minQty, maxQty, availableValue with defaults
+    }: CreateUpdateProductBody = req.body;
+
+    // Basic validation
+    if (!name || price === undefined || price === null) {
+        return res.status(400).json({ error: 'Product name and price are required.' });
+    }
+    if (typeof price !== 'number' || price < 0) {
+        return res.status(400).json({ error: 'Price must be a non-negative number.' });
+    }
+
+    const taxRateId = await getTaxRateIdFromVatRate(vatRate);
+
+    if (vatRate !== undefined && vatRate !== null && taxRateId === null) {
+        return res.status(400).json({ error: `Provided VAT rate ${vatRate} does not exist in tax_rates.` });
+    }
+
+    try {
+        const result = await pool.query<ProductDB>(
+            `INSERT INTO public.products_services (
+                name, description, unit_price, cost_price, sku, is_service,
+                stock_quantity, tax_rate_id, category, unit, user_id,
+                min_quantity, max_quantity, available_value -- ADDED columns
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) -- ADDED values
+            RETURNING
+                id, name, description, unit_price, cost_price, sku,
+                is_service, stock_quantity, created_at, updated_at,
+                tax_rate_id, category, unit, min_quantity, max_quantity, available_value, user_id`, // ADDED returning fields
+            [
+                name,
+                description || null,
+                price,
+                costPrice || null,
+                sku || null,
+                isService,
+                stock,
+                taxRateId,
+                category || null,
+                unit || null,
+                user_id,
+                minQty, // ADDED
+                maxQty, // ADDED
+                availableValue // ADDED
+            ]
+        );
+
+        const newProductDb = result.rows[0];
+        if (newProductDb.tax_rate_id) {
+            const { rows: taxRows } = await pool.query<{ rate: number }>('SELECT rate FROM public.tax_rates WHERE tax_rate_id = $1', [newProductDb.tax_rate_id]);
+            if (taxRows.length > 0) {
+                newProductDb.tax_rate_value = taxRows[0].rate;
+            }
+        }
+        res.status(201).json(mapProductToFrontend(newProductDb));
+
+    } catch (error: unknown) {
+        console.error('Error adding product:', error);
+        if (error instanceof Error && 'code' in error) {
+            if (error.code === '23505') {
+                return res.status(409).json({ error: 'A product with this SKU already exists.' });
+            }
+            if (error.code === '23503') {
+                return res.status(400).json({ error: 'Invalid VAT rate ID provided.', detail: error.message });
+            }
+        }
+        res.status(500).json({ error: 'Failed to add product', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// PUT Update Existing Product
+// Path: /api/products/:id
+app.put('/api/products/:id', authMiddleware, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    const {
+        name, description, price, costPrice, sku,
+        isService, stock, vatRate, category, unit,
+        minQty, maxQty, availableValue // ADDED minQty, maxQty, availableValue
+    }: CreateUpdateProductBody = req.body;
+
+    // Construct dynamic update query
+    const updates: string[] = [];
+    const values: (string | number | boolean | null)[] = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) { updates.push(`name = $${paramIndex++}`); values.push(name); }
+    if (description !== undefined) { updates.push(`description = $${paramIndex++}`); values.push(description || null); }
+    if (price !== undefined) {
+        if (typeof price !== 'number' || price < 0) {
+            return res.status(400).json({ error: 'Price must be a non-negative number.' });
+        }
+        updates.push(`unit_price = $${paramIndex++}`); values.push(price);
+    }
+    if (costPrice !== undefined) { updates.push(`cost_price = $${paramIndex++}`); values.push(costPrice || null); }
+    if (sku !== undefined) { updates.push(`sku = $${paramIndex++}`); values.push(sku || null); }
+    if (isService !== undefined) { updates.push(`is_service = $${paramIndex++}`); values.push(isService); }
+    if (stock !== undefined) { updates.push(`stock_quantity = $${paramIndex++}`); values.push(stock); }
+    if (category !== undefined) { updates.push(`category = $${paramIndex++}`); values.push(category || null); }
+    if (unit !== undefined) { updates.push(`unit = $${paramIndex++}`); values.push(unit || null); }
+    if (minQty !== undefined) { updates.push(`min_quantity = $${paramIndex++}`); values.push(minQty); } // ADDED
+    if (maxQty !== undefined) { updates.push(`max_quantity = $${paramIndex++}`); values.push(maxQty); } // ADDED
+    if (availableValue !== undefined) { updates.push(`available_value = $${paramIndex++}`); values.push(availableValue); } // ADDED
+
+
+    let taxRateId: number | null | undefined;
+    if (vatRate !== undefined) {
+        taxRateId = await getTaxRateIdFromVatRate(vatRate);
+        if (vatRate !== null && taxRateId === null) {
+            return res.status(400).json({ error: `Provided VAT rate ${vatRate} does not exist in tax_rates.` });
+        }
+        updates.push(`tax_rate_id = $${paramIndex++}`); values.push(taxRateId);
+    }
+
+
+    if (updates.length === 0) {
+        return res.status(400).json({ error: 'No fields provided for update.' });
+    }
+
+    updates.push(`updated_at = CURRENT_TIMESTAMP`); // Always update timestamp
+
+    const query = `UPDATE public.products_services SET ${updates.join(', ')} WHERE id = $${paramIndex} AND user_id = $${paramIndex + 1} RETURNING id, name, description, unit_price, cost_price, sku, is_service, stock_quantity, created_at, updated_at, tax_rate_id, category, unit, min_quantity, max_quantity, available_value, user_id`; // ADDED returning fields
+    values.push(id);
+    values.push(user_id);
+
+    try {
+        const result = await pool.query<ProductDB>(query, values);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Product not found or unauthorized.' });
+        }
+        const updatedProductDb = result.rows[0];
+        if (updatedProductDb.tax_rate_id) {
+            const { rows: taxRows } = await pool.query<{ rate: number }>('SELECT rate FROM public.tax_rates WHERE tax_rate_id = $1', [updatedProductDb.tax_rate_id]);
+            if (taxRows.length > 0) {
+                updatedProductDb.tax_rate_value = taxRows[0].rate;
+            }
+        }
+        res.json(mapProductToFrontend(updatedProductDb));
+
+    } catch (error: unknown) {
+        console.error(`Error updating product with ID ${id}:`, error);
+        if (error instanceof Error && 'code' in error) {
+            if (error.code === '23505') {
+                return res.status(409).json({ error: 'A product with this SKU already exists.' });
+            }
+            if (error.code === '23503') {
+                return res.status(400).json({ error: 'Invalid VAT rate ID provided.', detail: error.message });
+            }
+        }
+        res.status(500).json({ error: 'Failed to update product', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// DELETE a Product
+// Path: /api/products/:id
+app.delete('/api/products/:id', authMiddleware, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    try {
+        const { rowCount } = await pool.query(
+            'DELETE FROM public.products_services WHERE id = $1 AND user_id = $2',
+            [id, user_id]
+        );
+
+        if (rowCount === 0) {
+            return res.status(404).json({ error: 'Product not found or unauthorized.' });
+        }
+        res.status(204).send(); // No Content for successful deletion
+    } catch (error: unknown) {
+        console.error(`Error deleting product with ID ${id}:`, error);
+        if (error instanceof Error && 'code' in error && error.code === '23503') {
+            return res.status(409).json({
+                error: 'Cannot delete product: associated with existing records (e.g., invoices).',
+                detail: error.message
+            });
+        }
+        res.status(500).json({ error: 'Failed to delete product', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Products/Services (This seems like a duplicate of /api/products but without search)
+// Keeping it for now as it was in your provided snippet, but consider consolidating.
+app.get('/products-services', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.user_id;
+  try {
+    const result = await pool.query(
+      `SELECT id, name, description, unit_price, cost_price, sku, is_service, stock_quantity, unit,
+              min_quantity, max_quantity, available_value, user_id -- ADDED min_quantity, max_quantity, available_value, user_id
+       FROM products_services WHERE user_id = $1 ORDER BY name`, [user_id]
+    );
+
+    const formattedRows = result.rows.map(row => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      unit_price: Number(row.unit_price),
+      cost_price: row.cost_price ? Number(row.cost_price) : null,
+      sku: row.sku,
+      is_service: row.is_service,
+      stock_quantity: parseInt(row.stock_quantity, 10),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      tax_rate_id: row.tax_rate_id,
+      category: row.category,
+      unit: row.unit,
+      tax_rate_value: row.tax_rate_value, // If this is joined, ensure it's handled
+      min_quantity: row.min_quantity !== null ? Number(row.min_quantity) : null, // Added
+      max_quantity: row.max_quantity !== null ? Number(row.max_quantity) : null, // Added
+      available_value: row.available_value !== null ? Number(row.available_value) : null, // Added
+      user_id: row.user_id, // Added
+    }));
+
+    res.json(formattedRows);
+  } catch (error: unknown) {
+    console.error('Error fetching products/services:', error);
+    res.status(500).json({ error: 'Failed to fetch products/services', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// POST Product/Service (This also seems like a duplicate of /api/products but with different payload keys)
+// Keeping it for now as it was in your provided snippet, but consider consolidating.
+app.post('/products-services', authMiddleware, async (req: Request, res: Response) => {
+  const { name, description, unit_price, cost_price, sku, is_service, stock_quantity } = req.body;
+  const user_id = req.user!.user_id;
+  if (!name || unit_price == null) {
+    return res.status(400).json({ error: 'Product/Service name and unit_price are required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO products_services (name, description, unit_price, cost_price, sku, is_service, stock_quantity, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [name, description || null, unit_price, cost_price || null, sku || null, is_service || false, stock_quantity || 0, user_id]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error: unknown) {
+    console.error('Error adding product/service:', error);
+    res.status(500).json({ error: 'Failed to add product/service', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// PUT Update Product Stock
+app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { adjustmentQuantity } = req.body;
+  const user_id = req.user!.user_id;
+
+  const parsedAdjustmentQuantity = Number(adjustmentQuantity);
+
+  if (typeof parsedAdjustmentQuantity !== 'number' || isNaN(parsedAdjustmentQuantity)) {
+    return res.status(400).json({ error: 'adjustmentQuantity must be a valid number.' });
+  }
+
+  try {
+    await pool.query('BEGIN');
+
+    const productResult = await pool.query(
+      'SELECT stock_quantity, name FROM public.products_services WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [id, user_id]
+    );
+
+    if (productResult.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'Product or service not found or unauthorized.' });
+    }
+
+    const currentStock = Number(productResult.rows[0].stock_quantity);
+    const productName = productResult.rows[0].name;
+
+    const newStock = currentStock + parsedAdjustmentQuantity;
+
+    if (parsedAdjustmentQuantity < 0 && newStock < 0) {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Insufficient stock for "${productName}". Current stock: ${currentStock}. Cannot sell ${Math.abs(parsedAdjustmentQuantity)}.`,
+        availableStock: currentStock,
+      });
+    }
+
+    const updateResult = await pool.query(
+      `UPDATE public.products_services
+       SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND user_id = $3
+       RETURNING id, name, stock_quantity`,
+      [newStock, id, user_id]
+    );
+
+    await pool.query('COMMIT');
+
+    res.json({
+      message: `Stock for "${updateResult.rows[0].name}" updated successfully.`,
+      product: updateResult.rows[0],
+    });
+
+  } catch (error: unknown) {
+    await pool.query('ROLLBACK');
+    console.error(`Error updating stock for product ID ${id}:`, error);
+    res.status(500).json({
+      error: 'Failed to update product stock',
+      detail: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+/* --- Stats API Endpoints --- */
+
+// Helper function to calculate change percentage and type
+const calculateChange = (current: number, previous: number) => {
+    if (previous === 0 && current === 0) {
+        return { changePercentage: 0, changeType: 'neutral' };
+    }
+    if (previous === 0) { // If previous was 0 and current is not, it's an increase
+        return { changePercentage: 100, changeType: 'increase' }; // Or a very large number, but 100% is clear
+    }
+    const percentage = ((current - previous) / previous) * 100;
+    let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+    if (percentage > 0) {
+        changeType = 'increase';
+    } else if (percentage < 0) {
+        changeType = 'decrease';
+    }
+    return { changePercentage: parseFloat(percentage.toFixed(2)), changeType };
+};
+
+// Define a common date range for "current" and "previous" periods (e.g., last 30 days vs. prior 30 days)
+const getCurrentAndPreviousDateRanges = () => {
+    const now = new Date();
+    const currentPeriodEnd = now.toISOString();
+
+    const currentPeriodStart = new Date();
+    currentPeriodStart.setDate(now.getDate() - 30); // Last 30 days
+    const currentPeriodStartISO = currentPeriodStart.toISOString();
+
+    const previousPeriodEnd = currentPeriodStart.toISOString();
+    const previousPeriodStart = new Date(currentPeriodStart);
+    previousPeriodStart.setDate(currentPeriodStart.getDate() - 30); // 30 days before that
+    const previousPeriodStartISO = previousPeriodStart.toISOString();
+
+    return {
+        currentStart: currentPeriodStartISO,
+        currentEnd: currentPeriodEnd,
+        previousStart: previousPeriodStartISO,
+        previousEnd: previousPeriodEnd
+    };
+};
+
+
+// GET Client Count with Change
+app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+
+        const currentResult = await pool.query(
+            'SELECT COUNT(id) AS count FROM public.customers WHERE created_at >= $1 AND created_at <= $2 AND user_id = $3', // ADDED user_id filter
+            [currentStart, currentEnd, user_id]
+        );
+        const previousResult = await pool.query(
+            'SELECT COUNT(id) AS count FROM public.customers WHERE created_at >= $1 AND created_at < $2 AND user_id = $3', // ADDED user_id filter
+            [previousStart, previousEnd, user_id]
+        );
+
+        const currentCount = parseInt(currentResult.rows[0].count, 10);
+        const previousCount = parseInt(previousResult.rows[0].count, 10);
+
+        const { changePercentage, changeType } = calculateChange(currentCount, previousCount);
+
+        res.json({
+            count: currentCount,
+            previousCount: previousCount,
+            changePercentage: changePercentage,
+            changeType: changeType
+        });
+    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+        console.error('Error fetching client count:', error);
+        res.status(500).json({ error: 'Failed to fetch client count', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+// GET Quotes Count with Change
+// GET Quotes Count with Change
+app.get('/api/stats/quotes', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+
+        const currentResult = await pool.query(
+            'SELECT COUNT(id) AS count FROM public.quotations WHERE created_at >= $1 AND created_at <= $2 AND user_id = $3', // ADDED user_id filter
+            [currentStart, currentEnd, user_id]
+        );
+        const previousResult = await pool.query(
+            'SELECT COUNT(id) AS count FROM public.quotations WHERE created_at >= $1 AND created_at < $2 AND user_id = $3', // ADDED user_id filter
+            [previousStart, previousEnd, user_id]
+        );
+
+        const currentCount = parseInt(currentResult.rows[0].count, 10);
+        const previousCount = parseInt(previousResult.rows[0].count, 10);
+
+        const { changePercentage, changeType } = calculateChange(currentCount, previousCount);
+
+        res.json({
+            count: currentCount,
+            previousCount: previousCount,
+            changePercentage: changePercentage,
+            changeType: changeType
+        });
+    } catch (error: unknown) {
+        console.error('Error fetching quote count:', error);
+        res.status(500).json({ error: 'Failed to fetch quote count', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Invoices Count with Change
+app.get('/api/stats/invoices', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+
+        const currentResult = await pool.query(
+            'SELECT COUNT(id) AS count FROM public.invoices WHERE created_at >= $1 AND created_at <= $2 AND user_id = $3', // ADDED user_id filter
+            [currentStart, currentEnd, user_id]
+        );
+        const previousResult = await pool.query(
+            'SELECT COUNT(id) AS count FROM public.invoices WHERE created_at >= $1 AND created_at < $2 AND user_id = $3', // ADDED user_id filter
+            [previousStart, previousEnd, user_id]
+        );
+
+        const currentCount = parseInt(currentResult.rows[0].count, 10);
+        const previousCount = parseInt(previousResult.rows[0].count, 10);
+
+        const { changePercentage, changeType } = calculateChange(currentCount, previousCount);
+
+        res.json({
+            count: currentCount,
+            previousCount: previousCount,
+            changePercentage: changePercentage,
+            changeType: changeType
+        });
+    } catch (error: unknown) {
+        console.error('Error fetching invoice count:', error);
+        res.status(500).json({ error: 'Failed to fetch invoice count', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Total Invoice Value with Change
+app.get('/api/stats/invoice-value', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+
+        const currentResult = await pool.query(
+            'SELECT COALESCE(SUM(total_amount), 0) AS value FROM public.invoices WHERE created_at >= $1 AND created_at <= $2 AND user_id = $3', // ADDED user_id filter
+            [currentStart, currentEnd, user_id]
+        );
+        const previousResult = await pool.query(
+            'SELECT COALESCE(SUM(total_amount), 0) AS value FROM public.invoices WHERE created_at >= $1 AND created_at < $2 AND user_id = $3', // ADDED user_id filter
+            [previousStart, previousEnd, user_id]
+        );
+
+        const currentValue = parseFloat(currentResult.rows[0].value);
+        const previousValue = parseFloat(previousResult.rows[0].value);
+
+        const { changePercentage, changeType } = calculateChange(currentValue, previousValue);
+
+        res.json({
+            value: currentValue,
+            previousValue: previousValue,
+            changePercentage: changePercentage,
+            changeType: changeType
+        });
+    } catch (error: unknown) {
+        console.error('Error fetching total invoice value:', error);
+        res.status(500).json({ error: 'Failed to fetch total invoice value', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+// STAT APIs
+// Helper to format month to YYYY-MM
+const formatMonth = (date: Date) => {
+    return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}`;
+};
+
+// GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
+app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        // Fetch invoice revenue by month
+        // Using 'created_at' for consistency across transaction tables
+        const invoicesResult = await pool.query(`
+            SELECT
+                TO_CHAR(created_at, 'YYYY-MM') AS month,
+                COALESCE(SUM(total_amount), 0) AS revenue
+            FROM public.invoices
+            WHERE user_id = $1 -- ADDED user_id filter
+            GROUP BY month
+            ORDER BY month;
+        `, [user_id]);
+
+        // Fetch expenses by month (assuming an 'expenses' table with 'amount' and a date column)
+        // IMPORTANT: Verify the column name for date in your 'public.expenses' table.
+        // It is currently assumed to be 'date'. If it's different (e.g., 'created_at'), please change it.
+        const expensesResult = await pool.query(`
+            SELECT
+                TO_CHAR(date, 'YYYY-MM') AS month,
+                COALESCE(SUM(amount), 0) AS expenses
+            FROM public.transactions /* Changed to transactions table for expense data */
+            WHERE type = 'expense' AND user_id = $1 -- ADDED user_id filter
+            GROUP BY month
+            ORDER BY month;
+        `, [user_id]);
+
+        const revenueMap = new Map<string, { revenue: number, expenses: number }>();
+
+        // Populate revenue and initialize expenses
+        invoicesResult.rows.forEach(row => {
+            revenueMap.set(row.month, { revenue: parseFloat(row.revenue), expenses: 0 });
+        });
+
+        // Add expenses to the map
+        expensesResult.rows.forEach(row => {
+            if (revenueMap.has(row.month)) {
+                const existing = revenueMap.get(row.month)!;
+                existing.expenses = parseFloat(row.expenses);
+            } else {
+                revenueMap.set(row.month, { revenue: 0, expenses: parseFloat(row.expenses) });
+            }
+        });
+
+        // Consolidate and calculate profit
+        const monthlyData: { month: string; profit: number; expenses: number; revenue: number }[] = [];
+        const sortedMonths = Array.from(revenueMap.keys()).sort();
+
+        sortedMonths.forEach(month => {
+            const data = revenueMap.get(month)!;
+            const profit = data.revenue - data.expenses;
+            monthlyData.push({
+                month,
+                profit: parseFloat(profit.toFixed(2)),
+                expenses: parseFloat(data.expenses.toFixed(2)), // Ensure expenses are positive for display
+                revenue: parseFloat(data.revenue.toFixed(2))
+            });
+        });
+
+        res.json(monthlyData);
+    } catch (error: unknown) {
+        console.error('Error fetching revenue trend data:', error);
+        res.status(500).json({ error: 'Failed to fetch revenue trend data', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET Transaction Volume Data (Quotes, Invoices, Purchases by Month)
+app.get('/api/charts/transaction-volume', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        // Fetch quotes count by month
+        // Using 'created_at' as per your provided schema for consistency
+        const quotesResult = await pool.query(`
+            SELECT
+                TO_CHAR(created_at, 'YYYY-MM') AS month,
+                COUNT(id) AS count
+            FROM public.quotations
+            WHERE user_id = $1 -- ADDED user_id filter
+            GROUP BY month
+            ORDER BY month;
+        `, [user_id]);
+
+        // Fetch invoices count by month
+        // Using 'created_at' as per your provided schema for consistency
+        const invoicesResult = await pool.query(`
+            SELECT
+                TO_CHAR(created_at, 'YYYY-MM') AS month,
+                COUNT(id) AS count
+            FROM public.invoices
+            WHERE user_id = $1 -- ADDED user_id filter
+            GROUP BY month
+            ORDER BY month;
+        `, [user_id]);
+
+        // Fetch purchases count by month
+        // Using 'created_at' as per your provided schema for consistency
+        const purchasesResult = await pool.query(`
+            SELECT
+                TO_CHAR(created_at, 'YYYY-MM') AS month,
+                COUNT(id) AS count
+            FROM public.purchases
+            WHERE user_id = $1 -- ADDED user_id filter
+            GROUP BY month
+            ORDER BY month;
+        `, [user_id]);
+
+        const monthlyMap = new Map<string, { quotes: number; invoices: number; purchases: number }>();
+
+        // Populate map with all months and initialize counts
+        quotesResult.rows.forEach(row => {
+            monthlyMap.set(row.month, { quotes: parseInt(row.count, 10), invoices: 0, purchases: 0 });
+        });
+        purchasesResult.rows.forEach(row => {
+            if (monthlyMap.has(row.month)) {
+                monthlyMap.get(row.month)!.purchases = parseInt(row.count, 10);
+            } else {
+                monthlyMap.set(row.month, { quotes: 0, invoices: 0, purchases: parseInt(row.count, 10) });
+            }
+        });
+        invoicesResult.rows.forEach(row => {
+            if (monthlyMap.has(row.month)) {
+                monthlyMap.get(row.month)!.invoices = parseInt(row.count, 10);
+            } else {
+                monthlyMap.set(row.month, { quotes: 0, invoices: parseInt(row.count, 10), purchases: 0 });
+            }
+        });
+
+        // Sort months and convert to array
+        const sortedMonths = Array.from(monthlyMap.keys()).sort();
+        const monthlyData: { month: string; quotes: number; invoices: number; purchases: number }[] = [];
+
+        sortedMonths.forEach(month => {
+            monthlyData.push({
+                month,
+                quotes: monthlyMap.get(month)?.quotes || 0,
+                invoices: monthlyMap.get(month)?.invoices || 0,
+                purchases: monthlyMap.get(month)?.purchases || 0,
+            });
+        });
+
+        res.json(monthlyData);
+    } catch (error: unknown) {
+        console.error('Error fetching transaction volume data:', error);
+        res.status(500).json({ error: 'Failed to fetch transaction volume data', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// Upload endpoint
+app.post('/documents', authMiddleware, upload.single('file'), async (req: Request, res: Response) => { // ADDED authMiddleware
+    try {
+        const file = req.file;
+        const { name, type, description } = req.body; // Removed user_id from req.body
+        const user_id = req.user!.user_id; // Get user_id from req.user
+
+        if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+        // In a real application, you'd store the file securely (e.g., S3, Google Cloud Storage)
+        // For this example, we're simulating a file URL.
+        // You might need a more robust file storage solution.
+        const fileUrl = `/uploads/${file.originalname}`; // Using originalname as a placeholder
+
+        const mimeType = file.mimetype;
+        const fileSize = file.size;
+
+        const result = await pool.query(
+            `INSERT INTO documents (user_id, name, type, description, file_url, file_mime_type, file_size_bytes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+            [user_id, name, type, description, fileUrl, mimeType, fileSize]
+        );
+
+        res.status(201).json(result.rows[0]);
+    } catch (error: unknown) {
+        console.error('Upload error:', error);
+        res.status(500).json({ error: 'Something went wrong', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// (Optional) Get all documents
+app.get('/documents', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query('SELECT * FROM documents WHERE user_id = $1 ORDER BY uploaded_at DESC', [user_id]); // ADDED user_id filter
+        res.json(result.rows);
+    } catch (error: unknown) {
+        res.status(500).json({ error: 'Failed to fetch documents', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// Helper function to get status based on progress percentage
+const getStatusFromPercentage = (percentage: number): string => {
+    if (percentage === 100) {
+        return 'Done';
+    } else if (percentage >= 75) {
+        return 'Review';
+    } else if (percentage >= 25) {
+        return 'In Progress';
+    } else {
+        return 'To Do';
+    }
+};
+
+/* --- Task Management API Endpoints --- */
+
+// POST /api/tasks - Create a new task
+app.post('/api/tasks', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { title, description, priority, due_date, project_id, progress_percentage: clientProgress } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user (replaces dummyUserId)
+
+    if (!title) {
+        return res.status(400).json({ error: 'Task title is required.' });
+    }
+
+    // Ensure progress_percentage is a number and clamp it between 0 and 100
+    const progress_percentage = typeof clientProgress === 'number' ? Math.max(0, Math.min(100, clientProgress)) : 0;
+    // Derive status from the provided progress_percentage
+    const status = getStatusFromPercentage(progress_percentage);
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO public.tasks (user_id, title, description, status, priority, due_date, progress_percentage, project_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) RETURNING *`,
+            [
+                user_id, // Use actual user_id
+                title,
+                description || null,
+                status, // Use derived status
+                priority || 'Medium',
+                due_date || null,
+                progress_percentage, // Use client's progress
+                project_id || null
+            ]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error: unknown) {
+        console.error('Error creating task:', error);
+        res.status(500).json({ error: 'Failed to create task.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET /api/tasks - Fetch all tasks for the authenticated user, with project details
+app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user (replaces dummyUserId)
+
+    try {
+        const result = await pool.query(
+            `SELECT t.id, t.title, t.description, t.status, t.priority, t.due_date, t.progress_percentage, t.created_at, t.updated_at,
+                    t.project_id, p.name AS project_name, p.description AS project_description, p.deadline AS project_deadline,
+                    p.status AS project_status, p.assignee AS project_assignee, p.progress_percentage AS project_overall_progress
+             FROM public.tasks t
+             LEFT JOIN public.projects p ON t.project_id = p.id
+             WHERE t.user_id = $1 ORDER BY t.created_at DESC`, // Filter by actual user_id
+            [user_id]
+        );
+        res.json(result.rows);
+    } catch (error: unknown) {
+        console.error('Error fetching tasks:', error);
+        res.status(500).json({ error: 'Failed to fetch tasks.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// PUT /api/tasks/:id - Update an existing task
+app.put('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const { title, description, priority, due_date, project_id, progress_percentage: clientProgress } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user (replaces dummyUserId)
+
+    if (!title) {
+        return res.status(400).json({ error: 'Task title is required.' });
+    }
+
+    // Ensure progress_percentage is a number and clamp it between 0 and 100
+    const progress_percentage = typeof clientProgress === 'number' ? Math.max(0, Math.min(100, clientProgress)) : 0;
+    // Derive status from the provided progress_percentage
+    const status = getStatusFromPercentage(progress_percentage);
+
+    try {
+        const result = await pool.query(
+            `UPDATE public.tasks
+             SET title = $1, description = $2, status = $3, priority = $4, due_date = $5, progress_percentage = $6, project_id = $7, updated_at = NOW()
+             WHERE id = $8 AND user_id = $9 RETURNING *`, // Filter by actual user_id
+            [
+                title,
+                description || null,
+                status, // Use derived status
+                priority || 'Medium',
+                due_date || null,
+                progress_percentage, // Use client's progress
+                project_id || null,
+                id,
+                user_id // Use actual user_id
+            ]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Task not found or unauthorized.' });
+        }
+        res.json(result.rows[0]);
+    } catch (error: unknown) {
+        console.error('Error updating task:', error);
+        res.status(500).json({ error: 'Failed to update task.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// DELETE /api/tasks/:id - Delete a task
+app.delete('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user (replaces dummyUserId)
+
+    try {
+        const result = await pool.query(
+            `DELETE FROM public.tasks WHERE id = $1 AND user_id = $2 RETURNING id`, // Filter by actual user_id
+            [id, user_id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Task not found or unauthorized.' });
+        }
+        res.status(204).send(); // No Content
+    } catch (error: unknown) {
+        console.error('Error deleting task:', error);
+        res.status(500).json({ error: 'Failed to delete task.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+/* --- Project Management API Endpoints --- */
+
+// POST /api/projects - Create a new project
+app.post('/api/projects', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { name, description, deadline, status, assignee, progress_percentage } = req.body;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!name) {
+        return res.status(400).json({ error: 'Project name is required.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO public.projects (user_id, name, description, deadline, status, assignee, progress_percentage, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW()) RETURNING *`, // ADDED user_id
+            [
+                user_id, // ADDED user_id
+                name,
+                description || null,
+                deadline || null,
+                status || 'Not Started',
+                assignee || null,
+                progress_percentage || 0.00
+            ]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error: unknown) {
+        console.error('Error creating project:', error);
+        res.status(500).json({ error: 'Failed to create project.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// GET /api/projects - Fetch all projects
+app.get('/api/projects', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    try {
+        const result = await pool.query(
+            `SELECT id, name, description, deadline, status, assignee, progress_percentage, created_at, updated_at
+             FROM public.projects WHERE user_id = $1 ORDER BY created_at DESC`, // ADDED user_id filter
+            [user_id]
+        );
+        res.json(result.rows);
+    } catch (error: unknown) {
+        console.error('Error fetching projects:', error);
+        res.status(500).json({ error: 'Failed to fetch projects.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// PUT /api/projects/:id - Update an existing project
+app.put('/api/projects/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+    const { name, description, deadline, status, assignee, progress_percentage } = req.body;
+
+    if (!name) {
+        return res.status(400).json({ error: 'Project name is required.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `UPDATE public.projects
+             SET name = $1, description = $2, deadline = $3, status = $4, assignee = $5, progress_percentage = $6, updated_at = NOW()
+             WHERE id = $7 AND user_id = $8 RETURNING *`, // ADDED user_id filter
+            [
+                name,
+                description || null,
+                deadline || null,
+                status || 'Not Started',
+                assignee || null,
+                progress_percentage || 0.00,
+                id,
+                user_id // ADDED user_id
+            ]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Project not found or unauthorized.' });
+        }
+        res.json(result.rows[0]);
+    } catch (error: unknown) {
+        console.error('Error updating project:', error);
+        res.status(500).json({ error: 'Failed to update project.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// DELETE /api/projects/:id - Delete a project
+app.delete('/api/projects/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+    const { id } = req.params;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    try {
+        const result = await pool.query(
+            `DELETE FROM public.projects WHERE id = $1 AND user_id = $2 RETURNING id`, // ADDED user_id filter
+            [id, user_id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Project not found or unauthorized.' });
+        }
+        res.status(204).send(); // No Content
+    } catch (error: unknown) {
+        console.error('Error deleting project:', error);
+        res.status(500).json({ error: 'Failed to delete project.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+app.get('/generate-financial-document', authMiddleware, async (req: Request, res: Response) => {
+    const { documentType, startDate, endDate } = req.query;
+    const user_id = req.user!.user_id; // Get user_id from req.user
+
+    if (!documentType || !startDate || !endDate) {
+        return res.status(400).json({ error: 'documentType, startDate, and endDate are required.' });
+    }
+
+    // Set response headers for PDF download
+    res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': `attachment; filename="${documentType}-${startDate}-to-${endDate}.pdf"`
+    });
+
+    const doc = new PDFDocument();
+    doc.pipe(res); // Pipe the PDF directly to the response stream
+
+    try {
+        let companyName = "QUANTILYTIX"; // You might want to fetch this from a user's company profile
+
+        // Helper function to format currency for PDF
+        const formatCurrencyForPdf = (amount: number | null | undefined): string => {
+            if (amount === null || amount === undefined) return '-'; // Handle null/undefined balances
+            if (amount === 0) return '-';
+            return parseFloat(amount.toString()).toLocaleString('en-ZA', { style: 'currency', currency: 'ZAR', minimumFractionDigits: 2 });
+        };
+
+        // Common function to draw the header for all documents
+        const drawDocumentHeader = (doc: any, companyName: string, documentTitle: string, dateString: string, disclaimerText: string | null = null) => {
+            doc.fontSize(16).font('Helvetica-Bold').text(companyName, { align: 'center' });
+            doc.fontSize(14).font('Helvetica').text('MANAGEMENT ACCOUNTS', { align: 'center' });
+            doc.moveDown(0.5);
+            doc.fontSize(14).text(documentTitle, { align: 'center' });
+            doc.fontSize(10).text(dateString, { align: 'center' });
+            doc.moveDown();
+
+            if (disclaimerText) {
+                doc.fontSize(8).fillColor('red').text(
+                    disclaimerText,
+                    { align: 'center', width: doc.page.width - 100, continued: false }
+                );
+                doc.fillColor('black'); // Reset text color
+                doc.moveDown(0.5);
+            }
+        };
+
+        // Define common column positions for consistency
+        const col1X = 50;
+        const col2X = 400; // Aligned for values
+        const columnWidth = 100; // For right-aligned columns
+
+        switch (documentType) {
+            case 'income-statement': {
+                const incomeStatementStartDate = startDate as string;
+                const incomeStatementEndDate = endDate as string;
+
+                // Fetch revenue transactions for the period
+                const incomeQueryResult = await pool.query(
+                    `
+                    SELECT
+                        t.category,
+                        SUM(t.amount) AS total_amount
+                    FROM
+                        transactions t
+                    WHERE
+                        t.type = 'income'
+                        AND t.date >= $1 AND t.date <= $2 /* Inclusive end date */
+                        AND t.user_id = $3
+                    GROUP BY
+                        t.category;
+                    `,
+                    [incomeStatementStartDate, incomeStatementEndDate, user_id]
+                );
+                const incomeCategories = incomeQueryResult.rows;
+
+                let totalSales = 0;
+                let interestIncome = 0;
+                let otherIncome = 0;
+                const detailedIncome: { [key: string]: number } = {}; // To store income by category for display
+
+                incomeCategories.forEach(inc => {
+                    const amount = parseFloat(inc.total_amount);
+                    if (inc.category === 'Sales Revenue' || inc.category === 'Trading Income') {
+                        totalSales += amount;
+                    } else if (inc.category === 'Interest Income') {
+                        interestIncome += amount;
+                    } else {
+                        // Aggregate other specific income categories
+                        if (detailedIncome[inc.category]) {
+                            detailedIncome[inc.category] += amount;
+                        } else {
+                            detailedIncome[inc.category] = amount;
+                        }
+                        otherIncome += amount; // Sum all other income for gross income calculation
+                    }
+                });
+
+                // Fetch Cost of Goods Sold
+                const cogsQueryResult = await pool.query(
+                    `
+                    SELECT
+                        SUM(t.amount) AS total_cogs
+                    FROM
+                        transactions t
+                    WHERE
+                        t.type = 'expense' AND t.category = 'Cost of Goods Sold'
+                        AND t.date >= $1 AND t.date <= $2
+                        AND t.user_id = $3;
+                    `,
+                    [incomeStatementStartDate, incomeStatementEndDate, user_id]
+                );
+                const costOfGoodsSold = parseFloat(cogsQueryResult.rows[0]?.total_cogs || 0);
+
+                // Fetch operating expenses (excluding COGS)
+                const expensesQueryResult = await pool.query(
+                    `
+                    SELECT
+                        t.category,
+                        SUM(t.amount) AS total_amount
+                    FROM
+                        transactions t
+                    WHERE
+                        t.type = 'expense' AND t.category != 'Cost of Goods Sold' /* Exclude COGS here */
+                        AND t.date >= $1 AND t.date <= $2 /* Inclusive end date */
+                        AND t.user_id = $3
+                    GROUP BY
+                        t.category;
+                    `,
+                    [incomeStatementStartDate, incomeStatementEndDate, user_id]
+                );
+                const expenses = expensesQueryResult.rows;
+
+                const grossProfit = totalSales - costOfGoodsSold;
+                const totalExpensesSum = expenses.reduce((sum, exp) => sum + parseFloat(exp.total_amount), 0);
+                const netProfitLoss = (grossProfit + interestIncome + otherIncome) - totalExpensesSum;
+
+                drawDocumentHeader(
+                    doc,
+                    companyName,
+                    'INCOME STATEMENT',
+                    `FOR THE PERIOD ENDED ${new Date(incomeStatementEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+                );
+
+                // Table Headers
+                doc.font('Helvetica-Bold');
+                doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill(); // Background for header
+                doc.fillColor('#4a5568').text('Description', col1X + 5, doc.y + 5);
+                doc.text('Amount (R)', col2X, doc.y + 5, { width: columnWidth, align: 'right' });
+                doc.moveDown(0.5);
+                doc.fillColor('black'); // Reset text color
+                doc.font('Helvetica');
+
+
+                // Sales
+                doc.text('Sales', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(totalSales), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown(0.5);
+                doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+
+                // Less: Cost of Sales
+                doc.text('Less: Cost of Sales', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(costOfGoodsSold), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown(0.5);
+                doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+
+                // Gross Profit/ (Loss)
+                doc.font('Helvetica-Bold');
+                doc.text('Gross Profit / (Loss)', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(grossProfit), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.font('Helvetica');
+
+                // Add: Other Income
+                if (Object.keys(detailedIncome).length > 0 || interestIncome > 0) {
+                    doc.text('Add: Other Income', col1X, doc.y);
+                    doc.moveDown(0.5);
+                    if (interestIncome > 0) {
+                        doc.text(`   Interest Income`, col1X + 20, doc.y);
+                        doc.text(formatCurrencyForPdf(interestIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
+                        doc.moveDown(0.5);
+                    }
+                    for (const category in detailedIncome) {
+                        // Only list if it's not Sales Revenue or Interest Income (already handled)
+                        if (category !== 'Sales Revenue' && category !== 'Interest Income') {
+                            doc.text(`   ${category}`, col1X + 20, doc.y);
+                            doc.text(formatCurrencyForPdf(detailedIncome[category]), col2X, doc.y, { width: columnWidth, align: 'right' });
+                            doc.moveDown(0.5);
+                        }
+                    }
+                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                    doc.moveDown(0.5);
+                }
+
+                // Gross Income
+                doc.font('Helvetica-Bold');
+                doc.text('Gross Income', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(grossProfit + interestIncome + otherIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.font('Helvetica');
+
+                // Less: Expenses
+                doc.text('Less: Expenses', col1X, doc.y);
+                doc.moveDown(0.5);
+                expenses.forEach(exp => {
+                    doc.text(`   ${exp.category}`, col1X + 20, doc.y);
+                    doc.text(formatCurrencyForPdf(parseFloat(exp.total_amount)), col2X, doc.y, { width: columnWidth, align: 'right' });
+                    doc.moveDown(0.5);
+                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                    doc.moveDown(0.5);
+                });
+
+                // Total Expenses
+                doc.font('Helvetica-Bold');
+                doc.text('Total Expenses', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(totalExpensesSum), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.font('Helvetica');
+
+                // NET PROFIT /(LOSS) for the period
+                doc.font('Helvetica-Bold');
+                // Dynamically set text based on profit or loss
+                const netProfitLossText = netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period';
+                doc.text(netProfitLossText, col1X, doc.y);
+                // Ensure Net Profit/Loss is always positive for display
+                doc.text(formatCurrencyForPdf(Math.abs(netProfitLoss)), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown();
+
+                doc.fontSize(8).fillColor('#4a5568').text(`Statement Period: ${new Date(incomeStatementStartDate).toLocaleDateString('en-GB')} to ${new Date(incomeStatementEndDate).toLocaleDateString('en-GB')}`, { align: 'center' });
+                doc.fillColor('black');
+                doc.moveDown();
+
+                break;
+            }
+
+            case 'balance-sheet': {
+                const balanceSheetEndDate = endDate as string;
+
+                // Fetch all accounts and calculate their proper balances for balance sheet
+                const accountsQueryResult = await pool.query(`
+                    SELECT
+                        a.id,
+                        a.name AS account_name,
+                        a.type AS account_type,
+                        a.initial_balance,
+                        COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END), 0) AS transaction_impact
+                    FROM
+                        accounts a
+                    LEFT JOIN
+                        transactions t ON a.id = t.account_id AND t.date <= $1 AND t.user_id = $2
+                    WHERE a.user_id = $2
+                    GROUP BY
+                        a.id, a.name, a.type, a.initial_balance
+                    ORDER BY
+                        a.type, a.name;
+                `, [balanceSheetEndDate, user_id]);
+
+                const accounts = accountsQueryResult.rows.map(row => ({
+                    ...row,
+                    current_balance: parseFloat(row.initial_balance) + parseFloat(row.transaction_impact || 0)
+                }));
+
+                let totalAssets = 0;
+                let totalLiabilities = 0;
+                let totalEquity = 0;
+
+                const assets: any[] = [];
+                const liabilities: any[] = [];
+                const equity: any[] = [];
+
+                accounts.forEach(acc => {
+                    if (['Asset', 'Current Asset', 'Fixed Asset'].includes(acc.account_type)) {
+                        assets.push(acc);
+                        totalAssets += acc.current_balance;
+                    } else if (['Liability', 'Current Liability', 'Long-Term Liability'].includes(acc.account_type)) {
+                        liabilities.push(acc);
+                        totalLiabilities += acc.current_balance;
+                    } else if (['Equity', 'Capital', 'Retained Earnings'].includes(acc.account_type)) {
+                        equity.push(acc);
+                        totalEquity += acc.current_balance;
+                    }
+                });
+
+                // Calculate Retained Earnings: Beginning Retained Earnings + Net Income - Dividends
+                // For simplicity, we'll use the Net Profit/Loss from the Income Statement for the period
+                // (This assumes the income statement period aligns with the balance sheet period for retained earnings calculation,
+                // which might not always be the case in real-world accounting, but works for a simplified example).
+                const incomeStatementStartDateForRetainedEarnings = new Date(balanceSheetEndDate);
+                incomeStatementStartDateForRetainedEarnings.setFullYear(incomeStatementStartDateForRetainedEarnings.getFullYear() - 1); // Start of previous year
+                incomeStatementStartDateForRetainedEarnings.setMonth(0, 1); // Jan 1st of previous year
+
+                const incomeResultForRetainedEarnings = await pool.query(
+                    `
+                    SELECT
+                        COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE -amount END), 0) AS net_income
+                    FROM
+                        transactions
+                    WHERE
+                        date >= $1 AND date <= $2 AND user_id = $3;
+                    `,
+                    [incomeStatementStartDateForRetainedEarnings.toISOString(), balanceSheetEndDate, user_id]
+                );
+                const netIncomeForRetainedEarnings = parseFloat(incomeResultForRetainedEarnings.rows[0]?.net_income || 0);
+
+                // Assuming no dividends for simplicity, or fetch them if a 'dividends' transaction type exists
+                // For now, Retained Earnings will be (Previous Retained Earnings + Current Net Income)
+                // If you have a specific "Retained Earnings" account, its balance would be fetched directly.
+                // Here, we'll calculate a simplified "Retained Earnings" for display.
+                const calculatedRetainedEarnings = netIncomeForRetainedEarnings; // Simplified
+
+                totalEquity += calculatedRetainedEarnings; // Add calculated retained earnings to total equity
+
+                drawDocumentHeader(
+                    doc,
+                    companyName,
+                    'BALANCE SHEET',
+                    `AS AT ${new Date(balanceSheetEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`,
+                    'Disclaimer: This is a simplified Balance Sheet for illustrative purposes and may not conform to all accounting standards.'
+                );
+
+                doc.font('Helvetica-Bold');
+                doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
+                doc.fillColor('#4a5568').text('Description', col1X + 5, doc.y + 5);
+                doc.text('Amount (R)', col2X, doc.y + 5, { width: columnWidth, align: 'right' });
+                doc.moveDown(0.5);
+                doc.fillColor('black');
+                doc.font('Helvetica');
+
+                // ASSETS
+                doc.font('Helvetica-Bold').text('ASSETS', col1X, doc.y);
+                doc.moveDown(0.5);
+                doc.font('Helvetica');
+                assets.forEach(asset => {
+                    doc.text(`   ${asset.account_name}`, col1X + 20, doc.y);
+                    doc.text(formatCurrencyForPdf(asset.current_balance), col2X, doc.y, { width: columnWidth, align: 'right' });
+                    doc.moveDown(0.5);
+                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                    doc.moveDown(0.5);
+                });
+                doc.font('Helvetica-Bold');
+                doc.text('TOTAL ASSETS', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(totalAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown();
+
+                // LIABILITIES
+                doc.font('Helvetica-Bold').text('LIABILITIES', col1X, doc.y);
+                doc.moveDown(0.5);
+                doc.font('Helvetica');
+                liabilities.forEach(liability => {
+                    doc.text(`   ${liability.account_name}`, col1X + 20, doc.y);
+                    doc.text(formatCurrencyForPdf(liability.current_balance), col2X, doc.y, { width: columnWidth, align: 'right' });
+                    doc.moveDown(0.5);
+                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                    doc.moveDown(0.5);
+                });
+                doc.font('Helvetica-Bold');
+                doc.text('TOTAL LIABILITIES', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(totalLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown();
+
+                // EQUITY
+                doc.font('Helvetica-Bold').text('EQUITY', col1X, doc.y);
+                doc.moveDown(0.5);
+                doc.font('Helvetica');
+                equity.forEach(eq => {
+                    doc.text(`   ${eq.account_name}`, col1X + 20, doc.y);
+                    doc.text(formatCurrencyForPdf(eq.current_balance), col2X, doc.y, { width: columnWidth, align: 'right' });
+                    doc.moveDown(0.5);
+                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                    doc.moveDown(0.5);
+                });
+                // Add calculated Retained Earnings
+                doc.text(`   Retained Earnings`, col1X + 20, doc.y);
+                doc.text(formatCurrencyForPdf(calculatedRetainedEarnings), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown(0.5);
+                doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+
+                doc.font('Helvetica-Bold');
+                doc.text('TOTAL EQUITY', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(totalEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown();
+
+                // Verification
+                doc.font('Helvetica-Bold');
+                const liabilitiesAndEquity = totalLiabilities + totalEquity;
+                doc.text('LIABILITIES AND EQUITY', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(liabilitiesAndEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown();
+
+                doc.fontSize(8).fillColor('#4a5568').text(`Statement Date: ${new Date(balanceSheetEndDate).toLocaleDateString('en-GB')}`, { align: 'center' });
+                doc.fillColor('black');
+                doc.moveDown();
+
+                break;
+            }
+
+            case 'trial-balance': {
+                const trialBalanceEndDate = endDate as string;
+
+                // Fetch all accounts and calculate their balances up to the end date
+                const accountsWithBalances = await pool.query(`
+                    SELECT
+                        a.id,
+                        a.name AS account_name,
+                        a.type AS account_type,
+                        a.code AS account_code,
+                        a.initial_balance,
+                        COALESCE(SUM(CASE
+                            WHEN t.type = 'income' AND a.type IN ('Asset', 'Expense') THEN t.amount
+                            WHEN t.type = 'expense' AND a.type IN ('Liability', 'Equity', 'Income') THEN t.amount
+                            WHEN t.type = 'income' AND a.type IN ('Liability', 'Equity', 'Income') THEN -t.amount
+                            WHEN t.type = 'expense' AND a.type IN ('Asset', 'Expense') THEN -t.amount
+                            ELSE 0
+                        END), 0) AS transaction_impact
+                    FROM
+                        accounts a
+                    LEFT JOIN
+                        transactions t ON a.id = t.account_id AND t.date <= $1 AND t.user_id = $2
+                    WHERE a.user_id = $2
+                    GROUP BY
+                        a.id, a.name, a.type, a.code, a.initial_balance
+                    ORDER BY
+                        a.code;
+                `, [trialBalanceEndDate, user_id]);
+
+                const trialBalanceAccounts = accountsWithBalances.rows.map(row => {
+                    const initialBalance = parseFloat(row.initial_balance || 0);
+                    const transactionImpact = parseFloat(row.transaction_impact || 0);
+                    let currentBalance = initialBalance + transactionImpact;
+
+                    let debit = 0;
+                    let credit = 0;
+
+                    // Determine if the balance is a debit or credit based on account type
+                    // Normal balances:
+                    // Debit: Assets, Expenses
+                    // Credit: Liabilities, Equity, Income
+                    if (['Asset', 'Expense'].includes(row.account_type)) {
+                        if (currentBalance >= 0) {
+                            debit = currentBalance;
+                        } else {
+                            credit = Math.abs(currentBalance); // Negative asset/expense is a credit
+                        }
+                    } else if (['Liability', 'Equity', 'Income'].includes(row.account_type)) {
+                        if (currentBalance >= 0) {
+                            credit = currentBalance;
+                        } else {
+                            debit = Math.abs(currentBalance); // Negative liability/equity/income is a debit
+                        }
+                    }
+
+                    return {
+                        account_code: row.account_code,
+                        account_name: row.account_name,
+                        debit: debit,
+                        credit: credit,
+                    };
+                });
+
+                let totalDebits = 0;
+                let totalCredits = 0;
+
+                trialBalanceAccounts.forEach(account => {
+                    totalDebits += account.debit;
+                    totalCredits += account.credit;
+                });
+
+                drawDocumentHeader(
+                    doc,
+                    companyName,
+                    'TRIAL BALANCE',
+                    `AS AT ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`,
+                    'Disclaimer: This Trial Balance is for internal use and may not be suitable for external reporting without further adjustments.'
+                );
+
+                // Table Headers
+                doc.font('Helvetica-Bold');
+                doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill(); // Background for header
+                doc.fillColor('#4a5568').text('Account Code', col1X + 5, doc.y + 5);
+                doc.text('Account Name', col1X + 100, doc.y + 5);
+                doc.text('Debit (R)', col2X - 50, doc.y + 5, { width: columnWidth, align: 'right' });
+                doc.text('Credit (R)', col2X + 50, doc.y + 5, { width: columnWidth, align: 'right' });
+                doc.moveDown(0.5);
+                doc.fillColor('black'); // Reset text color
+                doc.font('Helvetica');
+
+                // Table Body
+                trialBalanceAccounts.forEach(account => {
+                    doc.text(account.account_code, col1X + 5, doc.y);
+                    doc.text(account.account_name, col1X + 100, doc.y);
+                    doc.text(formatCurrencyForPdf(account.debit), col2X - 50, doc.y, { width: columnWidth, align: 'right' });
+                    doc.text(formatCurrencyForPdf(account.credit), col2X + 50, doc.y, { width: columnWidth, align: 'right' });
+                    doc.moveDown(0.5);
+                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth + 50, doc.y).stroke();
+                    doc.moveDown(0.5);
+                });
+
+                // Totals
+                doc.font('Helvetica-Bold');
+                doc.text('TOTALS', col1X + 100, doc.y);
+                doc.text(formatCurrencyForPdf(totalDebits), col2X - 50, doc.y, { width: columnWidth, align: 'right' });
+                doc.text(formatCurrencyForPdf(totalCredits), col2X + 50, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth + 50, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth + 50, doc.y).stroke();
+                doc.moveDown();
+
+                doc.fontSize(8).fillColor('#4a5568').text(`Statement Date: ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB')}`, { align: 'center' });
+                doc.fillColor('black');
+                doc.moveDown();
+
+                break;
+            }
+
+            case 'cash-flow-statement': {
+                type TransactionRow = {
+                    type: string;
+                    category: string;
+                    amount: number;
+                };
+
+                const classify = (row: { category: string }): 'operating' | 'investing' | 'financing' => {
+                    const cat = (row.category || '').toLowerCase();
+                    if (['equipment', 'property', 'asset', 'vehicle'].some(k => cat.includes(k))) return 'investing';
+                    if (['loan', 'members loan', 'shareholders loan', 'credit facility'].some(k => cat.includes(k))) return 'financing';
+                    return 'operating';
+                };
+
+                const cashFlows: { operating: TransactionRow[]; investing: TransactionRow[]; financing: TransactionRow[] } = {
+                    operating: [],
+                    investing: [],
+                    financing: [],
+                };
+
+                const rowsResult = await pool.query(
+                    `SELECT type, category, amount FROM transactions WHERE date >= $1 AND date <= $2 AND user_id = $3 AND (type = 'income' OR type = 'expense');`,
+                    [startDate, endDate, user_id] // Added user_id filter here
+                );
+                const rows: TransactionRow[] = rowsResult.rows;
+
+                rows.forEach((row) => {
+                    const section = classify(row);
+                    const amount = row.type === 'income' ? parseFloat(row.amount as any) : -parseFloat(row.amount as any);
+                    cashFlows[section].push({ ...row, amount });
+                });
+
+                const renderSection = (title: string, items: TransactionRow[]) => {
+                    doc.font('Helvetica-Bold').fontSize(12).text(title, col1X, doc.y);
+                    doc.moveDown(0.5);
+                    doc.font('Helvetica');
+
+                    let total = 0;
+                    items.forEach(item => {
+                        doc.text(`   ${item.category || 'Uncategorized'}`, col1X + 20, doc.y);
+                        doc.text(formatCurrencyForPdf(item.amount), col2X, doc.y, { width: columnWidth, align: 'right' });
+                        total += item.amount;
+                        doc.moveDown(0.5);
+                        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                        doc.moveDown(0.5);
+                    });
+
+                    doc.font('Helvetica-Bold');
+                    doc.text(`Net ${title}`, col1X, doc.y);
+                    doc.text(formatCurrencyForPdf(total), col2X, doc.y, { width: columnWidth, align: 'right' });
+                    doc.moveDown(1);
+                    doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                    doc.moveDown(0.5);
+                    doc.font('Helvetica');
+
+                    return total;
+                };
+
+                drawDocumentHeader(
+                    doc,
+                    companyName,
+                    'CASH FLOW STATEMENT',
+                    `FOR THE PERIOD ENDED ${new Date(endDate.toString()).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+                );
+
+                const totalOperating = renderSection('Operating Activities', cashFlows.operating);
+                const totalInvesting = renderSection('Investing Activities', cashFlows.investing);
+                const totalFinancing = renderSection(
+                    'Financing Activities',
+                    cashFlows.financing
+                );
+
+                const netIncreaseInCash = totalOperating + totalInvesting + totalFinancing;
+
+                doc.font('Helvetica-Bold').fontSize(12).text('Net Increase / (Decrease) in Cash', col1X, doc.y);
+                doc.text(formatCurrencyForPdf(netIncreaseInCash), col2X, doc.y, { width: columnWidth, align: 'right' });
+                doc.moveDown();
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown(0.5);
+                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+                doc.moveDown();
+
+                doc.fontSize(8).fillColor('#4a5568').text(`Statement Period: ${new Date(startDate as string).toLocaleDateString('en-GB')} to ${new Date(endDate as string).toLocaleDateString('en-GB')}`, { align: 'center' });
+                doc.fillColor('black');
+                doc.moveDown();
+
+                break;
+            }
+
+            default:
+                doc.text('Document type not supported.', { align: 'center' });
+                doc.end();
+                return;
+        }
+
+        doc.end();
+
+    } catch (error: unknown) {
+        console.error(`Error generating ${documentType}:`, error);
+        res.removeHeader('Content-Disposition');
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+
+        if (error instanceof Error) {
+            res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: error.message }));
+        } else {
+            res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: String(error) }));
+        }
+    }
+});
+
+// Assuming app and PORT are defined elsewhere in your server file
+// app.listen(PORT, () => {
+//   console.log(`Node server running on http://localhost:${PORT}`);
+// });
+
+
+
+app.listen(PORT, () => {
+  console.log(`Node server running on http://localhost:${PORT}`);
+});
+
