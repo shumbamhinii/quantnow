@@ -49,15 +49,25 @@ pool.connect((err, client, release) => {
 
 // Extend the Request interface to include the user property
 
+// Extend the Request type to include the user property
+// This declaration is crucial for TypeScript to understand the JWT payload
+// attached to the request after authentication.
+// Extend the Request type to include the user property
+// This declaration is crucial for TypeScript to understand the JWT payload
+// attached to the request after authentication.
+// Extend the Request type to include the user property.
+// We are now correctly using 'user_id' as the unique identifier from the database.
 declare global {
   namespace Express {
     interface Request {
       user?: {
         user_id: string;
+        parent_user_id: string; // <--- add this line
       };
     }
   }
 }
+
 
 // AUTHENTICATION MIDDLEWARE (on your backend server)
 const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
@@ -85,7 +95,8 @@ const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
   try {
     const decoded = jwt.verify(token, secret);
     console.log('Token Decoded Successfully:', decoded);
-    req.user = decoded as { user_id: string };
+    req.user = decoded as { user_id: string; parent_user_id: string };
+
     next();
   } catch (err) {
     console.error('Authentication Failed: Invalid token', err);
@@ -331,15 +342,16 @@ app.post('/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
 
   try {
-const result = await pool.query('SELECT * FROM public.users WHERE email = $1', [email]);
-const user = result.rows[0];
+    const result = await pool.query('SELECT * FROM public.users WHERE email = $1', [email]);
+    const user = result.rows[0];
 
-const hash = typeof user?.password_hash === 'string' ? user.password_hash : user?.password_hash?.toString();
+    const hash = typeof user?.password_hash === 'string'
+      ? user.password_hash
+      : user?.password_hash?.toString();
 
-if (!user || !hash || !(await bcrypt.compare(password, hash))) {
-  return res.status(401).json({ error: 'Invalid credentials' });
-}
-
+    if (!user || !hash || !(await bcrypt.compare(password, hash))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const secret = process.env.JWT_SECRET;
     if (!secret) {
@@ -347,8 +359,26 @@ if (!user || !hash || !(await bcrypt.compare(password, hash))) {
       return res.status(500).json({ error: 'Server misconfiguration' });
     }
 
-    const token = jwt.sign({ user_id: user.user_id }, secret, { expiresIn: '7d' });
-    res.json({ token });
+    // Create token WITHOUT expiration
+    const token = jwt.sign(
+  {
+    user_id: user.user_id,
+    parent_user_id: user.parent_user_id || user.user_id, // Fallback for CEO accounts
+  },
+  secret
+);
+
+
+    res.json({
+      token,
+      user: {
+        user_id: user.user_id,
+        parent_user_id: user.parent_user_id,
+        role: user.role,
+        name: user.name,
+        email: user.email
+      }
+    });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
@@ -356,11 +386,12 @@ if (!user || !hash || !(await bcrypt.compare(password, hash))) {
 });
 
 
+
 // Generic PDF generation endpoint for invoices and statements
 app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
     const { documentType, id } = req.params;
     const { startDate, endDate } = req.query;
-    const user_id = req.user!.user_id;
+    const user_id = req.user!.parent_user_id;
 
     const doc = new PDFDocument({ margin: 50 });
 
@@ -516,7 +547,7 @@ app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: 
 // --- Specific Quotation PDF generation endpoint (MUST BE BEFORE generic one) ---
 app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
     const { id } = req.params;
-    const user_id = req.user!.user_id;
+    const user_id = req.user!.parent_user_id;
     const doc = new PDFDocument({ margin: 50 });
 
     try {
@@ -650,7 +681,7 @@ app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Res
 app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
     const { documentType, id } = req.params;
     const { startDate, endDate } = req.query;
-    const user_id = req.user!.user_id;
+    const user_id = req.user!.parent_user_id;
 
     const doc = new PDFDocument({ margin: 50 });
 
@@ -803,250 +834,367 @@ app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: 
     }
 });
 
+// Define the interface for PDF data again for clarity
 interface QuotationDetailsForPdf {
-  quotation_number: string;
-  customer_name: string;
-  customer_email?: string;
-  customer_address?: string;
-  quotation_date: string;
-  expiry_date?: string;
-  total_amount: number;
-  currency: string;
-  notes?: string;
-  line_items: Array<{
-    product_service_name?: string;
-    description: string;
-    quantity: number;
-    unit_price: number;
-    line_total: number;
-    tax_rate: number;
-  }>;
-  companyName: string;
-  companyAddress?: string;
-  companyVat?: string;
+    quotation_number: string;
+    customer_name: string;
+    customer_email?: string;
+    customer_address?: string;
+    quotation_date: string;
+    expiry_date?: string;
+    total_amount: number;
+    currency: string;
+    notes?: string;
+    line_items: Array<{
+        product_service_name?: string;
+        description: string;
+        quantity: number;
+        unit_price: number;
+        line_total: number;
+        tax_rate: number;
+    }>;
+    companyName: string;
+    companyAddress?: string;
+    companyVat?: string;
 }
 
+// NOTE: This function was commented out because the TypeScript error indicates it is a redeclaration.
+// Please use the other `formatCurrency` function that exists in your `server.ts` file.
+// const formatCurrency = (amount: number, currency: string) => {
+//     return `${currency} ${amount.toFixed(2)}`;
+// };
+
+// The code now assumes a `formatCurrency` function is available in the scope.
 async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 50 });
-    const buffers: Buffer[] = [];
+    return new Promise((resolve, reject) => {
+        const doc = new PDFDocument({ margin: 50 });
+        const buffers: Buffer[] = [];
 
-    doc.on('data', buffers.push.bind(buffers));
-    doc.on('end', () => resolve(Buffer.concat(buffers)));
-    doc.on('error', reject);
+        doc.on('data', buffers.push.bind(buffers));
+        doc.on('end', () => resolve(Buffer.concat(buffers)));
+        doc.on('error', reject);
 
-    // Header (Company details)
-    doc.fontSize(24).font('Helvetica-Bold').text(quotationData.companyName, { align: 'right' });
-    if (quotationData.companyAddress) {
-      doc.fontSize(10).font('Helvetica').text(quotationData.companyAddress, { align: 'right' });
-    }
-    if (quotationData.companyVat) {
-      doc.fontSize(10).font('Helvetica').text(`VAT No: ${quotationData.companyVat}`, { align: 'right' });
-    }
-    doc.moveDown(1);
-    doc.fontSize(10).text(`Quotation Date: ${new Date(quotationData.quotation_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
-    if (quotationData.expiry_date) {
-      doc.fontSize(10).text(`Expiry Date: ${new Date(quotationData.expiry_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
-    }
-    doc.moveDown(2);
+        // Header (Company details)
+        doc.fontSize(24).font('Helvetica-Bold').text(quotationData.companyName, { align: 'right' });
+        if (quotationData.companyAddress) {
+            doc.fontSize(10).font('Helvetica').text(quotationData.companyAddress, { align: 'right' });
+        }
+        if (quotationData.companyVat) {
+            doc.fontSize(10).font('Helvetica').text(`VAT No: ${quotationData.companyVat}`, { align: 'right' });
+        }
+        doc.moveDown(1);
+        doc.fontSize(10).text(`Quotation Date: ${new Date(quotationData.quotation_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+        if (quotationData.expiry_date) {
+            doc.fontSize(10).text(`Expiry Date: ${new Date(quotationData.expiry_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+        }
+        doc.moveDown(2);
 
-    // Title
-    doc.fontSize(30).font('Helvetica-Bold').text(`QUOTATION #${quotationData.quotation_number}`, { align: 'center' });
-    doc.moveDown(2);
+        // Title
+        doc.fontSize(30).font('Helvetica-Bold').text(`QUOTATION #${quotationData.quotation_number}`, { align: 'center' });
+        doc.moveDown(2);
 
-    // Customer Details
-    doc.fontSize(12).font('Helvetica-Bold').text('Quotation For:');
-    doc.fontSize(12).font('Helvetica').text(quotationData.customer_name);
-    if (quotationData.customer_address) {
-      doc.fontSize(10).text(quotationData.customer_address);
-    }
-    if (quotationData.customer_email) {
-      doc.fontSize(10).text(quotationData.customer_email);
-    }
-    doc.moveDown(2);
+        // Customer Details
+        doc.fontSize(12).font('Helvetica-Bold').text('Quotation For:');
+        doc.fontSize(12).font('Helvetica').text(quotationData.customer_name);
+        if (quotationData.customer_address) {
+            doc.fontSize(10).text(quotationData.customer_address);
+        }
+        if (quotationData.customer_email) {
+            doc.fontSize(10).text(quotationData.customer_email);
+        }
+        doc.moveDown(2);
 
-    // Table Header
-    const tableTop = doc.y;
-    const itemCol = 50;
-    const descCol = 150;
-    const qtyCol = 320;
-    const priceCol = 370;
-    const taxCol = 430;
-    const totalCol = 500;
+        // Table Header
+        const tableTop = doc.y;
+        const itemCol = 50;
+        const descCol = 150;
+        const qtyCol = 320;
+        const priceCol = 370;
+        const taxCol = 430;
+        const totalCol = 500;
 
-    doc.font('Helvetica-Bold').fontSize(10);
-    doc.text('Item', itemCol, tableTop);
-    doc.text('Description', descCol, tableTop);
-    doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
-    doc.text('Unit Price', priceCol, tableTop, { width: 50, align: 'right' });
-    doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
-    doc.text('Line Total', totalCol, tableTop, { width: 50, align: 'right' });
+        doc.font('Helvetica-Bold').fontSize(10);
+        doc.text('Item', itemCol, tableTop);
+        doc.text('Description', descCol, tableTop);
+        doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Unit Price', priceCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Line Total', totalCol, tableTop, { width: 50, align: 'right' });
 
-    doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
-    doc.moveDown();
+        doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
+        doc.moveDown();
 
-    // Table Body
-    doc.font('Helvetica').fontSize(9);
-    let currentY = doc.y;
-    let subtotal = 0;
-    let totalTax = 0;
+        // Table Body
+        doc.font('Helvetica').fontSize(9);
+        let currentY = doc.y;
+        let subtotal = 0;
+        let totalTax = 0;
 
-    quotationData.line_items.forEach(item => {
-      currentY = doc.y;
-      const itemDescription = item.product_service_name || item.description;
-      const taxAmount = (item.line_total * item.tax_rate);
-      const lineTotalExclTax = item.line_total - taxAmount;
+        quotationData.line_items.forEach(item => {
+            currentY = doc.y;
+            const itemDescription = item.product_service_name || item.description;
+            const taxAmount = (item.line_total * item.tax_rate);
+            const lineTotalExclTax = item.line_total - taxAmount;
 
-      doc.text(itemDescription, itemCol, currentY, { width: 140 });
-      doc.text(item.description, descCol, currentY, { width: 160 });
-      doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
-      doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
-      doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
-      doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
+            doc.text(itemDescription, itemCol, currentY, { width: 140 });
+            doc.text(item.description, descCol, currentY, { width: 160 });
+            doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
+            doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
+            doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
+            doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
 
-      doc.moveDown();
-      subtotal += lineTotalExclTax;
-      totalTax += taxAmount;
+            doc.moveDown();
+            subtotal += lineTotalExclTax;
+            totalTax += taxAmount;
+        });
+
+        // Totals
+        doc.moveDown();
+        const totalsY = doc.y;
+        const totalLabelCol = 400; // Aligned with the totals section
+        const totalValueCol = 500;
+        doc.font('Helvetica-Bold').fontSize(10);
+        
+        // Subtotal
+        doc.text('Subtotal:', totalLabelCol, totalsY, { width: 80, align: 'right' });
+        doc.text(formatCurrency(subtotal, quotationData.currency), totalValueCol, totalsY, { width: 50, align: 'right' });
+        doc.moveDown();
+
+        // Tax
+        doc.text('Tax:', totalLabelCol, doc.y, { width: 80, align: 'right' });
+        doc.text(formatCurrency(totalTax, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
+        doc.moveDown();
+
+        // Total Amount
+        doc.fontSize(14).text('Total Amount:', totalLabelCol, doc.y, { width: 80, align: 'right' });
+        doc.text(formatCurrency(quotationData.total_amount, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
+        doc.moveDown(3);
+
+        // Notes
+        if (quotationData.notes) {
+            doc.fontSize(10).font('Helvetica-Bold').text('Notes:');
+            doc.font('Helvetica').fontSize(10).text(quotationData.notes, { align: 'left' });
+            doc.moveDown(2);
+        }
+
+        // Footer
+        doc.fontSize(10).text(`Thank you for considering our quotation!`, doc.page.width / 2, doc.page.height - 50, {
+            align: 'center',
+            width: doc.page.width - 100,
+        });
+
+        doc.end();
     });
-
-    // Totals
-    doc.moveDown();
-    const totalsY = doc.y;
-    doc.font('Helvetica-Bold').fontSize(10);
-
-    doc.text('Subtotal:', 400, totalsY, { width: 80, align: 'right' });
-    doc.text(formatCurrency(subtotal, quotationData.currency), 500, totalsY, { width: 50, align: 'right' });
-    doc.moveDown();
-
-    doc.text('Tax:', 400, doc.y, { width: 80, align: 'right' });
-    doc.text(formatCurrency(totalTax, quotationData.currency), 500, doc.y, { width: 50, align: 'right' });
-    doc.moveDown();
-
-    doc.fontSize(14).text('Total Amount:', 400, doc.y, { width: 80, align: 'right' });
-    doc.text(formatCurrency(quotationData.total_amount, quotationData.currency), 500, doc.y, { width: 50, align: 'right' });
-    doc.moveDown(3);
-
-    // Notes
-    if (quotationData.notes) {
-      doc.fontSize(10).font('Helvetica-Bold').text('Notes:');
-      doc.font('Helvetica').fontSize(10).text(quotationData.notes, { align: 'left' });
-      doc.moveDown(2);
-    }
-
-    // Footer
-    doc.fontSize(10).text(`Thank you for considering our quotation!`, doc.page.width / 2, doc.page.height - 50, {
-      align: 'center',
-      width: doc.page.width - 100,
-    });
-
-    doc.end();
-  });
 }
+
+// --- Specific Quotation PDF generation endpoint (MUST BE BEFORE generic one) ---
+app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const user_id = req.user!.parent_user_id;
+    const doc = new PDFDocument({ margin: 50 });
+
+    try {
+        const quotationQueryResult = await pool.query(
+            `SELECT
+                q.*,
+                c.name AS customer_name,
+                c.email AS customer_email,
+                c.address AS customer_address
+            FROM quotations q
+            JOIN customers c ON q.customer_id = c.id
+            WHERE q.id = $1 AND q.user_id = $2`,
+            [id, user_id]
+        );
+
+        if (quotationQueryResult.rows.length === 0) {
+            res.status(404).json({ error: 'Quotation not found' });
+            doc.end();
+            return;
+        }
+
+        const quotation = quotationQueryResult.rows[0];
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="quotation_${quotation.quotation_number}.pdf"`);
+
+        // Fetch user's company information using the correct column name 'company'
+        const userProfileResult = await pool.query(
+            `SELECT company FROM users WHERE user_id = $1`,
+            [user_id]
+        );
+        const userCompany = userProfileResult.rows[0];
+
+        doc.pipe(res);
+
+        // Fetch line items for the quotation
+        const lineItemsResult = await pool.query(
+            `SELECT
+                li.*,
+                ps.name AS product_service_name
+            FROM quotation_line_items li
+            LEFT JOIN products_services ps ON li.product_service_id = ps.id
+            WHERE li.quotation_id = $1
+            ORDER BY li.created_at`,
+            [id]
+        );
+        quotation.line_items = lineItemsResult.rows;
+
+        // --- PDF Content Generation for Quotation (adapt from invoice) ---
+        // Pass the company name from the query result
+        generateQuotationPdf({
+            quotation_number: quotation.quotation_number,
+            customer_name: quotation.customer_name,
+            customer_email: quotation.customer_email,
+            customer_address: quotation.customer_address,
+            quotation_date: quotation.quotation_date,
+            expiry_date: quotation.expiry_date,
+            total_amount: parseFloat(quotation.total_amount),
+            currency: quotation.currency,
+            notes: quotation.notes,
+            line_items: quotation.line_items.map((item: any) => ({
+                product_service_name: item.product_service_name,
+                description: item.description,
+                quantity: parseFloat(item.quantity),
+                unit_price: parseFloat(item.unit_price),
+                line_total: parseFloat(item.line_total),
+                tax_rate: parseFloat(item.tax_rate),
+            })),
+            companyName: userCompany ? userCompany.company : 'Your Company Name',
+            companyAddress: undefined, // These fields don't exist in your DB yet
+            companyVat: undefined,     // These fields don't exist in your DB yet
+        });
+        
+        doc.end();
+    } catch (error: unknown) {
+        console.error(`Error generating quotation PDF:`, error);
+        if (res.headersSent) {
+            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
+            doc.end();
+            return;
+        }
+        res.status(500).json({
+            error: `Failed to generate quotation PDF`,
+            details: error instanceof Error ? error.message : String(error)
+        });
+        doc.end();
+    }
+});
 
 
 app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { recipientEmail, subject, body } = req.body;
-  const user_id = req.user!.user_id;
+    const { id } = req.params;
+    const { recipientEmail, subject, body } = req.body;
+    const user_id = req.user!.parent_user_id;
 
-  if (!recipientEmail || !subject || !body) {
-    return res.status(400).json({ error: 'Recipient email, subject, and body are required.' });
-  }
-
-  try {
-    // Fetch quotation details to generate PDF
-    const quotationQueryResult = await pool.query(
-      `SELECT
-          q.*,
-          c.name AS customer_name,
-          c.email AS customer_email,
-          c.address AS customer_address
-       FROM quotations q
-       JOIN customers c ON q.customer_id = c.id
-       WHERE q.id = $1 AND q.user_id = $2`,
-      [id, user_id]
-    );
-
-    if (quotationQueryResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Quotation not found.' });
-    }
-    const quotation = quotationQueryResult.rows[0];
-
-    const lineItemsResult = await pool.query(
-      `SELECT
-          li.*,
-          ps.name AS product_service_name
-       FROM quotation_line_items li
-       LEFT JOIN products_services ps ON li.product_service_id = ps.id
-       WHERE li.quotation_id = $1
-       ORDER BY li.created_at`,
-      [id]
-    );
-    quotation.line_items = lineItemsResult.rows;
-
-    // Prepare data for PDF generation
-    const quotationDataForPdf: QuotationDetailsForPdf = {
-      quotation_number: quotation.quotation_number,
-      customer_name: quotation.customer_name,
-      customer_email: quotation.customer_email,
-      customer_address: quotation.customer_address,
-      quotation_date: quotation.quotation_date,
-      expiry_date: quotation.expiry_date,
-      total_amount: parseFloat(quotation.total_amount),
-      currency: quotation.currency,
-      notes: quotation.notes,
-      line_items: quotation.line_items.map((item: any) => ({
-        product_service_name: item.product_service_name,
-        description: item.description,
-        quantity: parseFloat(item.quantity),
-        unit_price: parseFloat(item.unit_price),
-        line_total: parseFloat(item.line_total),
-        tax_rate: parseFloat(item.tax_rate),
-      })),
-      companyName: process.env.APP_NAME || 'Your Company',
-    };
-
-    // Generate PDF Buffer using the new function
-    const pdfBuffer = await generateQuotationPdf(quotationDataForPdf);
-
-    // Send email with PDF attachment
-    const emailSent = await sendEmail({
-      to: recipientEmail,
-      subject: subject,
-      html: body,
-      attachments: [
-        {
-          filename: `Quotation_${quotation.quotation_number}.pdf`,
-          content: pdfBuffer,
-          contentType: 'application/pdf',
-        },
-      ],
-    });
-
-    if (emailSent) {
-      res.status(200).json({ message: 'Email sent successfully!' });
-    } else {
-      res.status(500).json({ error: 'Failed to send quotation email.' });
+    if (!recipientEmail || !subject || !body) {
+        return res.status(400).json({ error: 'Recipient email, subject, and body are required.' });
     }
 
-  } catch (error: unknown) {
-    console.error('Error in send-pdf-email endpoint:', error);
-    if (res.headersSent) {
-      console.error('Headers already sent in send-pdf-email. Cannot send JSON error.');
-      return;
+    try {
+        // Fetch quotation details to generate PDF
+        const quotationQueryResult = await pool.query(
+            `SELECT
+                q.*,
+                c.name AS customer_name,
+                c.email AS customer_email,
+                c.address AS customer_address
+            FROM quotations q
+            JOIN customers c ON q.customer_id = c.id
+            WHERE q.id = $1 AND q.user_id = $2`,
+            [id, user_id]
+        );
+
+        if (quotationQueryResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Quotation not found.' });
+        }
+        const quotation = quotationQueryResult.rows[0];
+
+        // Fetch user's company information using the correct column name 'company'
+        const userProfileResult = await pool.query(
+            `SELECT company FROM users WHERE user_id = $1`,
+            [user_id]
+        );
+        const userCompany = userProfileResult.rows[0];
+
+        const lineItemsResult = await pool.query(
+            `SELECT
+                li.*,
+                ps.name AS product_service_name
+            FROM quotation_line_items li
+            LEFT JOIN products_services ps ON li.product_service_id = ps.id
+            WHERE li.quotation_id = $1
+            ORDER BY li.created_at`,
+            [id]
+        );
+        quotation.line_items = lineItemsResult.rows;
+
+        // Prepare data for PDF generation
+        const quotationDataForPdf: QuotationDetailsForPdf = {
+            quotation_number: quotation.quotation_number,
+            customer_name: quotation.customer_name,
+            customer_email: quotation.customer_email,
+            customer_address: quotation.customer_address,
+            quotation_date: quotation.quotation_date,
+            expiry_date: quotation.expiry_date,
+            total_amount: parseFloat(quotation.total_amount),
+            currency: quotation.currency,
+            notes: quotation.notes,
+            line_items: quotation.line_items.map((item: any) => ({
+                product_service_name: item.product_service_name,
+                description: item.description,
+                quantity: parseFloat(item.quantity),
+                unit_price: parseFloat(item.unit_price),
+                line_total: parseFloat(item.line_total),
+                tax_rate: parseFloat(item.tax_rate),
+            })),
+            // The key changes are here:
+            companyName: userCompany ? userCompany.company : 'Your Company Name',
+            companyAddress: undefined, 
+            companyVat: undefined,     
+        };
+
+        // Generate PDF Buffer using the new function
+        const pdfBuffer = await generateQuotationPdf(quotationDataForPdf);
+
+        // Send email with PDF attachment
+        const emailSent = await sendEmail({
+            to: recipientEmail,
+            subject: subject,
+            html: body,
+            attachments: [
+                {
+                    filename: `Quotation_${quotation.quotation_number}.pdf`,
+                    content: pdfBuffer,
+                    contentType: 'application/pdf',
+                },
+            ],
+        });
+
+        if (emailSent) {
+            res.status(200).json({ message: 'Email sent successfully!' });
+        } else {
+            res.status(500).json({ error: 'Failed to send quotation email.' });
+        }
+
+    } catch (error: unknown) {
+        console.error('Error in send-pdf-email endpoint:', error);
+        if (res.headersSent) {
+            console.error('Headers already sent in send-pdf-email. Cannot send JSON error.');
+            return;
+        }
+        if (error instanceof Error) {
+            res.status(500).json({ error: 'Failed to process email request', details: error.message });
+        } else {
+            res.status(500).json({ error: 'Failed to process email request', details: String(error) });
+        }
     }
-    if (error instanceof Error) {
-      res.status(500).json({ error: 'Failed to process email request', details: error.message });
-    } else {
-      res.status(500).json({ error: 'Failed to process email request', details: String(error) });
-    }
-  }
 });
+
 
 /* --- Transactions API (Fetching) --- */
 app.get('/transactions', authMiddleware, async (req: Request, res: Response) => {
   const { type, category, accountId, search, fromDate, toDate } = req.query;
-  const user_id = req.user!.user_id;
+  const user_id = req.user!.parent_user_id;
 
   if (fromDate && toDate && typeof fromDate === 'string' && typeof toDate === 'string') {
     const parsedFromDate = new Date(fromDate);
@@ -1126,7 +1274,7 @@ app.get('/transactions', authMiddleware, async (req: Request, res: Response) => 
 // MODIFIED: Added authMiddleware and user_id to INSERT/UPDATE
 app.post('/transactions/manual', authMiddleware, async (req: Request, res: Response) => {
   const { id, type, amount, description, date, category, account_id, original_text, source, confirmed } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   if (!type || !amount || !date) {
     return res.status(400).json({ detail: 'type, amount, and date are required' });
@@ -1184,7 +1332,7 @@ app.post('/transactions/manual', authMiddleware, async (req: Request, res: Respo
 
 /* --- Accounts API --- */
 app.get('/accounts', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     // Select 'type' and 'code' to match frontend's expected Account interface
     const result = await pool.query('SELECT id, name, type, code FROM accounts WHERE user_id = $1 ORDER BY id', [user_id]); // ADDED user_id filter
@@ -1198,7 +1346,7 @@ app.get('/accounts', authMiddleware, async (req: Request, res: Response) => { //
 app.post('/accounts', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   // Expect 'type', 'name', and 'code' from the frontend
   const { type, name, code } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   // Validate all required fields based on your DB schema
   if (!type || !name || !code) {
@@ -1229,252 +1377,268 @@ const formatCurrency = (amount: number, currency: string = 'R'): string => {
   return `${currency}${amount.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 };
 
+// The interface is updated to correctly handle potential null values from the database
 interface InvoiceDetailsForPdf {
-  invoice_number: string;
-  customer_name: string;
-  customer_email?: string; // Optional for PDF itself
-  customer_address?: string;
-  invoice_date: string;
-  due_date: string;
-  total_amount: number;
-  currency: string;
-  notes?: string;
-  line_items: Array<{
-    product_service_name?: string;
-    description: string;
-    quantity: number;
-    unit_price: number;
-    line_total: number;
-    tax_rate: number;
-  }>;
-  companyName: string; // From your .env or DB
-  companyAddress?: string;
-  companyVat?: string;
+    invoice_number: string;
+    customer_name: string;
+    customer_email?: string | null;
+    customer_address?: string | null;
+    invoice_date: string;
+    due_date: string;
+    total_amount: number;
+    currency: string;
+    notes?: string | null;
+    line_items: Array<{
+        product_service_name?: string | null;
+        description: string;
+        quantity: number;
+        unit_price: number;
+        line_total: number;
+        tax_rate: number;
+    }>;
+    companyName: string; // From your .env or DB
+    companyAddress?: string | null;
+    companyVat?: string | null;
 }
 
 async function generateInvoicePdf(invoiceData: InvoiceDetailsForPdf): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 50 });
-    const buffers: Buffer[] = [];
+    return new Promise((resolve, reject) => {
+        const doc = new PDFDocument({ margin: 50 });
+        const buffers: Buffer[] = [];
 
-    doc.on('data', buffers.push.bind(buffers));
-    doc.on('end', () => resolve(Buffer.concat(buffers)));
-    doc.on('error', reject);
+        doc.on('data', buffers.push.bind(buffers));
+        doc.on('end', () => resolve(Buffer.concat(buffers)));
+        doc.on('error', reject);
 
-    // Header
-    doc.fontSize(24).font('Helvetica-Bold').text(invoiceData.companyName, { align: 'right' });
-    if (invoiceData.companyAddress) {
-      doc.fontSize(10).font('Helvetica').text(invoiceData.companyAddress, { align: 'right' });
-    }
-    if (invoiceData.companyVat) {
-      doc.fontSize(10).font('Helvetica').text(`VAT No: ${invoiceData.companyVat}`, { align: 'right' });
-    }
-    doc.moveDown(1);
-    doc.fontSize(10).text(`Invoice Date: ${new Date(invoiceData.invoice_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
-    doc.fontSize(10).text(`Due Date: ${new Date(invoiceData.due_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
-    doc.moveDown(2);
+        // Header
+        // This is where the companyName will be used.
+        doc.fontSize(24).font('Helvetica-Bold').text(invoiceData.companyName, { align: 'right' });
+        if (invoiceData.companyAddress) {
+            doc.fontSize(10).font('Helvetica').text(invoiceData.companyAddress, { align: 'right' });
+        }
+        if (invoiceData.companyVat) {
+            doc.fontSize(10).font('Helvetica').text(`VAT No: ${invoiceData.companyVat}`, { align: 'right' });
+        }
+        doc.moveDown(1);
+        doc.fontSize(10).text(`Invoice Date: ${new Date(invoiceData.invoice_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+        doc.fontSize(10).text(`Due Date: ${new Date(invoiceData.due_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+        doc.moveDown(2);
 
-    // Title
-    doc.fontSize(30).font('Helvetica-Bold').text(`INVOICE #${invoiceData.invoice_number}`, { align: 'center' });
-    doc.moveDown(2);
+        // Title
+        doc.fontSize(30).font('Helvetica-Bold').text(`INVOICE #${invoiceData.invoice_number}`, { align: 'center' });
+        doc.moveDown(2);
 
-    // Bill To
-    doc.fontSize(12).font('Helvetica-Bold').text('Bill To:');
-    doc.fontSize(12).font('Helvetica').text(invoiceData.customer_name);
-    if (invoiceData.customer_address) {
-      doc.fontSize(10).text(invoiceData.customer_address);
-    }
-    if (invoiceData.customer_email) {
-      doc.fontSize(10).text(invoiceData.customer_email);
-    }
-    doc.moveDown(2);
+        // Bill To
+        doc.fontSize(12).font('Helvetica-Bold').text('Bill To:');
+        doc.fontSize(12).font('Helvetica').text(invoiceData.customer_name);
+        if (invoiceData.customer_address) {
+            doc.fontSize(10).text(invoiceData.customer_address);
+        }
+        if (invoiceData.customer_email) {
+            doc.fontSize(10).text(invoiceData.customer_email);
+        }
+        doc.moveDown(2);
 
-    // Table Header
-    const tableTop = doc.y;
-    const itemCol = 50;
-    const descCol = 150;
-    const qtyCol = 320;
-    const priceCol = 370;
-    const taxCol = 430;
-    const totalCol = 500;
+        // Table Header
+        const tableTop = doc.y;
+        const itemCol = 50;
+        const descCol = 150;
+        const qtyCol = 320;
+        const priceCol = 370;
+        const taxCol = 430;
+        const totalCol = 500;
 
-    doc.font('Helvetica-Bold').fontSize(10);
-    doc.text('Item', itemCol, tableTop);
-    doc.text('Description', descCol, tableTop);
-    doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
-    doc.text('Price', priceCol, tableTop, { width: 50, align: 'right' });
-    doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
-    doc.text('Total', totalCol, tableTop, { width: 50, align: 'right' });
+        doc.font('Helvetica-Bold').fontSize(10);
+        doc.text('Item', itemCol, tableTop);
+        doc.text('Description', descCol, tableTop);
+        doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Price', priceCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Total', totalCol, tableTop, { width: 50, align: 'right' });
 
-    doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
-    doc.moveDown();
+        doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
+        doc.moveDown();
 
-    // Table Body
-    doc.font('Helvetica').fontSize(9);
-    let currentY = doc.y;
-    let subtotal = 0;
-    let totalTax = 0;
+        // Table Body
+        doc.font('Helvetica').fontSize(9);
+        let currentY = doc.y;
+        let subtotal = 0;
+        let totalTax = 0;
 
-    invoiceData.line_items.forEach(item => {
-      currentY = doc.y;
-      const itemDescription = item.product_service_name || item.description;
-      const taxAmount = (item.line_total * item.tax_rate);
-      const lineTotalExclTax = item.line_total - taxAmount;
+        invoiceData.line_items.forEach(item => {
+            currentY = doc.y;
+            const itemDescription = item.product_service_name || item.description;
+            const taxAmount = (item.line_total * item.tax_rate);
+            const lineTotalExclTax = item.line_total - taxAmount;
 
-      doc.text(itemDescription, itemCol, currentY, { width: 140 });
-      doc.text(item.description, descCol, currentY, { width: 160 }); // Full description if needed
-      doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
-      doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
-      doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
-      doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
+            doc.text(itemDescription, itemCol, currentY, { width: 140 });
+            doc.text(item.description, descCol, currentY, { width: 160 }); // Full description if needed
+            doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
+            doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
+            doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
+            doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
 
-      doc.moveDown();
-      subtotal += lineTotalExclTax;
-      totalTax += taxAmount;
+            doc.moveDown();
+            subtotal += lineTotalExclTax;
+            totalTax += taxAmount;
+        });
+
+        // Totals
+        doc.moveDown();
+        const totalsY = doc.y;
+        doc.font('Helvetica-Bold').fontSize(10);
+
+        doc.text('Subtotal:', 400, totalsY, { width: 80, align: 'right' });
+        doc.text(formatCurrency(subtotal, invoiceData.currency), 500, totalsY, { width: 50, align: 'right' });
+        doc.moveDown();
+
+        doc.text('Tax:', 400, doc.y, { width: 80, align: 'right' });
+        doc.text(formatCurrency(totalTax, invoiceData.currency), 500, doc.y, { width: 50, align: 'right' });
+        doc.moveDown();
+
+        doc.fontSize(14).text('Total Due:', 400, doc.y, { width: 80, align: 'right' });
+        doc.text(formatCurrency(invoiceData.total_amount, invoiceData.currency), 500, doc.y, { width: 50, align: 'right' });
+        doc.moveDown(3);
+
+        // Notes
+        if (invoiceData.notes) {
+            doc.fontSize(10).font('Helvetica-Bold').text('Notes:');
+            doc.font('Helvetica').fontSize(10).text(invoiceData.notes, { align: 'left' });
+            doc.moveDown(2);
+        }
+
+        // Footer
+        doc.fontSize(10).text(`Thank you for your business!`, doc.page.width / 2, doc.page.height - 50, {
+            align: 'center',
+            width: doc.page.width - 100,
+        });
+
+        doc.end();
     });
-
-    // Totals
-    doc.moveDown();
-    const totalsY = doc.y;
-    doc.font('Helvetica-Bold').fontSize(10);
-
-    doc.text('Subtotal:', 400, totalsY, { width: 80, align: 'right' });
-    doc.text(formatCurrency(subtotal, invoiceData.currency), 500, totalsY, { width: 50, align: 'right' });
-    doc.moveDown();
-
-    doc.text('Tax:', 400, doc.y, { width: 80, align: 'right' });
-    doc.text(formatCurrency(totalTax, invoiceData.currency), 500, doc.y, { width: 50, align: 'right' });
-    doc.moveDown();
-
-    doc.fontSize(14).text('Total Due:', 400, doc.y, { width: 80, align: 'right' });
-    doc.text(formatCurrency(invoiceData.total_amount, invoiceData.currency), 500, doc.y, { width: 50, align: 'right' });
-    doc.moveDown(3);
-
-    // Notes
-    if (invoiceData.notes) {
-      doc.fontSize(10).font('Helvetica-Bold').text('Notes:');
-      doc.font('Helvetica').fontSize(10).text(invoiceData.notes, { align: 'left' });
-      doc.moveDown(2);
-    }
-
-    // Footer
-    doc.fontSize(10).text(`Thank you for your business!`, doc.page.width / 2, doc.page.height - 50, {
-      align: 'center',
-      width: doc.page.width - 100,
-    });
-
-    doc.end();
-  });
 }
 
-app.post('/api/invoices/:id/send-pdf-email', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const invoiceId = req.params.id;
-  const { customerEmail } = req.body; // Expect customerEmail in the request body
-  const user_id = req.user!.user_id; // Get user_id from req.user
+app.post('/api/invoices/:id/send-pdf-email', authMiddleware, async (req: Request, res: Response) => {
+    const invoiceId = req.params.id;
+    const { customerEmail } = req.body;
+    const user_id = req.user!.parent_user_id;
 
-  if (!customerEmail) {
-    return res.status(400).json({ error: 'Customer email is required to send the invoice.' });
-  }
-
-  try {
-    // 1. Fetch Invoice Details from Database (including line items and customer info)
-    const invoiceResult = await pool.query(
-      `SELECT
-          i.id, i.invoice_number, i.invoice_date, i.due_date, i.total_amount, i.status, i.currency, i.notes,
-          c.name AS customer_name, c.email AS customer_email, c.address AS customer_address
-       FROM public.invoices i
-       JOIN public.customers c ON i.customer_id = c.id
-       WHERE i.id = $1 AND i.user_id = $2;`, // ADDED user_id filter
-      [invoiceId, user_id]
-    );
-
-    if (invoiceResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Invoice not found.' });
-    }
-    const invoice = invoiceResult.rows[0];
-
-    const lineItemsResult = await pool.query(
-      `SELECT
-          il.product_service_id, il.description, il.quantity, il.unit_price, il.line_total, il.tax_rate,
-          ps.name AS product_service_name
-       FROM public.invoice_line_items il
-       LEFT JOIN public.products_services ps ON il.product_service_id = ps.id
-       WHERE il.invoice_id = $1;`,
-      [invoiceId]
-    );
-    invoice.line_items = lineItemsResult.rows;
-
-    // Prepare data for PDF generation
-    const invoiceDataForPdf: InvoiceDetailsForPdf = {
-      invoice_number: invoice.invoice_number,
-      customer_name: invoice.customer_name,
-      customer_email: invoice.customer_email,
-      customer_address: invoice.customer_address,
-      invoice_date: invoice.invoice_date,
-      due_date: invoice.due_date,
-      total_amount: parseFloat(invoice.total_amount),
-      currency: invoice.currency,
-      notes: invoice.notes,
-      line_items: invoice.line_items.map((item: any) => ({
-        product_service_name: item.product_service_name,
-        description: item.description,
-        quantity: parseFloat(item.quantity),
-        unit_price: parseFloat(item.unit_price),
-        line_total: parseFloat(item.line_total),
-        tax_rate: parseFloat(item.tax_rate),
-      })),
-      companyName: process.env.APP_NAME || 'Your Company',
-      // Add more company details from .env if you have them, e.g.:
-      // companyAddress: process.env.COMPANY_ADDRESS,
-      // companyVat: process.env.COMPANY_VAT_NUMBER,
-    };
-
-    // 2. Generate PDF
-    const pdfBuffer = await generateInvoicePdf(invoiceDataForPdf);
-
-    // 3. Send Email with PDF attachment
-    const emailSubject = `Invoice #${invoice.invoice_number} from ${process.env.APP_NAME || 'Your Company'}`;
-    const emailHtml = `
-      <p>Dear ${invoice.customer_name},</p>
-      <p>Please find attached your invoice (Invoice ID: <b>#${invoice.invoice_number}</b>) from ${process.env.APP_NAME || 'Your Company'}.</p>
-      <p>Total amount due: <b>${formatCurrency(invoiceDataForPdf.total_amount, invoiceDataForPdf.currency)}</b></p>
-      <p>Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-ZA')}</p>
-      <p>Thank you for your business!</p>
-      <p>Sincerely,<br>${process.env.APP_NAME || 'Your Company'}</p>
-    `;
-
-    const emailSent = await sendEmail({
-      to: customerEmail,
-      subject: emailSubject,
-      html: emailHtml,
-      attachments: [
-        {
-          filename: `Invoice_${invoice.invoice_number}.pdf`,
-          content: pdfBuffer,
-          contentType: 'application/pdf',
-        },
-      ],
-    });
-
-    if (emailSent) {
-      // Optional: Update invoice status to 'Sent' in your DB
-      await pool.query(
-        `UPDATE public.invoices SET status = 'Sent', updated_at = CURRENT_TIMESTAMP WHERE id = $1;`,
-        [invoiceId]
-      );
-      res.status(200).json({ message: 'Invoice PDF generated and email sent successfully!' });
-    } else {
-      res.status(500).json({ error: 'Failed to send invoice email.' });
+    if (!customerEmail) {
+        return res.status(400).json({ error: 'Customer email is required to send the invoice.' });
     }
 
-  } catch (error: any) {
-    console.error('Error generating PDF or sending email:', error);
-    res.status(500).json({
-      error: 'Failed to generate PDF or send email.',
-      detail: error.message || String(error)
-    });
-  }
+    try {
+        // 1. Fetch Invoice Details from Database (including line items and customer info)
+        const invoiceResult = await pool.query(
+            `SELECT
+                i.id, i.invoice_number, i.invoice_date, i.due_date, i.total_amount, i.status, i.currency, i.notes,
+                c.name AS customer_name, c.email AS customer_email, c.address AS customer_address
+            FROM public.invoices i
+            JOIN public.customers c ON i.customer_id = c.id
+            WHERE i.id = $1 AND i.user_id = $2;`,
+            [invoiceId, user_id]
+        );
+
+        if (invoiceResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Invoice not found.' });
+        }
+        const invoice = invoiceResult.rows[0];
+
+        const lineItemsResult = await pool.query(
+            `SELECT
+                il.product_service_id, il.description, il.quantity, il.unit_price, il.line_total, il.tax_rate,
+                ps.name AS product_service_name
+            FROM public.invoice_line_items il
+            LEFT JOIN public.products_services ps ON il.product_service_id = ps.id
+            WHERE il.invoice_id = $1;`,
+            [invoiceId]
+        );
+        invoice.line_items = lineItemsResult.rows;
+
+        // 2. FETCH THE USER'S COMPANY PROFILE
+        // This is a crucial step to get the user's company information from the database
+        const userProfileResult = await pool.query(
+            'SELECT company, address, city, province, postal_code, country FROM public.users WHERE user_id = $1;',
+            [user_id]
+        );
+
+        const userProfile = userProfileResult.rows[0];
+        const companyName = userProfile?.company || 'Your Company';
+        // Dynamically construct the full company address string
+        const companyAddress = userProfile?.address ?
+            `${userProfile.address}, ${userProfile.city}, ${userProfile.province}, ${userProfile.postal_code}, ${userProfile.country}`
+            : null;
+
+        // 3. Prepare data for PDF generation, now including dynamic company info
+        const invoiceDataForPdf: InvoiceDetailsForPdf = {
+            invoice_number: invoice.invoice_number,
+            customer_name: invoice.customer_name,
+            customer_email: invoice.customer_email,
+            customer_address: invoice.customer_address,
+            invoice_date: invoice.invoice_date,
+            due_date: invoice.due_date,
+            total_amount: parseFloat(invoice.total_amount),
+            currency: invoice.currency,
+            notes: invoice.notes,
+            line_items: invoice.line_items.map((item: any) => ({
+                product_service_name: item.product_service_name,
+                description: item.description,
+                quantity: parseFloat(item.quantity),
+                unit_price: parseFloat(item.unit_price),
+                line_total: parseFloat(item.line_total),
+                tax_rate: parseFloat(item.tax_rate),
+            })),
+            companyName: companyName, // USE DYNAMIC COMPANY NAME
+            companyAddress: companyAddress, // USE DYNAMIC COMPANY ADDRESS
+            companyVat: null, // Placeholder for VAT number
+        };
+
+        // 4. Generate PDF
+        const pdfBuffer = await generateInvoicePdf(invoiceDataForPdf);
+
+        // 5. Send Email with PDF attachment, also using dynamic company name
+        const emailSubject = `Invoice #${invoice.invoice_number} from ${companyName}`;
+        const emailHtml = `
+            <p>Dear ${invoice.customer_name},</p>
+            <p>Please find attached your invoice (Invoice ID: <b>#${invoice.invoice_number}</b>) from ${companyName}.</p>
+            <p>Total amount due: <b>${formatCurrency(invoiceDataForPdf.total_amount, invoiceDataForPdf.currency)}</b></p>
+            <p>Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-ZA')}</p>
+            <p>Thank you for your business!</p>
+            <p>Sincerely,<br>${companyName}</p>
+        `;
+
+        const emailSent = await sendEmail({
+            to: customerEmail,
+            subject: emailSubject,
+            html: emailHtml,
+            attachments: [
+                {
+                    filename: `Invoice_${invoice.invoice_number}.pdf`,
+                    content: pdfBuffer,
+                    contentType: 'application/pdf',
+                },
+            ],
+        });
+
+        if (emailSent) {
+            // Optional: Update invoice status to 'Sent' in your DB
+            await pool.query(
+                `UPDATE public.invoices SET status = 'Sent', updated_at = CURRENT_TIMESTAMP WHERE id = $1;`,
+                [invoiceId]
+            );
+            res.status(200).json({ message: 'Invoice PDF generated and email sent successfully!' });
+        } else {
+            res.status(500).json({ error: 'Failed to send invoice email.' });
+        }
+
+    } catch (error: any) {
+        console.error('Error generating PDF or sending email:', error);
+        res.status(500).json({
+            error: 'Failed to generate PDF or send email.',
+            detail: error.message || String(error)
+        });
+    }
 });
+
 /* --- Assets API --- */
 
 // Updated Asset Interface to include depreciation fields
@@ -1495,7 +1659,7 @@ interface Asset {
 }
 
 app.get('/assets', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     const result = await pool.query(`
       SELECT
@@ -1529,7 +1693,7 @@ app.post('/assets', authMiddleware, async (req: Request, res: Response) => { // 
     type, name, number, cost, date_received, account_id,
     depreciation_method, useful_life_years, salvage_value
   } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   if (!type || !name || cost == null || !date_received || !account_id) {
     return res.status(400).json({ error: 'Missing required asset fields: type, name, cost, date_received, account_id' });
@@ -1574,7 +1738,7 @@ app.put('/assets/:id', authMiddleware, async (req: Request, res: Response) => { 
     type, name, number, cost, date_received, account_id,
     depreciation_method, useful_life_years, salvage_value, accumulated_depreciation, last_depreciation_date
   } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   const updates = [];
   const values = [];
@@ -1617,7 +1781,7 @@ app.put('/assets/:id', authMiddleware, async (req: Request, res: Response) => { 
 
 app.delete('/assets/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { id } = req.params;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     const result = await pool.query('DELETE FROM assets WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
     if (result.rows.length === 0) {
@@ -1662,7 +1826,7 @@ const calculateDepreciation = (
 
 app.post('/api/depreciation/run', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { endDate } = req.body; // endDate: The date up to which depreciation should be calculated
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   if (!endDate) {
     return res.status(400).json({ error: 'endDate is required for depreciation calculation.' });
@@ -1798,7 +1962,7 @@ app.post('/api/depreciation/run', authMiddleware, async (req: Request, res: Resp
 
 /* --- Expenses API --- */
 app.get('/expenses', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     // Select all fields relevant for an expense transaction + account_name
     const result = await pool.query(`
@@ -1818,7 +1982,7 @@ app.get('/expenses', authMiddleware, async (req: Request, res: Response) => { //
 app.post('/expenses', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   // Ensure all required fields for an expense transaction are captured
   const { name, details, category, amount, date, account_id } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   if (!name || amount == null || !date || !account_id) {
     return res.status(400).json({ error: 'Missing required expense fields: name, amount, date, account_id' });
@@ -1851,7 +2015,7 @@ app.post('/expenses', authMiddleware, async (req: Request, res: Response) => { /
 app.put('/expenses/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { id } = req.params;
   const { name, details, category, amount, date, account_id } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   const updates = [];
   const values = [];
@@ -1898,7 +2062,7 @@ app.put('/expenses/:id', authMiddleware, async (req: Request, res: Response) => 
 // NEW: DELETE Expense
 app.delete('/expenses/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { id } = req.params;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     const result = await pool.query('DELETE FROM expenses WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
     if (result.rows.length === 0) {
@@ -1913,7 +2077,7 @@ app.delete('/expenses/:id', authMiddleware, async (req: Request, res: Response) 
 
 /* --- File upload & processing --- */
 app.post('/transactions/upload', authMiddleware, upload.single('file'), async (req: Request, res: Response) => { // ADDED authMiddleware
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   if (!req.file) {
     return res.status(400).json({ detail: 'No file uploaded' });
   }
@@ -1924,7 +2088,7 @@ app.post('/transactions/upload', authMiddleware, upload.single('file'), async (r
 /* --- Text description processing (UPDATED to use Gemini API) --- */
 app.post('/transactions/process-text', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { description } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   if (!description) {
     return res.status(400).json({ detail: 'Description is required' });
@@ -2025,7 +2189,7 @@ app.post('/transactions/process-text', authMiddleware, async (req: Request, res:
 
 /* --- Audio upload & processing --- */
 app.post('/transactions/process-audio', authMiddleware, upload.single('audio_file'), async (req: Request, res: Response) => { // ADDED authMiddleware
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   if (!req.file) {
     return res.status(400).json({ detail: 'No audio file uploaded' });
   }
@@ -2038,7 +2202,7 @@ app.post('/transactions/process-audio', authMiddleware, upload.single('audio_fil
 // POST Customer
 app.post('/customers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { name, contact_person, email, phone, address, tax_id } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   if (!name) return res.status(400).json({ error: 'Customer name is required' });
 
@@ -2060,7 +2224,7 @@ app.post('/customers', authMiddleware, async (req: Request, res: Response) => { 
 // GET All Customers (with optional search filter for the main table)
 app.get('/api/customers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const searchTerm = req.query.search as string | undefined;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     let query = `
         SELECT
@@ -2107,7 +2271,7 @@ app.get('/api/customers', authMiddleware, async (req: Request, res: Response) =>
 // GET Customers by Search Query (Still useful for specific search-as-you-type components if needed elsewhere)
 app.get('/api/customers/search', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const query = req.query.query as string | undefined;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!query) {
         return res.status(400).json({ error: 'Search query is required' });
@@ -2130,7 +2294,7 @@ app.get('/api/customers/search', authMiddleware, async (req: Request, res: Respo
 // GET Single Customer by ID
 app.get('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query<CustomerDB>('SELECT id, name, contact_person, email, phone, address, tax_id, total_invoiced FROM public.customers WHERE id = $1 AND user_id = $2', [id, user_id]); // ADDED user_id filter
         if (result.rows.length === 0) {
@@ -2146,7 +2310,7 @@ app.get('/api/customers/:id', authMiddleware, async (req: Request, res: Response
 // POST Create Customer
 app.post('/api/customers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { name, contactPerson, email, phone, address, vatNumber }: CreateUpdateCustomerBody = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!name) { // Name is NOT NULL in DB
         return res.status(400).json({ error: 'Customer name is required' });
@@ -2172,7 +2336,7 @@ app.post('/api/customers', authMiddleware, async (req: Request, res: Response) =
 app.put('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
     const { name, contactPerson, email, phone, address, vatNumber }: CreateUpdateCustomerBody = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!name) { // Name is required for update
         return res.status(400).json({ error: 'Customer name is required for update.' });
@@ -2202,7 +2366,7 @@ app.put('/api/customers/:id', authMiddleware, async (req: Request, res: Response
 // DELETE Customer
 app.delete('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     try {
         const { rowCount } = await pool.query(
@@ -2227,7 +2391,7 @@ app.delete('/api/customers/:id', authMiddleware, async (req: Request, res: Respo
 });
 // GET Vendors
 app.get('/vendors', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     const result = await pool.query('SELECT id, name, contact_person, email, phone, address, tax_id FROM vendors WHERE user_id = $1 ORDER BY name', [user_id]); // ADDED user_id filter
     res.json(result.rows);
@@ -2240,7 +2404,7 @@ app.get('/vendors', authMiddleware, async (req: Request, res: Response) => { // 
 // POST Vendor
 app.post('/vendors', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { name, contact_person, email, phone, address, tax_id } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   if (!name) return res.status(400).json({ error: 'Vendor name is required' });
 
   try {
@@ -2260,7 +2424,7 @@ app.post('/vendors', authMiddleware, async (req: Request, res: Response) => { //
 app.put('/vendors/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { id } = req.params;
   const { name, contact_person, email, phone, address, tax_id } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   if (!name) {
     return res.status(400).json({ error: 'Vendor name is required for update.' });
@@ -2303,7 +2467,7 @@ app.put('/vendors/:id', authMiddleware, async (req: Request, res: Response) => {
 // DELETE Vendor
 app.delete('/vendors/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { id } = req.params;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     const result = await pool.query('DELETE FROM vendors WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
     if (result.rows.length === 0) {
@@ -2319,7 +2483,7 @@ app.delete('/vendors/:id', authMiddleware, async (req: Request, res: Response) =
 
 // GET Products/Services
 app.get('/products-services', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     const result = await pool.query(
       'SELECT id, name, description, unit_price, cost_price, sku, is_service, stock_quantity, unit FROM products_services WHERE user_id = $1 ORDER BY name', [user_id] // ADDED user_id filter
@@ -2354,7 +2518,7 @@ app.get('/products-services', authMiddleware, async (req: Request, res: Response
 // POST Product/Service
 app.post('/products-services', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { name, description, unit_price, cost_price, sku, is_service, stock_quantity } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   if (!name || unit_price == null) {
     return res.status(400).json({ error: 'Product/Service name and unit_price are required' });
   }
@@ -2376,7 +2540,7 @@ app.post('/products-services', authMiddleware, async (req: Request, res: Respons
 app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { id } = req.params; // Product ID
   const { adjustmentQuantity } = req.body; // Quantity to add (positive) or subtract (negative)
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
   // 1. Explicitly convert adjustmentQuantity to a number
   const parsedAdjustmentQuantity = Number(adjustmentQuantity);
@@ -2442,160 +2606,420 @@ app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request,
   }
 });
 
-// POST Create New Sale
-app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const {
-    cart,
-    paymentType,
-    total,
-    customer, // This will be selectedCustomer from frontend
-    amountPaid,
-    change,
-    dueDate,
-    tellerName, // From frontend (e.g., 'Dummy Teller')
-    branch,     // From frontend (e.g., 'Dummy Branch')
-    companyName // From frontend (e.g., 'DummyCo')
-  } = req.body;
-  const user_id = req.user!.user_id; // Get user_id from req.user
-
-  if (!cart || cart.length === 0 || total === undefined) {
-    return res.status(400).json({ error: 'Cart cannot be empty and total amount is required.' });
-  }
-
-  const actualAmountPaid = paymentType === 'Cash' ? Number(amountPaid) : null;
-  const actualChangeGiven = paymentType === 'Cash' ? Number(change) : null;
-  const actualCreditAmount = paymentType === 'Credit' ? Number(total) : null;
-  const actualDueDate = paymentType === 'Credit' ? dueDate : null;
-
-  const tellerId = null; // Replace with actual user ID if available from authentication system
+app.delete('/products-services/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user_id = req.user!.parent_user_id;
 
   try {
-    await pool.query('BEGIN'); // Start a transaction
-
-    // 1. Insert into the sales table, associating with user_id
-    const salesInsertResult = await pool.query(
-      `INSERT INTO public.sales (
-        customer_id, customer_name, total_amount, payment_type,
-        amount_paid, change_given, credit_amount, due_date,
-        teller_id, teller_name, branch, company_name, created_at, user_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP, $13)
-      RETURNING id, created_at;`, // ADDED user_id
-      [
-        customer?.id || null,
-        customer?.name || null,
-        Number(total),
-        paymentType,
-        actualAmountPaid,
-        actualChangeGiven,
-        actualCreditAmount,
-        actualDueDate,
-        tellerId,
-        tellerName,
-        branch,
-        companyName,
-        user_id // ADDED user_id
-      ]
+    const result = await pool.query(
+      'DELETE FROM products_services WHERE id = $1 AND user_id = $2 RETURNING *',
+      [id, user_id]
     );
 
-    const saleId = salesInsertResult.rows[0].id;
-    const saleTimestamp = salesInsertResult.rows[0].created_at; // Get the timestamp for the transaction date
-
-    // 2. Loop through cart items, deduct stock, and insert into sale_items
-    for (const item of cart) {
-      // Get current stock quantity, filtered by user_id
-      const productResult = await pool.query(
-        'SELECT stock_quantity, name FROM public.products_services WHERE id = $1 AND user_id = $2 FOR UPDATE', // ADDED user_id filter
-        [item.id, user_id]
-      );
-
-      if (productResult.rows.length === 0) {
-        await pool.query('ROLLBACK');
-        return res.status(404).json({ error: `Product or service with ID ${item.id} not found or unauthorized.` });
-      }
-
-      const currentStock = Number(productResult.rows[0].stock_quantity);
-      const productName = productResult.rows[0].name;
-      const quantityToDeduct = Number(item.quantity);
-
-      const newStock = currentStock - quantityToDeduct;
-
-      if (newStock < 0) {
-        await pool.query('ROLLBACK');
-        return res.status(400).json({
-          error: `Insufficient stock for "${productName}". Current stock: ${currentStock}. Cannot sell ${quantityToDeduct}.`,
-          availableStock: currentStock,
-        });
-      }
-
-      await pool.query(
-        `UPDATE public.products_services
-         SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $2 AND user_id = $3;`, // ADDED user_id filter
-        [newStock, item.id, user_id]
-      );
-
-      await pool.query(
-        `INSERT INTO public.sale_items (
-          sale_id, product_id, product_name, quantity, unit_price_at_sale, subtotal
-        ) VALUES ($1, $2, $3, $4, $5, $6);`,
-        [
-          saleId,
-          item.id,
-          item.name,
-          Number(item.quantity),
-          Number(item.unit_price),
-          Number(item.subtotal)
-        ]
-      );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Not found or unauthorized' });
     }
 
-    // --- NEW: Insert into the public.transactions table for Sales Revenue, associating with user_id ---
-    const salesRevenueAccountId = 5; // As specified: Sales Revenue Account ID is 5
-    const transactionType = 'Sales Revenue';
-    const transactionDescription = `POS Sale ID: ${saleId}`;
-    const transactionCategory = 'Revenue'; // Or 'Sales' as per your preference
-    const transactionDate = new Date(saleTimestamp).toISOString().split('T')[0]; // Format as YYYY-MM-DD
+    res.json({ message: 'Deleted successfully', deleted: result.rows[0] });
+  } catch (error: unknown) {
+    res.status(500).json({ error: 'Failed to delete', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
 
-    await pool.query(
-      `INSERT INTO public.transactions (
-        type, amount, description, date, category, account_id, source, confirmed, user_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);`, // Changed firebase_uid to user_id
-      [
-        transactionType,
-        Number(total),
-        transactionDescription,
-        transactionDate,
-        transactionCategory,
-        salesRevenueAccountId,
-        'POS', // Source can be 'POS'
-        true, // Confirmed
-        user_id // ADDED user_id
-      ]
+app.put('/products-services/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user_id = req.user!.parent_user_id;
+  const {
+    name, description, unit_price, cost_price, sku,
+    is_service, stock_quantity, unit
+  } = req.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE products_services
+       SET name = $1, description = $2, unit_price = $3, cost_price = $4,
+           sku = $5, is_service = $6, stock_quantity = $7, unit = $8, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $9 AND user_id = $10
+       RETURNING *`,
+      [name, description, unit_price, cost_price, sku, is_service, stock_quantity, unit, id, user_id]
     );
 
-    await pool.query('COMMIT'); // Commit the transaction if all successful
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Product not found or unauthorized' });
+    }
 
-    res.status(201).json({
-      message: 'Sale submitted successfully and transaction recorded!',
-      saleId: saleId,
-      timestamp: saleTimestamp,
-    });
-
+    res.json(result.rows[0]);
   } catch (error: unknown) {
-    await pool.query('ROLLBACK'); // Rollback transaction in case of error
-    console.error('Error submitting sale:', error);
-    res.status(500).json({
-      error: 'Failed to submit sale',
-      detail: error instanceof Error ? error.message : String(error)
-    });
+    console.error('Error updating product:', error);
+    res.status(500).json({ error: 'Update failed', detail: error instanceof Error ? error.message : String(error) });
   }
+});
+
+// =========================================================================
+// 1. POST Create New Sale (app.post('/api/sales')) - Corrected
+// =========================================================================
+// =========================================================================
+// 1. POST Create New Sale (app.post('/api/sales'))
+// This endpoint is unchanged from our previous discussion and correctly
+// calculates the remaining_credit_amount.
+// =========================================================================
+app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
+    const {
+        cart,
+        paymentType,
+        total,
+        customer,
+        amountPaid,
+        change,
+        dueDate,
+        tellerName,
+        branch,
+        companyName
+    } = req.body;
+    const user_id = req.user!.parent_user_id;
+
+    if (!cart || cart.length === 0 || total === undefined) {
+        return res.status(400).json({ error: 'Cart cannot be empty and total amount is required.' });
+    }
+
+    if (paymentType === 'Credit' && (!customer || !customer.id)) {
+        return res.status(400).json({ error: 'A customer is required for credit sales.' });
+    }
+
+    const remainingCreditAmount = paymentType === 'Credit' ? Number(total) : null;
+    const actualAmountPaid = paymentType !== 'Credit' ? Number(amountPaid) : null;
+    const actualChangeGiven = paymentType === 'Cash' ? Number(change) : null;
+    const actualDueDate = paymentType === 'Credit' ? dueDate : null;
+
+    const tellerId = req.user!.parent_user_id;
+    const customerId = customer?.id || null;
+    const customerName = customer?.name || null;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        const salesInsertResult = await client.query(
+            `INSERT INTO public.sales (
+                customer_id, customer_name, total_amount, payment_type,
+                amount_paid, change_given, remaining_credit_amount, due_date,
+                teller_id, teller_name, branch, company_name, user_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id, created_at;`,
+            [
+                customerId,
+                customerName,
+                Number(total),
+                paymentType,
+                actualAmountPaid,
+                actualChangeGiven,
+                remainingCreditAmount,
+                actualDueDate,
+                tellerId,
+                tellerName,
+                branch,
+                companyName,
+                user_id
+            ]
+        );
+
+        const saleId = salesInsertResult.rows[0].id;
+        const saleTimestamp = salesInsertResult.rows[0].created_at;
+
+        if (paymentType === 'Credit' && customerId) {
+            await client.query(
+                `UPDATE public.customers
+                 SET balance_due = balance_due + $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $2 AND user_id = $3;`,
+                [Number(total), customerId, user_id]
+            );
+        }
+
+        for (const item of cart) {
+            const productResult = await client.query(
+                'SELECT stock_quantity, name FROM public.products_services WHERE id = $1 AND user_id = $2 FOR UPDATE',
+                [item.id, user_id]
+            );
+
+            if (productResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ error: `Product or service with ID ${item.id} not found or unauthorized.` });
+            }
+
+            const currentStock = Number(productResult.rows[0].stock_quantity);
+            const productName = productResult.rows[0].name;
+            const quantityToDeduct = Number(item.quantity);
+            const newStock = currentStock - quantityToDeduct;
+
+            if (newStock < 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    error: `Insufficient stock for "${productName}". Current stock: ${currentStock}. Cannot sell ${quantityToDeduct}.`,
+                    availableStock: currentStock,
+                });
+            }
+
+            await client.query(
+                `UPDATE public.products_services
+                 SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $2 AND user_id = $3;`,
+                [newStock, item.id, user_id]
+            );
+
+            await client.query(
+                `INSERT INTO public.sale_items (
+                    sale_id, product_id, product_name, quantity, unit_price_at_sale, subtotal
+                ) VALUES ($1, $2, $3, $4, $5, $6);`,
+                [
+                    saleId,
+                    item.id,
+                    item.name,
+                    Number(item.quantity),
+                    Number(item.unit_price),
+                    Number(item.subtotal)
+                ]
+            );
+        }
+
+        const salesRevenueAccountId = 5;
+        const transactionType = 'Sales Revenue';
+        const transactionDescription = `POS Sale ID: ${saleId}`;
+        const transactionCategory = 'Revenue';
+        const transactionDate = new Date(saleTimestamp).toISOString().split('T')[0];
+
+        await client.query(
+            `INSERT INTO public.transactions (
+                type, amount, description, date, category, account_id, source, confirmed, user_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);`,
+            [
+                transactionType,
+                Number(total),
+                transactionDescription,
+                transactionDate,
+                transactionCategory,
+                salesRevenueAccountId,
+                'POS',
+                true,
+                user_id
+            ]
+        );
+
+        await client.query('COMMIT');
+        res.status(201).json({
+            message: 'Sale submitted successfully and transaction recorded!',
+            saleId: saleId,
+            timestamp: saleTimestamp,
+        });
+
+    } catch (error: unknown) {
+        await client.query('ROLLBACK');
+        console.error('Error submitting sale:', error);
+        res.status(500).json({
+            error: 'Failed to submit sale',
+            detail: error instanceof Error ? error.message : String(error)
+        });
+    } finally {
+        client.release();
+    }
+});
+
+
+// =========================================================================
+// 2. GET Outstanding Credit Sales (app.get('/api/credit-sales'))
+// This is the fixed endpoint from our previous step.
+// =========================================================================
+app.get('/api/credit-sales', authMiddleware, async (req: Request, res: Response) => {
+    if (!req.user || !req.user.user_id) {
+        return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user_id = req.user.user_id;
+    console.log(`Fetching outstanding credit sales for user_id: ${user_id}`);
+
+    try {
+        const result = await pool.query(
+            `SELECT
+              s.id,
+              s.customer_id,
+              c.name AS customer_name,
+              s.created_at AS sale_date,
+              s.total_amount,
+              s.remaining_credit_amount,
+              s.payment_type AS payment_method,
+              s.due_date
+            FROM public.sales s
+            LEFT JOIN public.customers c ON s.customer_id = c.id
+            WHERE s.user_id = $1
+              AND s.payment_type = 'Credit'
+              AND s.remaining_credit_amount > 0
+            ORDER BY s.created_at DESC;`,
+            [user_id]
+        );
+
+        const creditSales = result.rows.map(row => ({
+            ...row,
+            total_amount: parseFloat(row.total_amount),
+            remaining_credit_amount: parseFloat(row.remaining_credit_amount),
+        }));
+
+        console.log('Backend API: Successfully fetched outstanding credit sales.', creditSales);
+        res.status(200).json(creditSales);
+
+    } catch (error) {
+        console.error('Error fetching outstanding credit sales:', error);
+        res.status(500).json({ error: 'Failed to fetch outstanding credit sales.' });
+    }
+});
+
+
+// =========================================================================
+// 3. GET Credit History for Customer (app.get('/api/sales/customer/:customerId/credit-history'))
+// --- FIX APPLIED HERE: Explicitly parse numeric values. ---
+// =========================================================================
+app.get('/api/sales/customer/:customerId/credit-history', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    const { customerId } = req.params;
+
+    try {
+        const result = await pool.query(
+            `SELECT
+              s.id,
+              s.customer_id,
+              s.customer_name,
+              s.created_at AS sale_date,
+              s.total_amount,
+              s.remaining_credit_amount,
+              s.payment_type AS payment_method,
+              s.due_date
+            FROM public.sales s
+            WHERE s.user_id = $1 AND s.customer_id = $2 AND s.payment_type = 'Credit'
+            ORDER BY s.created_at DESC;`,
+            [user_id, customerId]
+        );
+        
+        // --- FIX: Explicitly parse numeric values before sending to the client ---
+        const creditHistory = result.rows.map(row => ({
+            ...row,
+            total_amount: parseFloat(row.total_amount),
+            remaining_credit_amount: parseFloat(row.remaining_credit_amount),
+        }));
+
+        res.status(200).json(creditHistory);
+    } catch (error) {
+        console.error(`Error fetching credit history for customer ${customerId}:`, error);
+        res.status(500).json({ error: 'Failed to fetch customer credit history.' });
+    }
+});
+
+
+// =========================================================================
+// 4. POST Credit Payments (app.post('/api/credit-payments'))
+// This endpoint is unchanged from our previous discussion.
+// =========================================================================
+app.post('/api/credit-payments', authMiddleware, async (req: Request, res: Response) => {
+    const { customerId, saleId, amountPaid, paymentMethod, description, recordedBy } = req.body;
+    const user_id = req.user!.parent_user_id;
+
+    if (!customerId || !amountPaid || Number(amountPaid) <= 0) {
+        return res.status(400).json({ error: 'Customer ID and a positive amount paid are required.' });
+    }
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        await client.query(
+            `INSERT INTO public.credit_payments (
+                user_id, customer_id, sale_id, amount_paid, payment_method, description, recorded_by
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7);`,
+            [user_id, customerId, saleId, Number(amountPaid), paymentMethod, description, recordedBy]
+        );
+
+        await client.query(
+            `UPDATE public.customers
+             SET balance_due = balance_due - $1
+             WHERE id = $2 AND user_id = $3;`,
+            [Number(amountPaid), customerId, user_id]
+        );
+
+        if (saleId) {
+            const updateSaleQuery = `
+                UPDATE public.sales
+                SET remaining_credit_amount = remaining_credit_amount - $1
+                WHERE id = $2 AND user_id = $3;
+            `;
+            await client.query(updateSaleQuery, [Number(amountPaid), saleId, user_id]);
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'Credit payment recorded successfully.' });
+
+    } catch (error: unknown) {
+        await client.query('ROLLBACK');
+        console.error('Error recording credit payment:', error);
+        res.status(500).json({
+            error: 'Failed to record credit payment',
+            detail: error instanceof Error ? error.message : String(error)
+        });
+    } finally {
+        client.release();
+    }
+});
+
+
+// =========================================================================
+// 3. GET Sales Data for Dashboard (app.get('/api/dashboard/sales')) - Your existing code
+// =========================================================================
+app.get('/api/dashboard/sales', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+
+    try {
+        const salesDataResult = await pool.query(
+            `SELECT
+                s.id AS sale_id,
+                s.created_at AS sale_date,
+                si.product_id,
+                si.product_name,
+                si.quantity,
+                si.unit_price_at_sale
+            FROM
+                public.sales s
+            JOIN
+                public.sale_items si ON s.id = si.sale_id
+            WHERE
+                s.user_id = $1
+            ORDER BY
+                s.created_at ASC;`,
+            [user_id]
+        );
+
+        const processedSales = salesDataResult.rows.map(row => ({
+            saleId: row.sale_id,
+            createdAt: new Date(row.sale_date),
+            product_id: row.product_id,
+            product_name: row.product_name,
+            quantity: Number(row.quantity),
+            unit_price_at_sale: Number(row.unit_price_at_sale)
+        }));
+
+        res.status(200).json(processedSales);
+
+    } catch (error: unknown) {
+        console.error('Error fetching dashboard sales data:', error);
+        res.status(500).json({
+            error: 'Failed to fetch dashboard sales data',
+            detail: error instanceof Error ? error.message : String(error)
+        });
+    }
 });
 
 /* --- Invoice API Endpoints --- */
 
 // GET All Invoices (List View)
 app.get('/api/invoices', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query(`
             SELECT
@@ -2623,7 +3047,7 @@ app.get('/api/invoices', authMiddleware, async (req: Request, res: Response) => 
 // GET Single Invoice with Line Items
 app.get('/api/invoices/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const invoiceResult = await pool.query(`
             SELECT
@@ -2680,7 +3104,7 @@ app.get('/api/invoices/:id', authMiddleware, async (req: Request, res: Response)
 // POST Create Invoice
 app.post('/api/invoices', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { invoice_number, customer_id, customer_name, invoice_date, due_date, total_amount, status, currency, notes, line_items } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!invoice_number || !invoice_date || !due_date || total_amount == null || !line_items || line_items.length === 0) {
         return res.status(400).json({ error: 'Missing required invoice fields or line items' });
@@ -2746,7 +3170,7 @@ app.post('/api/invoices', authMiddleware, async (req: Request, res: Response) =>
 app.put('/api/invoices/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
     const { invoice_number, customer_id, customer_name, invoice_date, due_date, total_amount, status, currency, notes, line_items } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!invoice_number || !invoice_date || !due_date || total_amount == null || !line_items) {
         return res.status(400).json({ error: 'Missing required invoice fields or line items' });
@@ -2827,7 +3251,7 @@ app.put('/api/invoices/:id', authMiddleware, async (req: Request, res: Response)
 // DELETE Invoice
 app.delete('/api/invoices/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query('DELETE FROM public.invoices WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
         if (result.rows.length === 0) {
@@ -2844,7 +3268,7 @@ app.delete('/api/invoices/:id', authMiddleware, async (req: Request, res: Respon
 app.post('/api/invoices/:id/payment', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params; // Invoice ID
     const { amount_paid, payment_date, notes, account_id, transaction_description, transaction_category } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (amount_paid == null || !payment_date || !account_id) {
         return res.status(400).json({ error: 'Amount paid, payment date, and account ID are required' });
@@ -2889,7 +3313,7 @@ app.post('/api/invoices/:id/payment', authMiddleware, async (req: Request, res: 
 
 // GET All Quotations (List View)
 app.get('/api/quotations', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query(`
             SELECT
@@ -2917,7 +3341,7 @@ app.get('/api/quotations', authMiddleware, async (req: Request, res: Response) =
 // GET Single Quotation with Line Items
 app.get('/api/quotations/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const quotationResult = await pool.query(`
             SELECT
@@ -2974,7 +3398,7 @@ app.get('/api/quotations/:id', authMiddleware, async (req: Request, res: Respons
 // POST Create Quotation
 app.post('/api/quotations', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { quotation_number, customer_id, customer_name, quotation_date, expiry_date, total_amount, status, currency, notes, line_items } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!quotation_number || !quotation_date || total_amount == null || !line_items || line_items.length === 0) {
         return res.status(400).json({ error: 'Missing required quotation fields or line items' });
@@ -3045,7 +3469,7 @@ app.post('/api/quotations', authMiddleware, async (req: Request, res: Response) 
 app.put('/api/quotations/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params; // Correctly extract 'id' from params
     const { quotation_number, customer_id, customer_name, quotation_date, expiry_date, total_amount, status, currency, notes, line_items } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!quotation_number || !quotation_date || total_amount == null || !line_items) {
         return res.status(400).json({ error: 'Missing required quotation fields or line items' });
@@ -3127,7 +3551,7 @@ app.put('/api/quotations/:id', authMiddleware, async (req: Request, res: Respons
 // DELETE Quotation
 app.delete('/api/quotations/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query('DELETE FROM public.quotations WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
         if (result.rows.length === 0) {
@@ -3146,7 +3570,7 @@ app.delete('/api/quotations/:id', authMiddleware, async (req: Request, res: Resp
 
 // GET All Purchases (List View)
 app.get('/api/purchases', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query(`
             SELECT
@@ -3174,7 +3598,7 @@ app.get('/api/purchases', authMiddleware, async (req: Request, res: Response) =>
 // GET Single Purchase with Line Items
 app.get('/api/purchases/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const purchaseResult = await pool.query(`
             SELECT
@@ -3232,7 +3656,7 @@ app.get('/api/purchases/:id', authMiddleware, async (req: Request, res: Response
 app.post('/api/purchases', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     // Destructure vendor_name (manual input) from req.body
     const { po_number, vendor_id, vendor_name, order_date, delivery_date, total_amount, status, currency, notes, line_items } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!order_date || total_amount == null || !line_items || line_items.length === 0) {
         return res.status(400).json({ error: 'Missing required purchase fields or line items' });
@@ -3303,7 +3727,7 @@ app.post('/api/purchases', authMiddleware, async (req: Request, res: Response) =
 app.put('/api/purchases/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
     const { po_number, vendor_id, vendor_name, order_date, delivery_date, total_amount, status, currency, notes, line_items } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!order_date || total_amount == null || !line_items) {
         return res.status(400).json({ error: 'Missing required purchase fields or line items' });
@@ -3385,7 +3809,7 @@ app.put('/api/purchases/:id', authMiddleware, async (req: Request, res: Response
 // DELETE Purchase
 app.delete('/api/purchases/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query('DELETE FROM public.purchases WHERE id = $1 AND user_id = $2 RETURNING id', [id, user_id]); // ADDED user_id filter
         if (result.rows.length === 0) {
@@ -3402,7 +3826,7 @@ app.delete('/api/purchases/:id', authMiddleware, async (req: Request, res: Respo
 app.post('/api/purchases/:id/payment', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params; // Purchase ID
     const { amount_paid, payment_date, notes, account_id, transaction_description, transaction_category } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (amount_paid == null || !payment_date || !account_id) {
         return res.status(400).json({ error: 'Amount paid, payment date, and account ID are required' });
@@ -3451,7 +3875,7 @@ app.post('/api/purchases/:id/payment', authMiddleware, async (req: Request, res:
 
 // GET All Employees (List View)
 app.get('/employees', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query(`
             SELECT
@@ -3486,7 +3910,7 @@ app.get('/employees', authMiddleware, async (req: Request, res: Response) => { /
 // PUT Update Employee Details (including bank details and hours_worked_total)
 // Employee Registration Endpoint
 app.post('/employees', authMiddleware, async (req: Request, res: Response) => {
-  const user_id = req.user!.user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id; // Get user_id from req.user
   const {
     name,
     position,
@@ -3584,7 +4008,7 @@ app.post('/employees', authMiddleware, async (req: Request, res: Response) => {
 // DELETE Employee
 app.delete('/employees/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         // Due to ON DELETE CASCADE, bank_details and time_entries will be deleted automatically
         // Ensure deletion is scoped by user_id
@@ -3604,7 +4028,7 @@ app.delete('/employees/:id', authMiddleware, async (req: Request, res: Response)
 
 // NEW: GET All Time Entries (for dashboard and general list)
 app.get('/time-entries', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query(`
             SELECT te.id, te.employee_id, te.entry_date as date, te.hours_worked, te.notes as description, te.status, te.created_at, te.updated_at
@@ -3623,7 +4047,7 @@ app.get('/time-entries', authMiddleware, async (req: Request, res: Response) => 
 // GET Time Entries for a specific employee
 app.get('/employees/:employeeId/time-entries', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { employeeId } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         // Ensure the employee belongs to the user before fetching their time entries
         const employeeCheck = await pool.query('SELECT id FROM employees WHERE id = $1 AND user_id = $2', [employeeId, user_id]);
@@ -3648,7 +4072,7 @@ app.get('/employees/:employeeId/time-entries', authMiddleware, async (req: Reque
 // POST Add a new Time Entry for an employee
 app.post('/employees/:employeeId/time-entries', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { employeeId } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     const { date, hours_worked, description } = req.body; // Use date, hours_worked, description to match frontend payload
 
     if (!date || hours_worked == null || hours_worked <= 0) {
@@ -3677,7 +4101,7 @@ app.post('/employees/:employeeId/time-entries', authMiddleware, async (req: Requ
 // PUT Update a specific Time Entry
 app.put('/time-entries/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     const { date, hours_worked, description, status } = req.body; // Allow status to be updated
 
     // Build dynamic query parts
@@ -3723,7 +4147,7 @@ app.put('/time-entries/:id', authMiddleware, async (req: Request, res: Response)
 // DELETE a specific Time Entry
 app.delete('/time-entries/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         // Ensure deletion is scoped by user_id by joining with employees table
         const result = await pool.query(
@@ -3749,7 +4173,7 @@ app.delete('/time-entries/:id', authMiddleware, async (req: Request, res: Respon
 
 // GET All Suppliers (and filter by search term if provided)
 app.get('/api/suppliers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     // Asserting req.query.search as string to allow .toLowerCase()
     const searchTerm = req.query.search as string | undefined;
 
@@ -3777,7 +4201,7 @@ app.get('/api/suppliers', authMiddleware, async (req: Request, res: Response) =>
 // GET a single supplier by ID (useful for "Eye" button or detailed view)
 app.get('/api/suppliers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const { rows } = await pool.query<SupplierDB>(
             'SELECT id, name, email, phone, address, vat_number, total_purchased FROM public.suppliers WHERE id = $1 AND user_id = $2', // ADDED user_id filter
@@ -3798,7 +4222,7 @@ app.get('/api/suppliers/:id', authMiddleware, async (req: Request, res: Response
 // POST Create New Supplier
 app.post('/api/suppliers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { name, email, phone, address, vatNumber } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!name) {
         return res.status(400).json({ error: 'Supplier name is required' });
@@ -3823,7 +4247,7 @@ app.post('/api/suppliers', authMiddleware, async (req: Request, res: Response) =
 // PUT Update Existing Supplier
 app.put('/api/suppliers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     const { name, email, phone, address, vatNumber } = req.body;
 
     if (!name) { // Name is required for update
@@ -3854,7 +4278,7 @@ app.put('/api/suppliers/:id', authMiddleware, async (req: Request, res: Response
 // DELETE a Supplier
 app.delete('/api/suppliers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     try {
         const { rowCount } = await pool.query(
@@ -3944,7 +4368,7 @@ interface CreateUpdateProductBody {
 // GET All Products (with optional search)
 // Path: /api/products
 app.get('/api/products', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     const searchTerm = req.query.search as string | undefined;
 
     let query = `
@@ -3981,7 +4405,7 @@ app.get('/api/products', authMiddleware, async (req: Request, res: Response) => 
 // Path: /api/products/:id
 app.get('/api/products/:id', authMiddleware, async (req: Request, res: Response) => {
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const { rows } = await pool.query<ProductDB>(
             `SELECT
@@ -4008,7 +4432,7 @@ app.get('/api/products/:id', authMiddleware, async (req: Request, res: Response)
 // POST Create New Product
 // Path: /api/products
 app.post('/api/products', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     const {
         name, description, price, costPrice, sku,
         isService = false, stock = 0, vatRate, category, unit,
@@ -4086,7 +4510,7 @@ app.post('/api/products', authMiddleware, async (req: Request, res: Response) =>
 // Path: /api/products/:id
 app.put('/api/products/:id', authMiddleware, async (req: Request, res: Response) => {
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     const {
         name, description, price, costPrice, sku,
         isService, stock, vatRate, category, unit,
@@ -4170,7 +4594,7 @@ app.put('/api/products/:id', authMiddleware, async (req: Request, res: Response)
 // Path: /api/products/:id
 app.delete('/api/products/:id', authMiddleware, async (req: Request, res: Response) => {
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     try {
         const { rowCount } = await pool.query(
@@ -4197,7 +4621,7 @@ app.delete('/api/products/:id', authMiddleware, async (req: Request, res: Respon
 // GET Products/Services (This seems like a duplicate of /api/products but without search)
 // Keeping it for now as it was in your provided snippet, but consider consolidating.
 app.get('/products-services', authMiddleware, async (req: Request, res: Response) => {
-  const user_id = req.user!.user_id;
+  const user_id = req.user!.parent_user_id;
   try {
     const result = await pool.query(
       `SELECT id, name, description, unit_price, cost_price, sku, is_service, stock_quantity, unit,
@@ -4237,7 +4661,7 @@ app.get('/products-services', authMiddleware, async (req: Request, res: Response
 // Keeping it for now as it was in your provided snippet, but consider consolidating.
 app.post('/products-services', authMiddleware, async (req: Request, res: Response) => {
   const { name, description, unit_price, cost_price, sku, is_service, stock_quantity } = req.body;
-  const user_id = req.user!.user_id;
+  const user_id = req.user!.parent_user_id;
   if (!name || unit_price == null) {
     return res.status(400).json({ error: 'Product/Service name and unit_price are required' });
   }
@@ -4259,7 +4683,7 @@ app.post('/products-services', authMiddleware, async (req: Request, res: Respons
 app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request, res: Response) => {
   const { id } = req.params;
   const { adjustmentQuantity } = req.body;
-  const user_id = req.user!.user_id;
+  const user_id = req.user!.parent_user_id;
 
   const parsedAdjustmentQuantity = Number(adjustmentQuantity);
 
@@ -4363,7 +4787,7 @@ const getCurrentAndPreviousDateRanges = () => {
 
 // GET Client Count with Change
 app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
 
@@ -4395,7 +4819,7 @@ app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response
 // GET Quotes Count with Change
 // GET Quotes Count with Change
 app.get('/api/stats/quotes', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
 
@@ -4427,7 +4851,7 @@ app.get('/api/stats/quotes', authMiddleware, async (req: Request, res: Response)
 
 // GET Invoices Count with Change
 app.get('/api/stats/invoices', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
 
@@ -4459,7 +4883,7 @@ app.get('/api/stats/invoices', authMiddleware, async (req: Request, res: Respons
 
 // GET Total Invoice Value with Change
 app.get('/api/stats/invoice-value', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
 
@@ -4496,7 +4920,7 @@ const formatMonth = (date: Date) => {
 
 // GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
 app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         // Fetch invoice revenue by month
         // Using 'created_at' for consistency across transaction tables
@@ -4564,7 +4988,7 @@ app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: R
 
 // GET Transaction Volume Data (Quotes, Invoices, Purchases by Month)
 app.get('/api/charts/transaction-volume', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         // Fetch quotes count by month
         // Using 'created_at' as per your provided schema for consistency
@@ -4648,7 +5072,7 @@ app.post('/documents', authMiddleware, upload.single('file'), async (req: Reques
     try {
         const file = req.file;
         const { name, type, description } = req.body; // Removed user_id from req.body
-        const user_id = req.user!.user_id; // Get user_id from req.user
+        const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
         if (!file) return res.status(400).json({ error: 'No file uploaded' });
 
@@ -4675,7 +5099,7 @@ app.post('/documents', authMiddleware, upload.single('file'), async (req: Reques
 
 // (Optional) Get all documents
 app.get('/documents', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query('SELECT * FROM documents WHERE user_id = $1 ORDER BY uploaded_at DESC', [user_id]); // ADDED user_id filter
         res.json(result.rows);
@@ -4702,7 +5126,7 @@ const getStatusFromPercentage = (percentage: number): string => {
 // POST /api/tasks - Create a new task
 app.post('/api/tasks', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { title, description, priority, due_date, project_id, progress_percentage: clientProgress } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user (replaces dummyUserId)
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user (replaces dummyUserId)
 
     if (!title) {
         return res.status(400).json({ error: 'Task title is required.' });
@@ -4737,7 +5161,7 @@ app.post('/api/tasks', authMiddleware, async (req: Request, res: Response) => { 
 
 // GET /api/tasks - Fetch all tasks for the authenticated user, with project details
 app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user (replaces dummyUserId)
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user (replaces dummyUserId)
 
     try {
         const result = await pool.query(
@@ -4760,7 +5184,7 @@ app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => { /
 app.put('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
     const { title, description, priority, due_date, project_id, progress_percentage: clientProgress } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user (replaces dummyUserId)
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user (replaces dummyUserId)
 
     if (!title) {
         return res.status(400).json({ error: 'Task title is required.' });
@@ -4802,7 +5226,7 @@ app.put('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) =>
 // DELETE /api/tasks/:id - Delete a task
 app.delete('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user (replaces dummyUserId)
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user (replaces dummyUserId)
 
     try {
         const result = await pool.query(
@@ -4825,7 +5249,7 @@ app.delete('/api/tasks/:id', authMiddleware, async (req: Request, res: Response)
 // POST /api/projects - Create a new project
 app.post('/api/projects', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { name, description, deadline, status, assignee, progress_percentage } = req.body;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     if (!name) {
         return res.status(400).json({ error: 'Project name is required.' });
@@ -4854,7 +5278,7 @@ app.post('/api/projects', authMiddleware, async (req: Request, res: Response) =>
 
 // GET /api/projects - Fetch all projects
 app.get('/api/projects', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
         const result = await pool.query(
             `SELECT id, name, description, deadline, status, assignee, progress_percentage, created_at, updated_at
@@ -4871,7 +5295,7 @@ app.get('/api/projects', authMiddleware, async (req: Request, res: Response) => 
 // PUT /api/projects/:id - Update an existing project
 app.put('/api/projects/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
     const { name, description, deadline, status, assignee, progress_percentage } = req.body;
 
     if (!name) {
@@ -4908,7 +5332,7 @@ app.put('/api/projects/:id', authMiddleware, async (req: Request, res: Response)
 // DELETE /api/projects/:id - Delete a project
 app.delete('/api/projects/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const { id } = req.params;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
     try {
         const result = await pool.query(
@@ -4926,667 +5350,1340 @@ app.delete('/api/projects/:id', authMiddleware, async (req: Request, res: Respon
     }
 });
 
-app.get('/generate-financial-document', authMiddleware, async (req: Request, res: Response) => {
-    const { documentType, startDate, endDate } = req.query;
-    const user_id = req.user!.user_id; // Get user_id from req.user
+/* --- Financial Document Generation API --- */
+app.get('/generate-financial-document', async (req: Request, res: Response) => {
+  const { documentType, startDate, endDate } = req.query;
 
-    if (!documentType || !startDate || !endDate) {
-        return res.status(400).json({ error: 'documentType, startDate, and endDate are required.' });
+  if (!documentType || !startDate || !endDate) {
+    return res.status(400).json({ error: 'documentType, startDate, and endDate are required.' });
+  }
+
+  // Set response headers for PDF download
+  res.writeHead(200, {
+    'Content-Type': 'application/pdf',
+    'Content-Disposition': `attachment; filename="${documentType}-${startDate}-to-${endDate}.pdf"`
+  });
+
+  const doc = new PDFDocument();
+  doc.pipe(res); // Pipe the PDF directly to the response stream
+
+  try {
+    // MODIFICATION START: Fetch company name from the database
+    let companyName = 'MADE BY QUANTILYTIX'; // Default value in case of query failure
+
+    const userId = req.user?.user_id; // Assuming user info is available from auth middleware
+
+    if (!userId) {
+      console.warn('User not authenticated. Using default company name.');
+    } else {
+      try {
+        const query = 'SELECT company FROM public.users WHERE user_id = $1;';
+        const result = await pool.query(query, [userId]);
+  
+        if (result.rows.length > 0 && result.rows[0].company) {
+          companyName = result.rows[0].company;
+        } else {
+          console.warn('Could not find company name for the user in the database. Using default name.');
+        }
+      } catch (dbError) {
+        console.error('Error fetching company name from database:', dbError);
+        console.warn('Using default company name.');
+      }
     }
+    // MODIFICATION END
 
-    // Set response headers for PDF download
-    res.writeHead(200, {
-        'Content-Type': 'application/pdf',
-        'Content-Disposition': `attachment; filename="${documentType}-${startDate}-to-${endDate}.pdf"`
+
+    // Helper function to format currency for PDF
+    const formatCurrencyForPdf = (amount: number | null | undefined): string => {
+      if (amount === null || amount === undefined) return '-'; // Handle null/undefined balances
+      if (amount === 0) return '-';
+      return parseFloat(amount.toString()).toLocaleString('en-ZA', { style: 'currency', currency: 'ZAR', minimumFractionDigits: 2 });
+    };
+
+    // Common function to draw the header for all documents
+    const drawDocumentHeader = (doc: any, companyName: string, documentTitle: string, dateString:
+string, disclaimerText: string | null = null) => {
+      doc.fontSize(16).font('Helvetica-Bold').text(companyName, { align: 'center' });
+      doc.fontSize(14).font('Helvetica').text('MANAGEMENT ACCOUNTS', { align: 'center' });
+      doc.moveDown(0.5);
+      doc.fontSize(14).text(documentTitle, { align: 'center' });
+      doc.fontSize(10).text(dateString, { align: 'center' });
+      doc.moveDown();
+
+      if (disclaimerText) {
+        doc.fontSize(8).fillColor('red').text(
+          disclaimerText,
+          { align: 'center', width: doc.page.width - 100, continued: false }
+        );
+        doc.fillColor('black'); // Reset text color
+        doc.moveDown(0.5);
+      }
+    };
+
+    // Define common column positions for consistency
+    const col1X = 50;
+    const col2X = 400; // Aligned for values
+    const columnWidth = 100; // For right-aligned columns
+
+    switch (documentType) {
+      case 'income-statement': {
+        const incomeStatementStartDate = startDate as string;
+        const incomeStatementEndDate = endDate as string;
+
+        // Fetch revenue transactions for the period
+        const incomeQueryResult = await pool.query(
+          `
+          SELECT
+              t.category,
+              SUM(t.amount) AS total_amount
+          FROM
+              transactions t
+          WHERE
+              t.type = 'income'
+              AND t.date >= $1 AND t.date <= $2 /* Inclusive end date */
+          GROUP BY
+              t.category;
+          `,
+          [incomeStatementStartDate, incomeStatementEndDate]
+        );
+        const incomeCategories = incomeQueryResult.rows;
+
+        let totalSales = 0;
+        let interestIncome = 0;
+        let otherIncome = 0;
+        const detailedIncome: { [key: string]: number } = {}; // To store income by category for display
+
+        incomeCategories.forEach(inc => {
+            const amount = parseFloat(inc.total_amount);
+            if (inc.category === 'Sales Revenue' || inc.category === 'Trading Income') {
+                totalSales += amount;
+            } else if (inc.category === 'Interest Income') {
+                interestIncome += amount;
+            } else {
+                // Aggregate other specific income categories
+                if (detailedIncome[inc.category]) {
+                    detailedIncome[inc.category] += amount;
+                } else {
+                    detailedIncome[inc.category] = amount;
+                }
+                otherIncome += amount; // Sum all other income for gross income calculation
+            }
+        });
+
+        // Fetch Cost of Goods Sold
+        const cogsQueryResult = await pool.query(
+            `
+            SELECT
+                SUM(t.amount) AS total_cogs
+            FROM
+                transactions t
+            WHERE
+                t.type = 'expense' AND t.category = 'Cost of Goods Sold'
+                AND t.date >= $1 AND t.date <= $2;
+            `,
+            [incomeStatementStartDate, incomeStatementEndDate]
+        );
+        const costOfGoodsSold = parseFloat(cogsQueryResult.rows[0]?.total_cogs || 0);
+
+        // Fetch operating expenses (excluding COGS)
+        const expensesQueryResult = await pool.query(
+          `
+          SELECT
+              t.category,
+              SUM(t.amount) AS total_amount
+          FROM
+              transactions t
+          WHERE
+              t.type = 'expense' AND t.category != 'Cost of Goods Sold' /* Exclude COGS here */
+              AND t.date >= $1 AND t.date <= $2 /* Inclusive end date */
+          GROUP BY
+              t.category;
+          `,
+          [incomeStatementStartDate, incomeStatementEndDate]
+        );
+        const expenses = expensesQueryResult.rows;
+
+        const grossProfit = totalSales - costOfGoodsSold;
+        const totalExpensesSum = expenses.reduce((sum, exp) => sum + parseFloat(exp.total_amount), 0);
+        const netProfitLoss = (grossProfit + interestIncome + otherIncome) - totalExpensesSum;
+
+        drawDocumentHeader(
+          doc,
+          companyName,
+          'INCOME STATEMENT',
+          `FOR THE PERIOD ENDED ${new Date(incomeStatementEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+        );
+
+        // Table Headers
+        doc.font('Helvetica-Bold');
+        doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill(); // Background for header
+        doc.fillColor('#4a5568').text('Description', col1X + 5, doc.y + 5);
+        doc.text('Amount (R)', col2X, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5);
+        doc.fillColor('black'); // Reset text color
+        doc.font('Helvetica');
+
+
+        // Sales
+        doc.text('Sales', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(totalSales), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5);
+        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+
+        // Less: Cost of Sales
+        doc.text('Less: Cost of Sales', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(costOfGoodsSold), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5);
+        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+
+        // Gross Profit/ (Loss)
+        doc.font('Helvetica-Bold');
+        doc.text('Gross Profit / (Loss)', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(grossProfit), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown();
+        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+        doc.font('Helvetica');
+
+        // Add: Other Income
+        if (Object.keys(detailedIncome).length > 0 || interestIncome > 0) {
+          doc.text('Add: Other Income', col1X, doc.y);
+          doc.moveDown(0.5);
+          if (interestIncome > 0) {
+            doc.text(`  Interest Income`, col1X + 20, doc.y);
+            doc.text(formatCurrencyForPdf(interestIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
+            doc.moveDown(0.5);
+          }
+          for (const category in detailedIncome) {
+            // Only list if it's not Sales Revenue or Interest Income (already handled)
+            if (category !== 'Sales Revenue' && category !== 'Interest Income') {
+              doc.text(`  ${category}`, col1X + 20, doc.y);
+              doc.text(formatCurrencyForPdf(detailedIncome[category]), col2X, doc.y, { width: columnWidth, align: 'right' });
+              doc.moveDown(0.5);
+            }
+          }
+          doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+          doc.moveDown(0.5);
+        }
+
+        // Gross Income
+        doc.font('Helvetica-Bold');
+        doc.text('Gross Income', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(grossProfit + interestIncome + otherIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown();
+        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+        doc.font('Helvetica');
+
+        // Less: Expenses
+        doc.text('Less: Expenses', col1X, doc.y);
+        doc.moveDown(0.5);
+        expenses.forEach(exp => {
+          doc.text(`  ${exp.category}`, col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(parseFloat(exp.total_amount)), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5);
+          doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+          doc.moveDown(0.5);
+        });
+
+        // Total Expenses
+        doc.font('Helvetica-Bold');
+        doc.text('Total Expenses', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(totalExpensesSum), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown();
+        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+        doc.font('Helvetica');
+
+        // NET PROFIT /(LOSS) for the period
+        doc.font('Helvetica-Bold');
+        // Dynamically set text based on profit or loss
+        const netProfitLossText = netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period';
+        doc.text(netProfitLossText, col1X, doc.y);
+        // Ensure Net Profit/Loss is always positive for display
+        doc.text(formatCurrencyForPdf(Math.abs(netProfitLoss)), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown();
+        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown();
+
+        doc.fontSize(8).fillColor('#4a5568').text(`Statement Period: ${new Date(incomeStatementStartDate).toLocaleDateString('en-GB')} to ${new Date(incomeStatementEndDate).toLocaleDateString('en-GB')}`, { align: 'center' });
+        doc.fillColor('black');
+        doc.moveDown();
+
+        break;
+      }
+
+case 'balance-sheet': {
+    const balanceSheetEndDate = endDate as string;
+
+    // Corrected SQL query to calculate account balances based on proper accounting principles.
+    // This query now correctly applies debits and credits based on the account type.
+    const balanceSheetAccountsResult = await pool.query(
+      `
+      SELECT
+          acc.id,
+          acc.name,
+          acc.type,
+          /* Correctly apply debit and credit logic based on account type and transaction type.
+             Assets have normal debit balances (increase with debits, decrease with credits).
+             Liabilities and Equity have normal credit balances (increase with credits, decrease with debits).
+             A transaction of type 'income' is a credit to an income account (part of Equity) and a debit to an asset account.
+             A transaction of type 'expense' is a debit to an expense account (part of Equity) and a credit to an asset account.
+             Assuming a single-entry transaction model where the amount is always positive:
+          */
+          COALESCE(SUM(CASE
+              -- For Asset accounts, an 'income' transaction adds to the balance (a debit), while an 'expense' subtracts (a credit).
+              WHEN acc.type = 'Asset' AND t.type = 'income' THEN t.amount
+              WHEN acc.type = 'Asset' AND t.type = 'expense' THEN -t.amount
+              -- For Liability and Equity accounts, an 'income' transaction adds to the balance (a credit), while an 'expense' subtracts (a debit).
+              WHEN acc.type IN ('Liability', 'Equity') AND t.type = 'income' THEN t.amount
+              WHEN acc.type IN ('Liability', 'Equity') AND t.type = 'expense' THEN -t.amount
+              ELSE 0
+          END), 0) AS balance
+      FROM
+          accounts acc
+      LEFT JOIN
+          transactions t ON acc.id = t.account_id AND t.date <= $1
+      WHERE acc.type IN ('Asset', 'Liability', 'Equity')
+      GROUP BY
+          acc.id, acc.name, acc.type
+      ORDER BY acc.type, acc.name;
+      `,
+      [balanceSheetEndDate]
+    );
+
+    const allAccounts = balanceSheetAccountsResult.rows;
+    const assetsAccounts = allAccounts.filter(a => a.type === 'Asset');
+    const liabilityAccounts = allAccounts.filter(a => a.type === 'Liability');
+    const equityAccounts = allAccounts.filter(a => a.type === 'Equity');
+
+    // Fetch Fixed Assets with their accumulated depreciation
+    const fixedAssetsResult = await pool.query(`
+        SELECT
+            id, name, cost, accumulated_depreciation
+        FROM assets
+        WHERE date_received <= $1
+        ORDER BY name;
+    `, [balanceSheetEndDate]);
+
+    let totalFixedAssetsAtCost = 0;
+    let totalAccumulatedDepreciation = 0;
+    const fixedAssetsToDisplay: { name: string; cost: number; accumulated_depreciation: number; net_book_value: number }[] = [];
+
+    fixedAssetsResult.rows.forEach(asset => {
+        const cost = parseFloat(asset.cost);
+        const accumulated_depreciation = parseFloat(asset.accumulated_depreciation);
+        const net_book_value = cost - accumulated_depreciation;
+
+        totalFixedAssetsAtCost += cost;
+        totalAccumulatedDepreciation += accumulated_depreciation;
+
+        fixedAssetsToDisplay.push({
+            name: asset.name,
+            cost: cost,
+            accumulated_depreciation: accumulated_depreciation,
+            net_book_value: net_book_value
+        });
     });
 
-    const doc = new PDFDocument();
-    doc.pipe(res); // Pipe the PDF directly to the response stream
-
-    try {
-        let companyName = "QUANTILYTIX"; // You might want to fetch this from a user's company profile
-
-        // Helper function to format currency for PDF
-        const formatCurrencyForPdf = (amount: number | null | undefined): string => {
-            if (amount === null || amount === undefined) return '-'; // Handle null/undefined balances
-            if (amount === 0) return '-';
-            return parseFloat(amount.toString()).toLocaleString('en-ZA', { style: 'currency', currency: 'ZAR', minimumFractionDigits: 2 });
-        };
-
-        // Common function to draw the header for all documents
-        const drawDocumentHeader = (doc: any, companyName: string, documentTitle: string, dateString: string, disclaimerText: string | null = null) => {
-            doc.fontSize(16).font('Helvetica-Bold').text(companyName, { align: 'center' });
-            doc.fontSize(14).font('Helvetica').text('MANAGEMENT ACCOUNTS', { align: 'center' });
-            doc.moveDown(0.5);
-            doc.fontSize(14).text(documentTitle, { align: 'center' });
-            doc.fontSize(10).text(dateString, { align: 'center' });
-            doc.moveDown();
-
-            if (disclaimerText) {
-                doc.fontSize(8).fillColor('red').text(
-                    disclaimerText,
-                    { align: 'center', width: doc.page.width - 100, continued: false }
-                );
-                doc.fillColor('black'); // Reset text color
-                doc.moveDown(0.5);
-            }
-        };
-
-        // Define common column positions for consistency
-        const col1X = 50;
-        const col2X = 400; // Aligned for values
-        const columnWidth = 100; // For right-aligned columns
-
-        switch (documentType) {
-            case 'income-statement': {
-                const incomeStatementStartDate = startDate as string;
-                const incomeStatementEndDate = endDate as string;
-
-                // Fetch revenue transactions for the period
-                const incomeQueryResult = await pool.query(
-                    `
-                    SELECT
-                        t.category,
-                        SUM(t.amount) AS total_amount
-                    FROM
-                        transactions t
-                    WHERE
-                        t.type = 'income'
-                        AND t.date >= $1 AND t.date <= $2 /* Inclusive end date */
-                        AND t.user_id = $3
-                    GROUP BY
-                        t.category;
-                    `,
-                    [incomeStatementStartDate, incomeStatementEndDate, user_id]
-                );
-                const incomeCategories = incomeQueryResult.rows;
-
-                let totalSales = 0;
-                let interestIncome = 0;
-                let otherIncome = 0;
-                const detailedIncome: { [key: string]: number } = {}; // To store income by category for display
-
-                incomeCategories.forEach(inc => {
-                    const amount = parseFloat(inc.total_amount);
-                    if (inc.category === 'Sales Revenue' || inc.category === 'Trading Income') {
-                        totalSales += amount;
-                    } else if (inc.category === 'Interest Income') {
-                        interestIncome += amount;
-                    } else {
-                        // Aggregate other specific income categories
-                        if (detailedIncome[inc.category]) {
-                            detailedIncome[inc.category] += amount;
-                        } else {
-                            detailedIncome[inc.category] = amount;
-                        }
-                        otherIncome += amount; // Sum all other income for gross income calculation
-                    }
-                });
-
-                // Fetch Cost of Goods Sold
-                const cogsQueryResult = await pool.query(
-                    `
-                    SELECT
-                        SUM(t.amount) AS total_cogs
-                    FROM
-                        transactions t
-                    WHERE
-                        t.type = 'expense' AND t.category = 'Cost of Goods Sold'
-                        AND t.date >= $1 AND t.date <= $2
-                        AND t.user_id = $3;
-                    `,
-                    [incomeStatementStartDate, incomeStatementEndDate, user_id]
-                );
-                const costOfGoodsSold = parseFloat(cogsQueryResult.rows[0]?.total_cogs || 0);
-
-                // Fetch operating expenses (excluding COGS)
-                const expensesQueryResult = await pool.query(
-                    `
-                    SELECT
-                        t.category,
-                        SUM(t.amount) AS total_amount
-                    FROM
-                        transactions t
-                    WHERE
-                        t.type = 'expense' AND t.category != 'Cost of Goods Sold' /* Exclude COGS here */
-                        AND t.date >= $1 AND t.date <= $2 /* Inclusive end date */
-                        AND t.user_id = $3
-                    GROUP BY
-                        t.category;
-                    `,
-                    [incomeStatementStartDate, incomeStatementEndDate, user_id]
-                );
-                const expenses = expensesQueryResult.rows;
-
-                const grossProfit = totalSales - costOfGoodsSold;
-                const totalExpensesSum = expenses.reduce((sum, exp) => sum + parseFloat(exp.total_amount), 0);
-                const netProfitLoss = (grossProfit + interestIncome + otherIncome) - totalExpensesSum;
-
-                drawDocumentHeader(
-                    doc,
-                    companyName,
-                    'INCOME STATEMENT',
-                    `FOR THE PERIOD ENDED ${new Date(incomeStatementEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
-                );
-
-                // Table Headers
-                doc.font('Helvetica-Bold');
-                doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill(); // Background for header
-                doc.fillColor('#4a5568').text('Description', col1X + 5, doc.y + 5);
-                doc.text('Amount (R)', col2X, doc.y + 5, { width: columnWidth, align: 'right' });
-                doc.moveDown(0.5);
-                doc.fillColor('black'); // Reset text color
-                doc.font('Helvetica');
-
-
-                // Sales
-                doc.text('Sales', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(totalSales), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown(0.5);
-                doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-
-                // Less: Cost of Sales
-                doc.text('Less: Cost of Sales', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(costOfGoodsSold), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown(0.5);
-                doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-
-                // Gross Profit/ (Loss)
-                doc.font('Helvetica-Bold');
-                doc.text('Gross Profit / (Loss)', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(grossProfit), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.font('Helvetica');
-
-                // Add: Other Income
-                if (Object.keys(detailedIncome).length > 0 || interestIncome > 0) {
-                    doc.text('Add: Other Income', col1X, doc.y);
-                    doc.moveDown(0.5);
-                    if (interestIncome > 0) {
-                        doc.text(`   Interest Income`, col1X + 20, doc.y);
-                        doc.text(formatCurrencyForPdf(interestIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
-                        doc.moveDown(0.5);
-                    }
-                    for (const category in detailedIncome) {
-                        // Only list if it's not Sales Revenue or Interest Income (already handled)
-                        if (category !== 'Sales Revenue' && category !== 'Interest Income') {
-                            doc.text(`   ${category}`, col1X + 20, doc.y);
-                            doc.text(formatCurrencyForPdf(detailedIncome[category]), col2X, doc.y, { width: columnWidth, align: 'right' });
-                            doc.moveDown(0.5);
-                        }
-                    }
-                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                    doc.moveDown(0.5);
-                }
-
-                // Gross Income
-                doc.font('Helvetica-Bold');
-                doc.text('Gross Income', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(grossProfit + interestIncome + otherIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.font('Helvetica');
-
-                // Less: Expenses
-                doc.text('Less: Expenses', col1X, doc.y);
-                doc.moveDown(0.5);
-                expenses.forEach(exp => {
-                    doc.text(`   ${exp.category}`, col1X + 20, doc.y);
-                    doc.text(formatCurrencyForPdf(parseFloat(exp.total_amount)), col2X, doc.y, { width: columnWidth, align: 'right' });
-                    doc.moveDown(0.5);
-                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                    doc.moveDown(0.5);
-                });
-
-                // Total Expenses
-                doc.font('Helvetica-Bold');
-                doc.text('Total Expenses', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(totalExpensesSum), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.font('Helvetica');
-
-                // NET PROFIT /(LOSS) for the period
-                doc.font('Helvetica-Bold');
-                // Dynamically set text based on profit or loss
-                const netProfitLossText = netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period';
-                doc.text(netProfitLossText, col1X, doc.y);
-                // Ensure Net Profit/Loss is always positive for display
-                doc.text(formatCurrencyForPdf(Math.abs(netProfitLoss)), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown();
-
-                doc.fontSize(8).fillColor('#4a5568').text(`Statement Period: ${new Date(incomeStatementStartDate).toLocaleDateString('en-GB')} to ${new Date(incomeStatementEndDate).toLocaleDateString('en-GB')}`, { align: 'center' });
-                doc.fillColor('black');
-                doc.moveDown();
-
-                break;
-            }
-
-            case 'balance-sheet': {
-                const balanceSheetEndDate = endDate as string;
-
-                // Fetch all accounts and calculate their proper balances for balance sheet
-                const accountsQueryResult = await pool.query(`
-                    SELECT
-                        a.id,
-                        a.name AS account_name,
-                        a.type AS account_type,
-                        a.initial_balance,
-                        COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END), 0) AS transaction_impact
-                    FROM
-                        accounts a
-                    LEFT JOIN
-                        transactions t ON a.id = t.account_id AND t.date <= $1 AND t.user_id = $2
-                    WHERE a.user_id = $2
-                    GROUP BY
-                        a.id, a.name, a.type, a.initial_balance
-                    ORDER BY
-                        a.type, a.name;
-                `, [balanceSheetEndDate, user_id]);
-
-                const accounts = accountsQueryResult.rows.map(row => ({
-                    ...row,
-                    current_balance: parseFloat(row.initial_balance) + parseFloat(row.transaction_impact || 0)
-                }));
-
-                let totalAssets = 0;
-                let totalLiabilities = 0;
-                let totalEquity = 0;
-
-                const assets: any[] = [];
-                const liabilities: any[] = [];
-                const equity: any[] = [];
-
-                accounts.forEach(acc => {
-                    if (['Asset', 'Current Asset', 'Fixed Asset'].includes(acc.account_type)) {
-                        assets.push(acc);
-                        totalAssets += acc.current_balance;
-                    } else if (['Liability', 'Current Liability', 'Long-Term Liability'].includes(acc.account_type)) {
-                        liabilities.push(acc);
-                        totalLiabilities += acc.current_balance;
-                    } else if (['Equity', 'Capital', 'Retained Earnings'].includes(acc.account_type)) {
-                        equity.push(acc);
-                        totalEquity += acc.current_balance;
-                    }
-                });
-
-                // Calculate Retained Earnings: Beginning Retained Earnings + Net Income - Dividends
-                // For simplicity, we'll use the Net Profit/Loss from the Income Statement for the period
-                // (This assumes the income statement period aligns with the balance sheet period for retained earnings calculation,
-                // which might not always be the case in real-world accounting, but works for a simplified example).
-                const incomeStatementStartDateForRetainedEarnings = new Date(balanceSheetEndDate);
-                incomeStatementStartDateForRetainedEarnings.setFullYear(incomeStatementStartDateForRetainedEarnings.getFullYear() - 1); // Start of previous year
-                incomeStatementStartDateForRetainedEarnings.setMonth(0, 1); // Jan 1st of previous year
-
-                const incomeResultForRetainedEarnings = await pool.query(
-                    `
-                    SELECT
-                        COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE -amount END), 0) AS net_income
-                    FROM
-                        transactions
-                    WHERE
-                        date >= $1 AND date <= $2 AND user_id = $3;
-                    `,
-                    [incomeStatementStartDateForRetainedEarnings.toISOString(), balanceSheetEndDate, user_id]
-                );
-                const netIncomeForRetainedEarnings = parseFloat(incomeResultForRetainedEarnings.rows[0]?.net_income || 0);
-
-                // Assuming no dividends for simplicity, or fetch them if a 'dividends' transaction type exists
-                // For now, Retained Earnings will be (Previous Retained Earnings + Current Net Income)
-                // If you have a specific "Retained Earnings" account, its balance would be fetched directly.
-                // Here, we'll calculate a simplified "Retained Earnings" for display.
-                const calculatedRetainedEarnings = netIncomeForRetainedEarnings; // Simplified
-
-                totalEquity += calculatedRetainedEarnings; // Add calculated retained earnings to total equity
-
-                drawDocumentHeader(
-                    doc,
-                    companyName,
-                    'BALANCE SHEET',
-                    `AS AT ${new Date(balanceSheetEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`,
-                    'Disclaimer: This is a simplified Balance Sheet for illustrative purposes and may not conform to all accounting standards.'
-                );
-
-                doc.font('Helvetica-Bold');
-                doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
-                doc.fillColor('#4a5568').text('Description', col1X + 5, doc.y + 5);
-                doc.text('Amount (R)', col2X, doc.y + 5, { width: columnWidth, align: 'right' });
-                doc.moveDown(0.5);
-                doc.fillColor('black');
-                doc.font('Helvetica');
-
-                // ASSETS
-                doc.font('Helvetica-Bold').text('ASSETS', col1X, doc.y);
-                doc.moveDown(0.5);
-                doc.font('Helvetica');
-                assets.forEach(asset => {
-                    doc.text(`   ${asset.account_name}`, col1X + 20, doc.y);
-                    doc.text(formatCurrencyForPdf(asset.current_balance), col2X, doc.y, { width: columnWidth, align: 'right' });
-                    doc.moveDown(0.5);
-                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                    doc.moveDown(0.5);
-                });
-                doc.font('Helvetica-Bold');
-                doc.text('TOTAL ASSETS', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(totalAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown();
-
-                // LIABILITIES
-                doc.font('Helvetica-Bold').text('LIABILITIES', col1X, doc.y);
-                doc.moveDown(0.5);
-                doc.font('Helvetica');
-                liabilities.forEach(liability => {
-                    doc.text(`   ${liability.account_name}`, col1X + 20, doc.y);
-                    doc.text(formatCurrencyForPdf(liability.current_balance), col2X, doc.y, { width: columnWidth, align: 'right' });
-                    doc.moveDown(0.5);
-                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                    doc.moveDown(0.5);
-                });
-                doc.font('Helvetica-Bold');
-                doc.text('TOTAL LIABILITIES', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(totalLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown();
-
-                // EQUITY
-                doc.font('Helvetica-Bold').text('EQUITY', col1X, doc.y);
-                doc.moveDown(0.5);
-                doc.font('Helvetica');
-                equity.forEach(eq => {
-                    doc.text(`   ${eq.account_name}`, col1X + 20, doc.y);
-                    doc.text(formatCurrencyForPdf(eq.current_balance), col2X, doc.y, { width: columnWidth, align: 'right' });
-                    doc.moveDown(0.5);
-                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                    doc.moveDown(0.5);
-                });
-                // Add calculated Retained Earnings
-                doc.text(`   Retained Earnings`, col1X + 20, doc.y);
-                doc.text(formatCurrencyForPdf(calculatedRetainedEarnings), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown(0.5);
-                doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-
-                doc.font('Helvetica-Bold');
-                doc.text('TOTAL EQUITY', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(totalEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown();
-
-                // Verification
-                doc.font('Helvetica-Bold');
-                const liabilitiesAndEquity = totalLiabilities + totalEquity;
-                doc.text('LIABILITIES AND EQUITY', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(liabilitiesAndEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown();
-
-                doc.fontSize(8).fillColor('#4a5568').text(`Statement Date: ${new Date(balanceSheetEndDate).toLocaleDateString('en-GB')}`, { align: 'center' });
-                doc.fillColor('black');
-                doc.moveDown();
-
-                break;
-            }
-
-            case 'trial-balance': {
-                const trialBalanceEndDate = endDate as string;
-
-                // Fetch all accounts and calculate their balances up to the end date
-                const accountsWithBalances = await pool.query(`
-                    SELECT
-                        a.id,
-                        a.name AS account_name,
-                        a.type AS account_type,
-                        a.code AS account_code,
-                        a.initial_balance,
-                        COALESCE(SUM(CASE
-                            WHEN t.type = 'income' AND a.type IN ('Asset', 'Expense') THEN t.amount
-                            WHEN t.type = 'expense' AND a.type IN ('Liability', 'Equity', 'Income') THEN t.amount
-                            WHEN t.type = 'income' AND a.type IN ('Liability', 'Equity', 'Income') THEN -t.amount
-                            WHEN t.type = 'expense' AND a.type IN ('Asset', 'Expense') THEN -t.amount
-                            ELSE 0
-                        END), 0) AS transaction_impact
-                    FROM
-                        accounts a
-                    LEFT JOIN
-                        transactions t ON a.id = t.account_id AND t.date <= $1 AND t.user_id = $2
-                    WHERE a.user_id = $2
-                    GROUP BY
-                        a.id, a.name, a.type, a.code, a.initial_balance
-                    ORDER BY
-                        a.code;
-                `, [trialBalanceEndDate, user_id]);
-
-                const trialBalanceAccounts = accountsWithBalances.rows.map(row => {
-                    const initialBalance = parseFloat(row.initial_balance || 0);
-                    const transactionImpact = parseFloat(row.transaction_impact || 0);
-                    let currentBalance = initialBalance + transactionImpact;
-
-                    let debit = 0;
-                    let credit = 0;
-
-                    // Determine if the balance is a debit or credit based on account type
-                    // Normal balances:
-                    // Debit: Assets, Expenses
-                    // Credit: Liabilities, Equity, Income
-                    if (['Asset', 'Expense'].includes(row.account_type)) {
-                        if (currentBalance >= 0) {
-                            debit = currentBalance;
-                        } else {
-                            credit = Math.abs(currentBalance); // Negative asset/expense is a credit
-                        }
-                    } else if (['Liability', 'Equity', 'Income'].includes(row.account_type)) {
-                        if (currentBalance >= 0) {
-                            credit = currentBalance;
-                        } else {
-                            debit = Math.abs(currentBalance); // Negative liability/equity/income is a debit
-                        }
-                    }
-
-                    return {
-                        account_code: row.account_code,
-                        account_name: row.account_name,
-                        debit: debit,
-                        credit: credit,
-                    };
-                });
-
-                let totalDebits = 0;
-                let totalCredits = 0;
-
-                trialBalanceAccounts.forEach(account => {
-                    totalDebits += account.debit;
-                    totalCredits += account.credit;
-                });
-
-                drawDocumentHeader(
-                    doc,
-                    companyName,
-                    'TRIAL BALANCE',
-                    `AS AT ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`,
-                    'Disclaimer: This Trial Balance is for internal use and may not be suitable for external reporting without further adjustments.'
-                );
-
-                // Table Headers
-                doc.font('Helvetica-Bold');
-                doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill(); // Background for header
-                doc.fillColor('#4a5568').text('Account Code', col1X + 5, doc.y + 5);
-                doc.text('Account Name', col1X + 100, doc.y + 5);
-                doc.text('Debit (R)', col2X - 50, doc.y + 5, { width: columnWidth, align: 'right' });
-                doc.text('Credit (R)', col2X + 50, doc.y + 5, { width: columnWidth, align: 'right' });
-                doc.moveDown(0.5);
-                doc.fillColor('black'); // Reset text color
-                doc.font('Helvetica');
-
-                // Table Body
-                trialBalanceAccounts.forEach(account => {
-                    doc.text(account.account_code, col1X + 5, doc.y);
-                    doc.text(account.account_name, col1X + 100, doc.y);
-                    doc.text(formatCurrencyForPdf(account.debit), col2X - 50, doc.y, { width: columnWidth, align: 'right' });
-                    doc.text(formatCurrencyForPdf(account.credit), col2X + 50, doc.y, { width: columnWidth, align: 'right' });
-                    doc.moveDown(0.5);
-                    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth + 50, doc.y).stroke();
-                    doc.moveDown(0.5);
-                });
-
-                // Totals
-                doc.font('Helvetica-Bold');
-                doc.text('TOTALS', col1X + 100, doc.y);
-                doc.text(formatCurrencyForPdf(totalDebits), col2X - 50, doc.y, { width: columnWidth, align: 'right' });
-                doc.text(formatCurrencyForPdf(totalCredits), col2X + 50, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth + 50, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth + 50, doc.y).stroke();
-                doc.moveDown();
-
-                doc.fontSize(8).fillColor('#4a5568').text(`Statement Date: ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB')}`, { align: 'center' });
-                doc.fillColor('black');
-                doc.moveDown();
-
-                break;
-            }
-
-            case 'cash-flow-statement': {
-                type TransactionRow = {
-                    type: string;
-                    category: string;
-                    amount: number;
-                };
-
-                const classify = (row: { category: string }): 'operating' | 'investing' | 'financing' => {
-                    const cat = (row.category || '').toLowerCase();
-                    if (['equipment', 'property', 'asset', 'vehicle'].some(k => cat.includes(k))) return 'investing';
-                    if (['loan', 'members loan', 'shareholders loan', 'credit facility'].some(k => cat.includes(k))) return 'financing';
-                    return 'operating';
-                };
-
-                const cashFlows: { operating: TransactionRow[]; investing: TransactionRow[]; financing: TransactionRow[] } = {
-                    operating: [],
-                    investing: [],
-                    financing: [],
-                };
-
-                const rowsResult = await pool.query(
-                    `SELECT type, category, amount FROM transactions WHERE date >= $1 AND date <= $2 AND user_id = $3 AND (type = 'income' OR type = 'expense');`,
-                    [startDate, endDate, user_id] // Added user_id filter here
-                );
-                const rows: TransactionRow[] = rowsResult.rows;
-
-                rows.forEach((row) => {
-                    const section = classify(row);
-                    const amount = row.type === 'income' ? parseFloat(row.amount as any) : -parseFloat(row.amount as any);
-                    cashFlows[section].push({ ...row, amount });
-                });
-
-                const renderSection = (title: string, items: TransactionRow[]) => {
-                    doc.font('Helvetica-Bold').fontSize(12).text(title, col1X, doc.y);
-                    doc.moveDown(0.5);
-                    doc.font('Helvetica');
-
-                    let total = 0;
-                    items.forEach(item => {
-                        doc.text(`   ${item.category || 'Uncategorized'}`, col1X + 20, doc.y);
-                        doc.text(formatCurrencyForPdf(item.amount), col2X, doc.y, { width: columnWidth, align: 'right' });
-                        total += item.amount;
-                        doc.moveDown(0.5);
-                        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                        doc.moveDown(0.5);
-                    });
-
-                    doc.font('Helvetica-Bold');
-                    doc.text(`Net ${title}`, col1X, doc.y);
-                    doc.text(formatCurrencyForPdf(total), col2X, doc.y, { width: columnWidth, align: 'right' });
-                    doc.moveDown(1);
-                    doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                    doc.moveDown(0.5);
-                    doc.font('Helvetica');
-
-                    return total;
-                };
-
-                drawDocumentHeader(
-                    doc,
-                    companyName,
-                    'CASH FLOW STATEMENT',
-                    `FOR THE PERIOD ENDED ${new Date(endDate.toString()).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
-                );
-
-                const totalOperating = renderSection('Operating Activities', cashFlows.operating);
-                const totalInvesting = renderSection('Investing Activities', cashFlows.investing);
-                const totalFinancing = renderSection(
-                    'Financing Activities',
-                    cashFlows.financing
-                );
-
-                const netIncreaseInCash = totalOperating + totalInvesting + totalFinancing;
-
-                doc.font('Helvetica-Bold').fontSize(12).text('Net Increase / (Decrease) in Cash', col1X, doc.y);
-                doc.text(formatCurrencyForPdf(netIncreaseInCash), col2X, doc.y, { width: columnWidth, align: 'right' });
-                doc.moveDown();
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown(0.5);
-                doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                doc.moveDown();
-
-                doc.fontSize(8).fillColor('#4a5568').text(`Statement Period: ${new Date(startDate as string).toLocaleDateString('en-GB')} to ${new Date(endDate as string).toLocaleDateString('en-GB')}`, { align: 'center' });
-                doc.fillColor('black');
-                doc.moveDown();
-
-                break;
-            }
-
-            default:
-                doc.text('Document type not supported.', { align: 'center' });
-                doc.end();
-                return;
-        }
-
-        doc.end();
-
-    } catch (error: unknown) {
-        console.error(`Error generating ${documentType}:`, error);
-        res.removeHeader('Content-Disposition');
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-
-        if (error instanceof Error) {
-            res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: error.message }));
-        } else {
-            res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: String(error) }));
-        }
+    // Calculate retained earnings (accumulated profit/loss from all periods up to end date)
+    // This query is logically correct and remains unchanged.
+    const currentPeriodProfitLossResult = await pool.query(
+      `
+      SELECT
+          COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END), 0) AS retained_earnings
+      FROM
+          transactions t
+      WHERE
+          t.date <= $1;
+      `,
+      [balanceSheetEndDate] // Calculate all profit/loss up to balance sheet date
+    );
+    const retainedEarnings = parseFloat(currentPeriodProfitLossResult.rows[0].retained_earnings || 0);
+
+    drawDocumentHeader(
+      doc,
+      companyName,
+      'BALANCE SHEET',
+      `AS OF ${new Date(balanceSheetEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+    );
+
+    // ASSETS SECTION
+    doc.font('Helvetica-Bold').fontSize(12).text('ASSETS', col1X, doc.y);
+    doc.moveDown(0.5);
+    doc.font('Helvetica');
+
+    // Non-current Assets (Fixed Assets)
+    doc.font('Helvetica-Bold').text('Non-current Assets', col1X, doc.y);
+    doc.moveDown(0.5);
+
+    if (fixedAssetsToDisplay.length > 0) {
+        doc.text('  Fixed Assets at Cost:', col1X + 20, doc.y);
+        doc.text(formatCurrencyForPdf(totalFixedAssetsAtCost), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5);
+
+        doc.text('  Less: Accumulated Depreciation', col1X + 20, doc.y);
+        doc.text(formatCurrencyForPdf(totalAccumulatedDepreciation), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5);
+        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+
+        doc.font('Helvetica-Bold');
+        doc.text('Net Book Value of Fixed Assets', col1X + 20, doc.y);
+        doc.text(formatCurrencyForPdf(totalFixedAssetsAtCost - totalAccumulatedDepreciation), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown();
+        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+        doc.font('Helvetica');
+    } else {
+        doc.text('  No Fixed Assets to display.', col1X + 20, doc.y);
+        doc.moveDown(1);
     }
+
+    doc.font('Helvetica-Bold');
+    doc.text('Total Non-current Assets', col1X, doc.y);
+    doc.text(formatCurrencyForPdf(totalFixedAssetsAtCost - totalAccumulatedDepreciation), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown();
+    doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+    doc.font('Helvetica');
+
+    // Current Assets
+    doc.font('Helvetica-Bold').text('Current Assets', col1X, doc.y);
+    doc.moveDown(0.5);
+    let totalCurrentAssets = 0;
+    assetsAccounts.filter(a => a.name.toLowerCase().includes('bank') || a.name.toLowerCase().includes('cash') || a.name.toLowerCase().includes('receivable')).forEach(asset => {
+      doc.text(`  ${asset.name}`, col1X + 20, doc.y);
+      doc.text(formatCurrencyForPdf(asset.balance), col2X, doc.y, { width: columnWidth, align: 'right' });
+      totalCurrentAssets += parseFloat(asset.balance);
+      doc.moveDown(0.5);
+      doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+      doc.moveDown(0.5);
+    });
+
+    doc.font('Helvetica-Bold');
+    doc.text('Total Current Assets', col1X, doc.y);
+    doc.text(formatCurrencyForPdf(totalCurrentAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown();
+    doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+
+    doc.font('Helvetica-Bold').fontSize(12);
+    const totalAssets = (totalFixedAssetsAtCost - totalAccumulatedDepreciation) + totalCurrentAssets;
+    doc.text('Total Assets', col1X, doc.y);
+    doc.text(formatCurrencyForPdf(totalAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown(2);
+    doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+    doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown();
+
+
+    // EQUITY AND LIABILITIES SECTION
+    doc.font('Helvetica-Bold').fontSize(12).text('EQUITY AND LIABILITIES', col1X, doc.y);
+    doc.moveDown(0.5);
+    doc.font('Helvetica');
+
+    // Capital and Reserves
+    doc.font('Helvetica-Bold').text('Capital and Reserves', col1X, doc.y);
+    doc.moveDown(0.5);
+    let totalEquityAccountsBalance = 0;
+    equityAccounts.forEach(eq => {
+      doc.text(`  ${eq.name}`, col1X + 20, doc.y);
+      doc.text(formatCurrencyForPdf(eq.balance), col2X, doc.y, { width: columnWidth, align: 'right' });
+      totalEquityAccountsBalance += parseFloat(eq.balance);
+      doc.moveDown(0.5);
+      doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+      doc.moveDown(0.5);
+    });
+
+    // Add Retained Earnings to Equity
+    doc.text(`  Retained Earnings`, col1X + 20, doc.y);
+    doc.text(formatCurrencyForPdf(retainedEarnings), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown(0.5);
+    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+
+    doc.font('Helvetica-Bold');
+    const totalEquity = totalEquityAccountsBalance + retainedEarnings;
+    doc.text('Total Equity', col1X, doc.y);
+    doc.text(formatCurrencyForPdf(totalEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown();
+    doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+    doc.font('Helvetica');
+
+    // Non - Current Liabilities
+    doc.font('Helvetica-Bold').text('Non-Current Liabilities', col1X, doc.y);
+    doc.moveDown(0.5);
+    let totalNonCurrentLiabilities = 0;
+    liabilityAccounts.filter(a => a.name.toLowerCase().includes('loan') || a.name.toLowerCase().includes('long-term')).forEach(lib => {
+      doc.text(`  ${lib.name}`, col1X + 20, doc.y);
+      doc.text(formatCurrencyForPdf(lib.balance), col2X, doc.y, { width: columnWidth, align: 'right' });
+      totalNonCurrentLiabilities += parseFloat(lib.balance);
+      doc.moveDown(0.5);
+      doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+      doc.moveDown(0.5);
+    });
+
+    doc.font('Helvetica-Bold');
+    doc.text('Total Non-Current Liabilities', col1X, doc.y);
+    doc.text(formatCurrencyForPdf(totalNonCurrentLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown();
+    doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+    doc.font('Helvetica');
+
+
+    // Current Liabilities
+    doc.font('Helvetica-Bold').text('Current Liabilities', col1X, doc.y);
+    doc.moveDown(0.5);
+    let totalCurrentLiabilities = 0;
+    liabilityAccounts.filter(a => a.name.toLowerCase().includes('payable') || a.name.toLowerCase().includes('current liability') || a.name.toLowerCase().includes('credit facility')).forEach(lib => {
+      doc.text(`  ${lib.name}`, col1X + 20, doc.y);
+      doc.text(formatCurrencyForPdf(lib.balance), col2X, doc.y, { width: columnWidth, align: 'right' });
+      totalCurrentLiabilities += parseFloat(lib.balance);
+      doc.moveDown(0.5);
+      doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+      doc.moveDown(0.5);
+    });
+
+    doc.font('Helvetica-Bold');
+    doc.text('Total Current Liabilities', col1X, doc.y);
+    doc.text(formatCurrencyForPdf(totalCurrentLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown();
+    doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+
+    doc.font('Helvetica-Bold').fontSize(12);
+    let totalEquityAndLiabilities = totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
+
+    const balanceDifference = totalAssets - totalEquityAndLiabilities;
+
+if (balanceDifference !== 0) {
+  const adjustmentLabel = balanceDifference > 0 ? 'Unreported Profit' : 'Unreported Loss';
+
+  doc.font('Helvetica-Bold');
+  doc.text(adjustmentLabel, col1X, doc.y);
+  doc.text(
+    formatCurrencyForPdf(Math.abs(balanceDifference)),
+    col2X, doc.y,
+    { width: columnWidth, align: 'right' }
+  );
+  doc.moveDown();
+  doc.lineWidth(0.5).strokeColor('#a0aec0')
+     .moveTo(col1X, doc.y)
+     .lineTo(col2X + columnWidth, doc.y)
+     .stroke();
+
+  // Add to liabilities to make balance sheet equal
+  totalEquityAndLiabilities += balanceDifference;
+}
+
+    doc.text('Total Equity and Liabilities', col1X, doc.y);
+    doc.text(formatCurrencyForPdf(totalEquityAndLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown(2);
+    doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+    doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown();
+
+    doc.fontSize(8).fillColor('#4a5568').text(`Statement Period: ${new Date(startDate as string).toLocaleDateString('en-GB')} to ${new Date(endDate as string).toLocaleDateString('en-GB')}`, { align: 'center' });
+    doc.fillColor('black');
+    doc.moveDown();
+
+    break;
+}
+
+
+
+      case 'trial-balance': {
+        const trialBalanceStartDate = startDate as string;
+        const trialBalanceEndDate = endDate as string;
+
+        // Define column positions for trial balance specifically, before use
+        const accountNameX = 50;
+        const debitX = 350;
+        const creditX = 500;
+        // columnWidth is already defined globally as 100
+
+        // Step 1: Calculate proper debit/credit balances for each account
+        // Modified query to use t.category + t.description for Income/Expense display names
+        const netBalancesResult = await pool.query(
+  `
+  SELECT
+  CASE
+    WHEN acc.type = 'Income' AND t.category IS NOT NULL THEN COALESCE(t.category, 'Uncategorized Income')
+    WHEN acc.type = 'Expense' AND t.category IS NOT NULL THEN COALESCE(t.category, 'Uncategorized Expense')
+    ELSE acc.name
+  END AS account_display_name,
+  acc.type AS account_type,
+  COALESCE(SUM(
+    CASE
+      WHEN acc.type IN ('Asset', 'Expense') THEN
+        CASE
+          WHEN t.type = 'expense' THEN t.amount
+          WHEN t.type = 'income' THEN -t.amount
+          ELSE 0
+        END
+      WHEN acc.type IN ('Liability', 'Equity', 'Income') THEN
+        CASE
+          WHEN t.type = 'income' THEN t.amount
+          WHEN t.type = 'expense' THEN -t.amount
+          ELSE 0
+        END
+      ELSE 0
+    END
+  ), 0) AS account_balance
+FROM accounts acc
+LEFT JOIN transactions t ON acc.id = t.account_id AND t.date <= $1
+GROUP BY
+  CASE
+    WHEN acc.type = 'Income' AND t.category IS NOT NULL THEN COALESCE(t.category, 'Uncategorized Income')
+    WHEN acc.type = 'Expense' AND t.category IS NOT NULL THEN COALESCE(t.category, 'Uncategorized Expense')
+    ELSE acc.name
+  END,
+  acc.type
+HAVING
+  COALESCE(SUM(
+    CASE
+      WHEN acc.type IN ('Asset', 'Expense') THEN
+        CASE WHEN t.type = 'expense' THEN t.amount WHEN t.type = 'income' THEN -t.amount ELSE 0 END
+      WHEN acc.type IN ('Liability', 'Equity', 'Income') THEN
+        CASE WHEN t.type = 'income' THEN t.amount WHEN t.type = 'expense' THEN -t.amount ELSE 0 END
+      ELSE 0
+    END
+  ), 0) != 0
+ORDER BY
+  account_type, account_display_name;
+
+  `,
+  [trialBalanceEndDate]
+);
+
+
+        let trialAccounts = netBalancesResult.rows.map(account => {
+          const accountBalance = parseFloat(String(account.account_balance || 0));
+          let debitAmount = 0;
+          let creditAmount = 0;
+
+          // Determine normal balance side and place amounts accordingly
+          if (account.account_type === 'Asset' || account.account_type === 'Expense') {
+            // Assets and Expenses have normal debit balances
+            if (accountBalance >= 0) {
+              debitAmount = accountBalance;
+            } else {
+              creditAmount = Math.abs(accountBalance); // If negative, it's a credit balance
+            }
+          } else if (account.account_type === 'Liability' || account.account_type === 'Equity' || account.account_type === 'Income') {
+            // Liabilities, Equity, and Income have normal credit balances
+            if (accountBalance >= 0) {
+              creditAmount = accountBalance;
+            } else {
+              debitAmount = Math.abs(accountBalance); // If negative, it's a debit balance
+            }
+          }
+
+          return {
+            account_display_name: account.account_display_name,
+            account_type: account.account_type, // Keep for sorting/debugging
+            debitAmount,
+            creditAmount
+          };
+        });
+
+        // Filter out accounts with zero debit and zero credit to keep the report clean
+        trialAccounts = trialAccounts.filter(account => account.debitAmount !== 0 || account.creditAmount !== 0);
+
+        // Calculate totals for rendering
+let totalDebit = trialAccounts.reduce((sum, acc) => sum + acc.debitAmount, 0);
+let totalCredit = trialAccounts.reduce((sum, acc) => sum + acc.creditAmount, 0);
+
+        let balancingFigure = Math.abs(totalDebit - totalCredit);
+const showBalancingFigure = balancingFigure !== 0;
+
+if (showBalancingFigure) {
+  trialAccounts.push({
+    account_display_name: 'Profit/Loss',
+    account_type: 'Adjustment',
+    debitAmount: totalDebit < totalCredit ? balancingFigure : 0,
+    creditAmount: totalDebit > totalCredit ? balancingFigure : 0
+  });
+
+  // Adjust totals
+  if (totalDebit < totalCredit) {
+    totalDebit += balancingFigure;
+  } else {
+    totalCredit += balancingFigure;
+  }
+}
+
+        drawDocumentHeader(
+          doc,
+          companyName,
+          'TRIAL BALANCE',
+          `AS OF ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB')}`,
+          
+        );
+
+        // Table Headers
+        doc.font('Helvetica-Bold');
+        doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill(); // Background for header
+        doc.fillColor('#4a5568').text('Account Name', accountNameX + 5, doc.y + 5);
+        doc.text('Debit (R)', debitX, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.text('Credit (R)', creditX, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5);
+        doc.fillColor('black'); // Reset text color
+        doc.font('Helvetica');
+
+
+        // === Render Accounts to PDF ===
+        trialAccounts.forEach(account => {
+          doc.text(account.account_display_name, accountNameX, doc.y);
+          doc.text(
+            formatCurrencyForPdf(account.debitAmount),
+            debitX, doc.y, { width: columnWidth, align: 'right' });
+
+          doc.text(
+            formatCurrencyForPdf(account.creditAmount),
+            creditX, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5);
+          doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
+          doc.moveDown(0.5);
+        });
+
+        // === Render Totals ===
+        doc.font('Helvetica-Bold');
+        doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill(); // Background for totals
+        doc.fillColor('#4a5568').text('Total', col1X + 5, doc.y + 5);
+        doc.text(formatCurrencyForPdf(totalDebit),
+          debitX, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.text(formatCurrencyForPdf(totalCredit),
+          creditX, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.moveDown();
+        doc.fillColor('black'); // Reset text color
+        doc.font('Helvetica');
+        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
+        doc.moveDown();
+
+        doc.fontSize(8).fillColor('#4a5568').text(`Statement Period: ${new Date(trialBalanceStartDate).toLocaleDateString('en-GB')} to ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB')}`, { align: 'center' });
+        doc.fillColor('black');
+        doc.moveDown();
+
+        break;
+      }
+
+case 'cash-flow-statement': {
+    // Defines a type for a single transaction row, including its type, category, and amount.
+    type TransactionRow = {
+      type: string;
+      category: string;
+      amount: number;
+    };
+
+    // A helper function to classify a transaction into one of the three cash flow categories.
+    const classify = (row: { category: string }): 'operating' | 'investing' | 'financing' => {
+      const cat = (row.category || '').toLowerCase();
+      // Classifies based on keywords in the category name.
+      if (['equipment', 'property', 'asset', 'vehicle'].some(k => cat.includes(k))) return 'investing';
+      if (['loan', 'members loan', 'shareholders loan', 'credit facility'].some(k => cat.includes(k))) return 'financing';
+      return 'operating';
+    };
+
+    // An object to hold the transactions, sorted by their cash flow category.
+    const cashFlows: { operating: TransactionRow[]; investing: TransactionRow[]; financing: TransactionRow[] } = {
+      operating: [],
+      investing: [],
+      financing: [],
+    };
+
+    // Fetches all relevant income and expense transactions within the specified date range.
+    const rowsResult = await pool.query(
+      `SELECT type, category, amount FROM transactions WHERE date >= $1 AND date <= $2 AND (type = 'income' OR type = 'expense');`,
+      [startDate, endDate]
+    );
+    const rows: TransactionRow[] = rowsResult.rows;
+
+    // Populates the cashFlows object by classifying each transaction and adjusting the amount for expenses.
+    rows.forEach((row) => {
+      const section = classify(row);
+      const amount = row.type === 'income' ? parseFloat(row.amount as any) : -parseFloat(row.amount as any);
+      cashFlows[section].push({ ...row, amount });
+    });
+
+    // A reusable function to render a section of the cash flow statement, now with aggregation.
+    const renderSection = (title: string, items: TransactionRow[]) => {
+      doc.font('Helvetica-Bold').fontSize(12).text(title, col1X, doc.y);
+      doc.moveDown(0.5);
+      doc.font('Helvetica');
+
+      // Aggregate all items by category to display a single line per category.
+      const aggregatedItems: { [category: string]: number } = {};
+      items.forEach(item => {
+        const category = item.category || 'Uncategorized';
+        if (!aggregatedItems[category]) {
+          aggregatedItems[category] = 0;
+        }
+        aggregatedItems[category] += item.amount;
+      });
+
+      let total = 0;
+      // Loop through the aggregated items and render them.
+      Object.keys(aggregatedItems).forEach(category => {
+        const amount = aggregatedItems[category];
+        doc.text(`  ${category}`, col1X + 20, doc.y);
+        doc.text(formatCurrencyForPdf(amount), col2X, doc.y, { width: columnWidth, align: 'right' });
+        total += amount;
+        doc.moveDown(0.5);
+        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        doc.moveDown(0.5);
+      });
+
+      doc.font('Helvetica-Bold');
+      doc.text(`Net ${title}`, col1X, doc.y);
+      doc.text(formatCurrencyForPdf(total), col2X, doc.y, { width: columnWidth, align: 'right' });
+      doc.moveDown(1);
+      doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+      doc.moveDown(0.5);
+      doc.font('Helvetica');
+
+      return total;
+    };
+
+    drawDocumentHeader(
+      doc,
+      companyName,
+      'CASH FLOW STATEMENT',
+      `FOR THE PERIOD ENDED ${new Date(endDate.toString()).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+    );
+
+    const totalOperating = renderSection('Operating Activities', cashFlows.operating);
+    const totalInvesting = renderSection('Investing Activities', cashFlows.investing);
+    const totalFinancing = renderSection(
+      'Financing Activities',
+      cashFlows.financing
+    );
+
+    const netIncreaseInCash = totalOperating + totalInvesting + totalFinancing;
+
+    doc.font('Helvetica-Bold').fontSize(12).text('Net Increase / (Decrease) in Cash', col1X, doc.y);
+    doc.text(formatCurrencyForPdf(netIncreaseInCash), col2X, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown();
+    doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown(0.5);
+    doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+    doc.moveDown();
+
+    doc.fontSize(8).fillColor('#4a5568').text(`Statement Period: ${new Date(startDate as string).toLocaleDateString('en-GB')} to ${new Date(endDate as string).toLocaleDateString('en-GB')}`, { align: 'center' });
+    doc.fillColor('black');
+    doc.moveDown();
+
+    break;
+  }
+
+
+
+      default:
+        doc.text('Document type not supported.', { align: 'center' });
+        doc.end();
+        return;
+    }
+
+    doc.end();
+
+  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    console.error(`Error generating ${documentType}:`, error);
+    res.removeHeader('Content-Disposition');
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+
+    if (error instanceof Error) {
+      res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: error.message }));
+    } else {
+      res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: String(error) }));
+    }
+  }
+});
+// Profile endpoints
+// GET /api/profile
+app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.user_id;
+    if (!userId) return res.status(401).json({ error: 'User not authenticated.' });
+
+    const result = await pool.query('SELECT * FROM public.users WHERE user_id = $1', [userId]);
+
+    if (result.rows.length > 0) {
+      res.status(200).json(result.rows[0]);
+    } else {
+      res.status(404).json({ error: 'Profile not found.' });
+    }
+  } catch (error) {
+    console.error('Error fetching user profile:', error);
+    res.status(500).json({ error: 'Failed to fetch user profile.' });
+  }
 });
 
-// Assuming app and PORT are defined elsewhere in your server file
-// app.listen(PORT, () => {
-//   console.log(`Node server running on http://localhost:${PORT}`);
-// });
 
+
+/**
+ * @route PUT /api/profile
+ * @desc Update the current user's profile information
+ * @access Private
+ */
+// PUT /api/profile
+app.put('/api/profile', authMiddleware, async (req: Request, res: Response) => {
+  const userId = req.user?.user_id;
+  if (!userId) return res.status(401).json({ error: 'User not authenticated.' });
+
+  const {
+    name,
+    contact_person,
+    email,
+    phone,
+    address,
+    company,
+    position,
+    city,
+    province,
+    postal_code,
+    country,
+    bio,
+    website,
+    linkedin,
+    timezone,
+    currency,
+    language,
+  } = req.body;
+
+  const query = `
+    UPDATE public.users SET
+      name = $1,
+      contact_person = $2,
+      email = $3,
+      phone = $4,
+      address = $5,
+      company = $6,
+      position = $7,
+      city = $8,
+      province = $9,
+      postal_code = $10,
+      country = $11,
+      bio = $12,
+      website = $13,
+      linkedin = $14,
+      timezone = $15,
+      currency = $16,
+      language = $17,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = $18
+    RETURNING *;
+  `;
+
+  const values = [
+    name,
+    contact_person,
+    email,
+    phone,
+    address,
+    company,
+    position,
+    city,
+    province,
+    postal_code,
+    country,
+    bio,
+    website,
+    linkedin,
+    timezone,
+    currency,
+    language,
+    userId,
+  ];
+
+  try {
+    await pool.query('BEGIN');
+    const result = await pool.query(query, values);
+    await pool.query('COMMIT');
+
+    if (result.rows.length > 0) {
+      res.status(200).json({ message: 'Profile updated successfully.', updatedProfile: result.rows[0] });
+    } else {
+      res.status(404).json({ error: 'Profile not found.' });
+    }
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    console.error('Error updating profile:', error);
+    res.status(500).json({ error: 'Failed to update user profile.' });
+  }
+});
+
+app.put('/api/profile/password', authMiddleware, async (req: Request, res: Response) => {
+  const userId = req.user?.user_id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { password } = req.body;
+  if (!password || password.length < 6) {
+    return res.status(400).json({ error: 'Invalid password' });
+  }
+
+  try {
+    const hashed = await bcrypt.hash(password, 10);
+    await pool.query('UPDATE public.users SET password_hash = $1 WHERE user_id = $2', [hashed, userId]);
+    res.status(200).json({ message: 'Password updated successfully.' });
+  } catch (err) {
+    console.error('Password update error:', err);
+    res.status(500).json({ error: 'Failed to update password.' });
+  }
+});
+
+
+// Helper function to handle async queries and reduce boilerplate
+async function queryDb<T>(queryText: string, params: any[]): Promise<T[]> {
+  const client = await pool.connect();
+  try {
+    const res = await client.query(queryText, params);
+    return res.rows;
+  } finally {
+    client.release();
+  }
+}
+// Helper for the new endpoint to calculate baseline data
+async function calculateBaselineData(userId: string) {
+  // Define the start date as 12 months ago
+  const twelveMonthsAgo = new Date();
+  twelveMonthsAgo.setFullYear(twelveMonthsAgo.getFullYear() - 1);
+
+  // Calculate Total Sales
+  const salesQuery = `
+    SELECT COALESCE(SUM(total_amount), 0) AS total_sales
+    FROM public.sales
+    WHERE user_id = $1 AND created_at >= $2;
+  `;
+  const salesResult = await queryDb<{ total_sales: number }>(salesQuery, [userId, twelveMonthsAgo.toISOString()]);
+  const totalSales = Number(salesResult[0]?.total_sales || 0);
+
+  // Calculate Total Costs (from purchases)
+  const purchasesQuery = `
+    SELECT COALESCE(SUM(total_amount), 0) AS total_costs
+    FROM public.purchases
+    WHERE user_id = $1 AND created_at >= $2;
+  `;
+  const purchasesResult = await queryDb<{ total_costs: number }>(purchasesQuery, [userId, twelveMonthsAgo.toISOString()]);
+  const totalCosts = Number(purchasesResult[0]?.total_costs || 0);
+
+  // Calculate Total Expenses (from expenses and transactions tables)
+  const expensesQuery = `
+    SELECT COALESCE(SUM(amount), 0) AS total_expenses
+    FROM public.expenses
+    WHERE user_id = $1 AND date >= $2;
+  `;
+  const expensesResult = await queryDb<{ total_expenses: number }>(expensesQuery, [userId, twelveMonthsAgo.toISOString()]);
+  const expensesTotal = Number(expensesResult[0]?.total_expenses || 0);
+  
+  // Transactions marked as expenses. Assuming a transaction type exists for expenses.
+  const transactionsQuery = `
+    SELECT COALESCE(SUM(amount), 0) AS total_transaction_expenses
+    FROM public.transactions
+    WHERE user_id = $1 AND date >= $2 AND type = 'Expense';
+  `;
+  const transactionsResult = await queryDb<{ total_transaction_expenses: number }>(transactionsQuery, [userId, twelveMonthsAgo.toISOString()]);
+  const transactionsExpensesTotal = Number(transactionsResult[0]?.total_transaction_expenses || 0);
+  
+  // Combine all expense sources
+  const totalExpenses = expensesTotal + transactionsExpensesTotal;
+
+  // The final baseline data object
+  return {
+    sales: totalSales,
+    costOfGoods: totalCosts,
+    grossProfit: totalSales - totalCosts,
+    totalExpenses: totalExpenses,
+    netProfit: (totalSales - totalCosts) - totalExpenses,
+  };
+}
+
+// --- START: UPDATED ENDPOINT FOR PROJECTIONS ---
+// This endpoint now correctly calculates and returns baseline financial data.
+app.get('/api/projections/baseline-data', authMiddleware, async (req: Request, res: Response) => {
+  const userId = req.user?.user_id;
+
+  if (!userId) {
+    return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
+  }
+
+  try {
+    // Determine the baseline period (e.g., last 30 days)
+    const baselineStartDate = new Date();
+    baselineStartDate.setDate(baselineStartDate.getDate() - 30);
+    const baselineEndDate = new Date();
+
+    // 1. Calculate total sales
+    // Corrected column name from `sale_date` to `due_date`
+    const salesQuery = `
+      SELECT SUM(total_amount) as total_sales
+      FROM public.sales
+      WHERE user_id = $1 AND due_date BETWEEN $2 AND $3;
+    `;
+    const salesResult = await pool.query(salesQuery, [userId, baselineStartDate, baselineEndDate]);
+    const totalSales = parseFloat(salesResult.rows[0]?.total_sales) || 0;
+
+    // 2. Calculate total cost of goods sold (COGS)
+    // Corrected column name from `s.sale_date` to `s.due_date`
+    const cogsQuery = `
+      SELECT SUM(si.quantity * p.cost_price) as total_cogs
+      FROM public.sale_items si
+      JOIN public.sales s ON si.sale_id = s.id
+      JOIN public.products_services p ON si.product_id = p.id
+      WHERE s.user_id = $1 AND s.due_date BETWEEN $2 AND $3;
+    `;
+    const cogsResult = await pool.query(cogsQuery, [userId, baselineStartDate, baselineEndDate]);
+    const totalCogs = parseFloat(cogsResult.rows[0]?.total_cogs) || 0;
+
+    // 3. Calculate total expenses
+    const expensesQuery = `
+      SELECT SUM(amount) as total_expenses
+      FROM public.expenses
+      WHERE user_id = $1 AND date BETWEEN $2 AND $3;
+    `;
+    const expensesResult = await pool.query(expensesQuery, [userId, baselineStartDate, baselineEndDate]);
+    const totalExpenses = parseFloat(expensesResult.rows[0]?.total_expenses) || 0;
+
+    // Construct the response object with the calculated values
+    const baselineData = {
+      sales: totalSales,
+      costOfGoods: totalCogs,
+      totalExpenses: totalExpenses,
+    };
+
+    res.status(200).json(baselineData);
+
+  } catch (error) {
+    console.error('Error fetching baseline data:', error);
+    res.status(500).json({ error: 'Failed to fetch financial baseline data.' });
+  }
+});
+
+// --- API Endpoints for User Management ---
+
+// --- API Endpoints for User Management ---
+
+// 1. GET /users - Fetch all users belonging to the authenticated user's organization
+// This now correctly filters based on the parent-child relationship.
+// --- API Endpoints for User Management ---
+// NOTE: These endpoints have been updated to remove the 'position' column
+// and would require separate endpoints to manage user roles.
+
+// --- API Endpoints for User Management ---
+// NOTE: These endpoints have been updated to remove the 'position' column
+// and would require separate endpoints to manage user roles.
+
+// 1. GET /users - Fetch all users belonging to the authenticated user's organization with their roles
+app.get('/users', authMiddleware, async (req: Request, res: Response) => {
+  const userId = (req as any).user?.user_id;
+
+  if (!userId) {
+    return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
+  }
+
+  try {
+    const result = await pool.query(`
+      SELECT
+        u.id,
+        u.name AS "displayName",
+        u.email,
+        u.user_id,
+        COALESCE(json_agg(r.name) FILTER (WHERE r.name IS NOT NULL), '[]') AS roles
+      FROM public.users u
+      LEFT JOIN public.user_roles ur ON u.user_id = ur.user_id
+      LEFT JOIN public.roles r ON ur.role = r.name
+      WHERE u.parent_user_id = $1
+      GROUP BY u.id, u.name, u.email, u.user_id;
+    `, [userId]);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching users:', err);
+    res.status(500).json({ error: 'Failed to load users.' });
+  }
+});
+
+// 2. POST /users - Create a new user within the authenticated user's organization
+app.post('/users', authMiddleware, async (req: Request, res: Response) => {
+  const { displayName, email, role, password } = req.body;
+  const newUserId = uuidv4();
+  const parentUserId = (req as any).user?.user_id;
+
+  if (!displayName || !email || !password || !parentUserId) {
+    return res.status(400).json({ error: 'Missing required data' });
+  }
+
+  const userRole = (typeof role === 'string' && role.length > 0) ? role : 'user';
+  
+  try {
+    const password_hash = await bcrypt.hash(password, 10);
+
+    await pool.query('BEGIN');
+
+    const userInsertResult = await pool.query(
+      'INSERT INTO public.users (id, name, email, user_id, password_hash, parent_user_id, role) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name AS "displayName", email, user_id',
+      [uuidv4(), displayName, email, newUserId, password_hash, parentUserId, userRole]
+    );
+
+    const roleInsertResult = await pool.query('SELECT name FROM public.roles WHERE name = $1', [userRole]);
+    if (roleInsertResult.rows.length === 0) {
+      console.warn(`Role '${userRole}' does not exist and will not be assigned.`);
+    } else {
+        await pool.query(
+          'INSERT INTO public.user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [newUserId, userRole]
+        );
+    }
+    
+    await pool.query('COMMIT');
+
+    res.status(201).json(userInsertResult.rows[0]);
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Error adding new user:', err);
+    
+    if (err instanceof Error) {
+        res.status(500).json({ error: err.message || 'Registration failed.' });
+    } else {
+      res.status(500).json({ error: 'Registration failed.' });
+    }
+  }
+});
+
+// 3. PUT /users/:id - Update a user's basic details within the authenticated user's organization
+app.put('/users/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { displayName, email } = req.body;
+  const parentUserId = (req as any).user?.user_id;
+
+  if (!parentUserId) {
+    return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
+  }
+
+  if (!displayName || !email) {
+    return res.status(400).json({ error: 'Missing required data: displayName and email' });
+  }
+
+  try {
+    // Log the parameters to help debug the 404 issue
+    console.log(`[PUT /users/:id] Attempting to update user with id: ${id} under parent user: ${parentUserId}`);
+    
+    const result = await pool.query(
+      'UPDATE public.users SET name = $1, email = $2 WHERE id = $3 AND parent_user_id = $4 RETURNING id, name AS "displayName", email',
+      [displayName, email, id, parentUserId]
+    );
+
+    if (result.rows.length === 0) {
+      console.error(`[PUT /users/:id] User with id: ${id} and parent_user_id: ${parentUserId} not found.`);
+      return res.status(404).json({ error: 'User not found or not in your organization' });
+    }
+
+    res.status(200).json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating user:', err);
+    res.status(500).json({ error: 'Update failed.' });
+  }
+});
+
+// 4. DELETE /users/:id - Delete a user within the authenticated user's organization
+app.delete('/users/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parentUserId = (req as any).user?.user_id;
+
+  if (!parentUserId) {
+    return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
+  }
+
+  try {
+    console.log(`[DELETE /users/:id] Attempting to delete user with id: ${id} under parent user: ${parentUserId}`);
+    // Delete from user_roles first due to foreign key constraints
+    await pool.query('DELETE FROM public.user_roles WHERE user_id = (SELECT id FROM public.users WHERE id = $1 AND parent_user_id = $2)', [id, parentUserId]);
+    
+    // Then delete the user
+    const result = await pool.query('DELETE FROM public.users WHERE id = $1 AND parent_user_id = $2 RETURNING id', [id, parentUserId]);
+
+    if (result.rows.length === 0) {
+      console.error(`[DELETE /users/:id] User with id: ${id} and parent_user_id: ${parentUserId} not found.`);
+      return res.status(404).json({ error: 'User not found or not in your organization' });
+    }
+
+    res.status(200).json({ message: 'User deleted successfully' });
+  } catch (err) {
+    console.error('Error deleting user:', err);
+    res.status(500).json({ error: 'Deletion failed.' });
+  }
+});
+
+// New endpoint to update user roles
+app.put('/users/:id/roles', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { roles } = req.body;
+  const parentUserId = (req as any).user?.user_id;
+
+  if (!parentUserId) {
+    return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
+  }
+
+  if (!Array.isArray(roles)) {
+    return res.status(400).json({ error: 'Roles must be an array of strings.' });
+  }
+
+  try {
+    console.log(`[PUT /users/:id/roles] Attempting to update roles for user with id: ${id} under parent user: ${parentUserId}`);
+    await pool.query('BEGIN');
+    
+    // Check for user existence and get the user_id before proceeding to delete/insert roles
+    const userResult = await pool.query('SELECT user_id FROM public.users WHERE id = $1 AND parent_user_id = $2', [id, parentUserId]);
+    if (userResult.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found or not in your organization' });
+    }
+    const targetUserId = userResult.rows[0].user_id;
+
+    // First, remove all existing roles for this user
+    await pool.query('DELETE FROM public.user_roles WHERE user_id = $1', [targetUserId]);
+    
+    // Then, insert the new roles
+    const roleInsertPromises = roles.map(async (roleName) => {
+      // Check if the role exists before inserting
+      const roleResult = await pool.query('SELECT name FROM public.roles WHERE name = $1', [roleName]);
+      if (roleResult.rows.length > 0) {
+        // Insert the user-role mapping.
+        await pool.query(
+          'INSERT INTO public.user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [targetUserId, roleName]
+        );
+      } else {
+        console.warn(`Role '${roleName}' does not exist and will not be assigned.`);
+      }
+    });
+
+    await Promise.all(roleInsertPromises);
+    await pool.query('COMMIT');
+
+    res.status(200).json({ message: 'User roles updated successfully' });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Error updating user roles:', err);
+    if (err instanceof Error) {
+        res.status(500).json({ error: err.message || 'Failed to update roles.' });
+    } else {
+        res.status(500).json({ error: 'Failed to update roles.' });
+    }
+  }
+});
 
 
 app.listen(PORT, () => {
   console.log(`Node server running on http://localhost:${PORT}`);
 });
-
