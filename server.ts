@@ -315,6 +315,10 @@ const mapCustomerToFrontend = (customer: CustomerDB): CustomerFrontend => ({
 
 
 
+// Assuming 'app', 'pool', 'authMiddleware', 'bcrypt', 'uuidv4', 'Request', 'Response' are defined elsewhere
+
+// Assuming 'app', 'pool', 'authMiddleware', 'bcrypt', 'uuidv4', 'Request', 'Response' are defined elsewhere
+
 app.post('/register', async (req: Request, res: Response) => {
   const { name, email, password } = req.body;
 
@@ -323,33 +327,89 @@ app.post('/register', async (req: Request, res: Response) => {
 
   const user_id = uuidv4();
   const password_hash = await bcrypt.hash(password, 10);
+  const defaultRole = 'admin'; // or 'ceo' depending on your system
 
   try {
-    await pool.query(`
-      INSERT INTO public.users (name, email, user_id, password_hash)
-      VALUES ($1, $2, $3, $4)
-    `, [name, email, user_id, password_hash]);
+    await pool.query('BEGIN'); // Start a database transaction
 
-    res.status(201).json({ message: 'User registered' });
+    // Step 1: Insert user into `users` table
+    await pool.query(`
+      INSERT INTO public.users (name, email, user_id, password_hash, role)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [name, email, user_id, password_hash, defaultRole]);
+
+    // Step 2: Insert default role into `user_roles` table
+    await pool.query(`
+      INSERT INTO public.user_roles (user_id, role)
+      VALUES ($1, $2)
+    `, [user_id, defaultRole]);
+
+    // Step 3: Insert default 'Sales Revenue' account into `accounts` table for the new user
+    // Corrected 'account_type' to 'type' as per your public.accounts definition
+    await pool.query(`
+      INSERT INTO public.accounts (name, type, category, code, user_id)
+      VALUES ($1, $2, $3, $4, $5)
+    `, ['Sales Revenue', 'Income', 'Sales Revenue', '4000', user_id]);
+
+    // You can add more default accounts here if needed, following the same pattern:
+    // For example, a 'Cost of Goods Sold' account with code '5000'
+    /*
+    await pool.query(`
+      INSERT INTO public.accounts (name, type, category, code, user_id)
+      VALUES ($1, $2, $3, $4, $5)
+    `, ['Cost of Goods Sold', 'Expense', 'Cost of Goods Sold', '5000', user_id]);
+    */
+
+    await pool.query('COMMIT'); // Commit the transaction if all steps succeed
+
+    res.status(201).json({ message: 'User registered and default accounts created successfully' });
   } catch (error) {
+    await pool.query('ROLLBACK'); // Rollback the transaction if any error occurs
     console.error('Registration error:', error);
     res.status(500).json({ error: 'Registration failed' });
   }
 });
 
 
+
+
 app.post('/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
 
   try {
-    const result = await pool.query('SELECT * FROM public.users WHERE email = $1', [email]);
+    console.log('🔐 Login attempt for:', email);
+
+    const result = await pool.query(`
+      SELECT 
+        u.id,
+        u.name,
+        u.email,
+        u.user_id,
+        u.password_hash,
+        u.parent_user_id,
+        u.role AS fallback_role,  -- 👈 we use this only if user_roles is empty
+        COALESCE(json_agg(r.name) FILTER (WHERE r.name IS NOT NULL), '[]') AS roles
+      FROM public.users u
+      LEFT JOIN public.user_roles ur ON u.user_id = ur.user_id
+      LEFT JOIN public.roles r ON ur.role = r.name
+      WHERE u.email = $1
+      GROUP BY u.id, u.name, u.email, u.user_id, u.password_hash, u.parent_user_id, u.role
+    `, [email]);
+
     const user = result.rows[0];
+
+    if (!user) {
+      console.warn('❌ No user found for email:', email);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const hash = typeof user?.password_hash === 'string'
       ? user.password_hash
       : user?.password_hash?.toString();
 
-    if (!user || !hash || !(await bcrypt.compare(password, hash))) {
+    const passwordMatch = await bcrypt.compare(password, hash);
+    if (!passwordMatch) {
+      console.warn('❌ Password mismatch for:', email);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
@@ -359,31 +419,41 @@ app.post('/login', async (req: Request, res: Response) => {
       return res.status(500).json({ error: 'Server misconfiguration' });
     }
 
-    // Create token WITHOUT expiration
-    const token = jwt.sign(
-  {
-    user_id: user.user_id,
-    parent_user_id: user.parent_user_id || user.user_id, // Fallback for CEO accounts
-  },
-  secret
-);
+    // ✅ Resolve final roles (from user_roles or fallback to users.role)
+    const resolvedRoles = (user.roles && user.roles.length > 0)
+      ? user.roles
+      : (user.fallback_role ? [user.fallback_role] : []);
 
+    const token = jwt.sign(
+      {
+        user_id: user.user_id,
+        parent_user_id: user.parent_user_id || user.user_id,
+      },
+      secret
+    );
+
+    const responseUser = {
+      user_id: user.user_id,
+      parent_user_id: user.parent_user_id,
+      name: user.name,
+      email: user.email,
+      roles: resolvedRoles
+    };
+
+    console.log('📤 Sending login response:', responseUser);
 
     res.json({
       token,
-      user: {
-        user_id: user.user_id,
-        parent_user_id: user.parent_user_id,
-        role: user.role,
-        name: user.name,
-        email: user.email
-      }
+      user: responseUser
     });
+
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('💥 Login error:', error);
     res.status(500).json({ error: 'Login failed' });
   }
 });
+
+
 
 
 
@@ -1299,8 +1369,12 @@ app.post('/transactions/manual', authMiddleware, async (req: Request, res: Respo
          WHERE id = $10 AND user_id = $11 -- Added user_id to WHERE clause for update
          RETURNING id, "type", amount, description, "date", category, account_id, created_at, original_text, source, confirmed`,
         [type, amount, description || null, date, category || null, account_id || null, original_text || null, source || 'manual', confirmed !== undefined ? confirmed : true, id, user_id]
+      
+      
+      
       );
-      if (result.rows.length === 0) {
+
+     if (result.rows.length === 0) {
         return res.status(404).json({ error: 'Transaction not found or unauthorized for update' });
       }
     } else {
@@ -2481,81 +2555,98 @@ app.delete('/vendors/:id', authMiddleware, async (req: Request, res: Response) =
 });
 
 
+// Assuming 'app', 'authMiddleware', 'pool', 'Request', 'Response' are defined elsewhere
+
+
 // GET Products/Services
-app.get('/products-services', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+app.get('/products-services', authMiddleware, async (req: Request, res: Response) => {
+  // TypeScript now knows req.user might be undefined, so we add a check or use !
   const user_id = req.user!.parent_user_id; // Get user_id from req.user
   try {
     const result = await pool.query(
-      'SELECT id, name, description, unit_price, cost_price, sku, is_service, stock_quantity, unit FROM products_services WHERE user_id = $1 ORDER BY name', [user_id] // ADDED user_id filter
+      'SELECT id, name, description, unit_price, cost_price, sku, is_service, max_quantity, min_quantity, stock_quantity, unit, available_value FROM products_services WHERE user_id = $1 ORDER BY name', // ADDED available_value to SELECT
+      [user_id]
     );
 
-    // Map the rows to format stock_quantity as an integer
-    // and ensure all fields match the ProductDB interface structure
     const formattedRows = result.rows.map(row => ({
       id: row.id,
       name: row.name,
       description: row.description,
-      unit_price: Number(row.unit_price), // Ensure unit_price is a number
-      cost_price: row.cost_price ? Number(row.cost_price) : null, // Ensure cost_price is a number or null
+      unit_price: Number(row.unit_price),
+      cost_price: row.cost_price ? Number(row.cost_price) : null,
+      max_quantity: row.max_quantity ? Number(row.max_quantity) : null,
+      min_quantity: row.min_quantity ? Number(row.min_quantity) : null,
       sku: row.sku,
       is_service: row.is_service,
-      stock_quantity: parseInt(row.stock_quantity, 10), // Convert to integer
-      created_at: row.created_at, // Assuming these are handled correctly by pg
+      stock_quantity: Number(row.stock_quantity), // Changed to Number() to preserve decimals as per DDL
+      created_at: row.created_at,
       updated_at: row.updated_at,
       tax_rate_id: row.tax_rate_id,
       category: row.category,
-      unit: row.unit, // Include the unit
-      tax_rate_value: row.tax_rate_value // If this is joined, ensure it's handled
+      unit: row.unit,
+      available_value: row.available_value ? Number(row.available_value) : null, // Mapped available_value
     }));
 
     res.json(formattedRows);
-  } catch (error: unknown) {
+  } catch (error) {
     console.error('Error fetching products/services:', error);
     res.status(500).json({ error: 'Failed to fetch products/services', detail: error instanceof Error ? error.message : String(error) });
   }
 });
 
 // POST Product/Service
-app.post('/products-services', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const { name, description, unit_price, cost_price, sku, is_service, stock_quantity } = req.body;
+app.post('/products-services', authMiddleware, async (req: Request, res: Response) => {
+  const { name, description, unit_price, cost_price, sku, is_service, stock_quantity, max_quantity, min_quantity, available_value } = req.body; // Added available_value
   const user_id = req.user!.parent_user_id; // Get user_id from req.user
+
   if (!name || unit_price == null) {
     return res.status(400).json({ error: 'Product/Service name and unit_price are required' });
   }
 
   try {
+    // Ensure the order of values matches the order of columns in the INSERT statement
     const result = await pool.query(
-      `INSERT INTO products_services (name, description, unit_price, cost_price, sku, is_service, stock_quantity, user_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`, // ADDED user_id
-      [name, description || null, unit_price, cost_price || null, sku || null, is_service || false, stock_quantity || 0, user_id]
+      `INSERT INTO products_services (name, description, unit_price, cost_price, sku, is_service, stock_quantity, min_quantity, max_quantity, available_value, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`, // Reordered columns for min/max and added available_value
+      [
+        name,
+        description || null,
+        unit_price,
+        cost_price || null,
+        sku || null,
+        is_service || false,
+        stock_quantity || 0, // This is for products
+        min_quantity || null, // Corrected order
+        max_quantity || null, // Corrected order
+        available_value || null, // This is for services
+        user_id
+      ]
     );
     res.status(201).json(result.rows[0]);
-  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+  } catch (error) {
     console.error('Error adding product/service:', error);
     res.status(500).json({ error: 'Failed to add product/service', detail: error instanceof Error ? error.message : String(error) });
   }
 });
 
-// PUT Update Product Stock
-app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const { id } = req.params; // Product ID
-  const { adjustmentQuantity } = req.body; // Quantity to add (positive) or subtract (negative)
+// PUT Update Product Stock (This route was already mostly correct for its specific purpose)
+app.put('/products-services/:id/stock', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { adjustmentQuantity, updatedCostPrice } = req.body; // Added updatedCostPrice from frontend
   const user_id = req.user!.parent_user_id; // Get user_id from req.user
 
-  // 1. Explicitly convert adjustmentQuantity to a number
   const parsedAdjustmentQuantity = Number(adjustmentQuantity);
+  const parsedUpdatedCostPrice = Number(updatedCostPrice); // Parse updatedCostPrice
 
   if (typeof parsedAdjustmentQuantity !== 'number' || isNaN(parsedAdjustmentQuantity)) {
     return res.status(400).json({ error: 'adjustmentQuantity must be a valid number.' });
   }
 
   try {
-    // Start a transaction for atomicity
     await pool.query('BEGIN');
 
-    // 2. Get current stock quantity, filtered by user_id
     const productResult = await pool.query(
-      'SELECT stock_quantity, name FROM public.products_services WHERE id = $1 AND user_id = $2 FOR UPDATE', // ADDED user_id filter
+      'SELECT stock_quantity, name FROM public.products_services WHERE id = $1 AND user_id = $2 FOR UPDATE',
       [id, user_id]
     );
 
@@ -2564,14 +2655,11 @@ app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request,
       return res.status(404).json({ error: 'Product or service not found or unauthorized.' });
     }
 
-    // 3. Explicitly convert currentStock to a number to prevent string concatenation
     const currentStock = Number(productResult.rows[0].stock_quantity);
     const productName = productResult.rows[0].name;
 
-    // 4. Perform numeric addition
     const newStock = currentStock + parsedAdjustmentQuantity;
 
-    // 5. Check for insufficient stock if selling (adjustmentQuantity is negative)
     if (parsedAdjustmentQuantity < 0 && newStock < 0) {
       await pool.query('ROLLBACK');
       return res.status(400).json({
@@ -2580,13 +2668,13 @@ app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request,
       });
     }
 
-    // 6. Update stock quantity, filtered by user_id
+    // Update stock quantity AND cost_price if provided
     const updateResult = await pool.query(
       `UPDATE public.products_services
-       SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2 AND user_id = $3
-       RETURNING id, name, stock_quantity`, // ADDED user_id filter
-      [newStock, id, user_id]
+       SET stock_quantity = $1, cost_price = COALESCE($2, cost_price), updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3 AND user_id = $4
+       RETURNING id, name, stock_quantity, cost_price`, // Return cost_price to confirm update
+      [newStock, isNaN(parsedUpdatedCostPrice) ? null : parsedUpdatedCostPrice, id, user_id] // Use COALESCE to update cost_price only if a valid number is provided
     );
 
     await pool.query('COMMIT');
@@ -2596,8 +2684,8 @@ app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request,
       product: updateResult.rows[0],
     });
 
-  } catch (error: unknown) {
-    await pool.query('ROLLBACK'); // Rollback transaction in case of error
+  } catch (error) {
+    await pool.query('ROLLBACK');
     console.error(`Error updating stock for product ID ${id}:`, error);
     res.status(500).json({
       error: 'Failed to update product stock',
@@ -2606,6 +2694,52 @@ app.put('/api/products-services/:id/stock', authMiddleware, async (req: Request,
   }
 });
 
+// PUT Update Product/Service (General Update)
+app.put('/products-services/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user_id = req.user!.parent_user_id;
+  const {
+    name, description, unit_price, cost_price, sku,
+    is_service, stock_quantity, unit, min_quantity, max_quantity, available_value // Added min_quantity, max_quantity, available_value
+  } = req.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE products_services
+       SET name = $1, description = $2, unit_price = $3, cost_price = $4,
+           sku = $5, is_service = $6, stock_quantity = $7, unit = $8,
+           min_quantity = $9, max_quantity = $10, available_value = $11, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $12 AND user_id = $13
+       RETURNING *`, // Added min_quantity, max_quantity, available_value to SET clause
+      [
+        name,
+        description || null,
+        unit_price,
+        cost_price || null,
+        sku || null,
+        is_service || false,
+        stock_quantity || 0,
+        unit || null,
+        min_quantity || null, // Pass min_quantity
+        max_quantity || null, // Pass max_quantity
+        available_value || null, // Pass available_value
+        id,
+        user_id
+      ]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Product not found or unauthorized' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error updating product:', error);
+    res.status(500).json({ error: 'Update failed', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// DELETE Product/Service (No changes needed, already correct)
 app.delete('/products-services/:id', authMiddleware, async (req: Request, res: Response) => {
   const { id } = req.params;
   const user_id = req.user!.parent_user_id;
@@ -2621,39 +2755,11 @@ app.delete('/products-services/:id', authMiddleware, async (req: Request, res: R
     }
 
     res.json({ message: 'Deleted successfully', deleted: result.rows[0] });
-  } catch (error: unknown) {
+  } catch (error) {
     res.status(500).json({ error: 'Failed to delete', detail: error instanceof Error ? error.message : String(error) });
   }
 });
 
-app.put('/products-services/:id', authMiddleware, async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const user_id = req.user!.parent_user_id;
-  const {
-    name, description, unit_price, cost_price, sku,
-    is_service, stock_quantity, unit
-  } = req.body;
-
-  try {
-    const result = await pool.query(
-      `UPDATE products_services
-       SET name = $1, description = $2, unit_price = $3, cost_price = $4,
-           sku = $5, is_service = $6, stock_quantity = $7, unit = $8, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $9 AND user_id = $10
-       RETURNING *`,
-      [name, description, unit_price, cost_price, sku, is_service, stock_quantity, unit, id, user_id]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Product not found or unauthorized' });
-    }
-
-    res.json(result.rows[0]);
-  } catch (error: unknown) {
-    console.error('Error updating product:', error);
-    res.status(500).json({ error: 'Update failed', detail: error instanceof Error ? error.message : String(error) });
-  }
-});
 
 // =========================================================================
 // 1. POST Create New Sale (app.post('/api/sales')) - Corrected
@@ -2769,23 +2875,38 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
 
             await client.query(
                 `INSERT INTO public.sale_items (
-                    sale_id, product_id, product_name, quantity, unit_price_at_sale, subtotal
-                ) VALUES ($1, $2, $3, $4, $5, $6);`,
+                    sale_id, product_id, product_name, quantity, unit_price_at_sale, subtotal, user_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7);`,
                 [
                     saleId,
                     item.id,
-                    item.name,
+                    productName, // Use productName from the query result
                     Number(item.quantity),
                     Number(item.unit_price),
-                    Number(item.subtotal)
+                    Number(item.subtotal),
+                    user_id // Ensure user_id is included for sale_items
                 ]
             );
         }
 
-        const salesRevenueAccountId = 5;
-        const transactionType = 'Sales Revenue';
+        // --- START: MODIFIED SALES REVENUE ACCOUNT LOOKUP ---
+        // Dynamically fetch the Sales Revenue account ID based on user_id and account code (or category/name)
+        const salesRevenueAccountResult = await client.query(
+            `SELECT id FROM public.accounts
+             WHERE user_id = $1 AND name = 'Sales Revenue' AND account_type = 'Income';`, // Assuming 'name' and 'account_type' for lookup
+            [user_id]
+        );
+
+        if (salesRevenueAccountResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(500).json({ error: 'Sales Revenue account not found for this user. Please ensure it is set up.' });
+        }
+        const salesRevenueAccountId = salesRevenueAccountResult.rows[0].id;
+        // --- END: MODIFIED SALES REVENUE ACCOUNT LOOKUP ---
+
+        const transactionType = 'income'; // Changed to 'income' as per transactions table type
+        const transactionCategory = 'Sales Revenue'; // Changed to 'Sales Revenue' as per transactions table category
         const transactionDescription = `POS Sale ID: ${saleId}`;
-        const transactionCategory = 'Revenue';
         const transactionDate = new Date(saleTimestamp).toISOString().split('T')[0];
 
         await client.query(
@@ -2798,7 +2919,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
                 transactionDescription,
                 transactionDate,
                 transactionCategory,
-                salesRevenueAccountId,
+                salesRevenueAccountId, // Use the dynamically fetched account ID
                 'POS',
                 true,
                 user_id
@@ -2823,6 +2944,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
         client.release();
     }
 });
+
 
 
 // =========================================================================
@@ -3877,29 +3999,32 @@ app.post('/api/purchases/:id/payment', authMiddleware, async (req: Request, res:
 app.get('/employees', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
     const user_id = req.user!.parent_user_id; // Get user_id from req.user
     try {
-        const result = await pool.query(`
-            SELECT
-                e.id,
-                e.name,
-                e.position,
-                e.email,
-                e.id_number,
-                e.phone,
-                e.start_date,
-                e.payment_type,
-                e.base_salary,
-                e.hourly_rate,
-                /* Sum of approved hours for each employee for dashboard stats */
-                COALESCE((SELECT SUM(hours_worked) FROM time_entries WHERE employee_id = e.id AND status = 'approved' AND user_id = $1), 0) AS hours_worked_total, -- ADDED user_id filter
-                bd.account_holder,
-                bd.bank_name,
-                bd.account_number,
-                bd.branch_code
-            FROM employees e
-            LEFT JOIN bank_details bd ON e.id = bd.employee_id
-            WHERE e.user_id = $1 -- ADDED user_id filter
-            ORDER BY e.name ASC
-        `, [user_id]);
+const result = await pool.query(`
+  SELECT
+    e.id,
+    e.name,
+    e.position,
+    e.email,
+    e.id_number,
+    e.phone,
+    e.start_date,
+    e.payment_type,
+    e.base_salary,
+    e.hourly_rate,
+    COALESCE((
+      SELECT SUM(hours_worked)
+      FROM time_entries
+      WHERE employee_id = e.id AND status = 'approved' AND user_id = $1
+    ), 0) AS hours_worked_total,
+    (e.bank_details::json->>'accountHolder') AS account_holder,
+    (e.bank_details::json->>'bankName') AS bank_name,
+    (e.bank_details::json->>'accountNumber') AS account_number,
+    (e.bank_details::json->>'branchCode') AS branch_code
+  FROM employees e
+  WHERE e.user_id = $1
+  ORDER BY e.name ASC;
+`, [user_id]);
+
         res.json(result.rows);
     } catch (error: unknown) { // Changed 'err' to 'error: unknown'
         console.error('Error fetching employees:', error);
@@ -4087,10 +4212,12 @@ app.post('/employees/:employeeId/time-entries', authMiddleware, async (req: Requ
         }
 
         const result = await pool.query(
-            `INSERT INTO time_entries (employee_id, entry_date, hours_worked, notes, status)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id, employee_id, entry_date as date, hours_worked, notes as description, status`, // Return full object
-            [employeeId, date, hours_worked, description || null, 'pending'] // Explicitly set status to 'pending'
-        );
+  `INSERT INTO time_entries (employee_id, entry_date, hours_worked, notes, status, user_id)
+   VALUES ($1, $2, $3, $4, $5, $6)
+   RETURNING id, employee_id, entry_date as date, hours_worked, notes as description, status`,
+  [employeeId, date, hours_worked, description || null, 'pending', user_id]
+);
+
         res.status(201).json(result.rows[0]); // Return the created time entry object
     } catch (error: unknown) { // Changed 'err' to 'error: unknown'
         console.error('Error adding time entry:', error);
@@ -6469,15 +6596,7 @@ app.get('/api/projections/baseline-data', authMiddleware, async (req: Request, r
   }
 });
 
-// --- API Endpoints for User Management ---
 
-// --- API Endpoints for User Management ---
-
-// 1. GET /users - Fetch all users belonging to the authenticated user's organization
-// This now correctly filters based on the parent-child relationship.
-// --- API Endpoints for User Management ---
-// NOTE: These endpoints have been updated to remove the 'position' column
-// and would require separate endpoints to manage user roles.
 
 // --- API Endpoints for User Management ---
 // NOTE: These endpoints have been updated to remove the 'position' column
@@ -6680,6 +6799,162 @@ app.put('/users/:id/roles', authMiddleware, async (req: Request, res: Response) 
     } else {
         res.status(500).json({ error: 'Failed to update roles.' });
     }
+  }
+});
+
+// Assuming 'app', 'authMiddleware', 'pool', 'Request', 'Response' are defined elsewhere
+
+// NEW: Top Selling Products (using sale_items and sales tables)
+app.get('/api/charts/top-selling-products', authMiddleware, async (req, res) => {
+  const user_id = req.user!.parent_user_id;
+  try {
+    const result = await pool.query(`
+      SELECT
+        si.product_name,
+        SUM(si.quantity) AS total_quantity_sold
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.id
+      WHERE s.user_id = $1
+      GROUP BY si.product_name
+      ORDER BY total_quantity_sold DESC
+      LIMIT 5;
+    `, [user_id]);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching top-selling products:', error);
+    res.status(500).json({ error: 'Failed to fetch top-selling products' });
+  }
+});
+
+// Existing Endpoints (unchanged, but included for context)
+// Customer Lifetime Value: NOW dynamically calculates total_invoiced from sales table
+app.get('/api/charts/customer-lifetime-value', authMiddleware, async (req, res) => {
+  const user_id = req.user!.parent_user_id;
+  try {
+    const result = await pool.query(`
+      SELECT
+        CASE
+          WHEN COALESCE(customer_sales.total_customer_sales, 0) < 1000 THEN 'Low Value (<R1000)'
+          WHEN COALESCE(customer_sales.total_customer_sales, 0) BETWEEN 1000 AND 5000 THEN 'Medium Value (R1000-R5000)'
+          ELSE 'High Value (>R5000)'
+        END AS bucket,
+        COUNT(c.id) AS count
+      FROM customers c
+      LEFT JOIN (
+          SELECT
+              s.customer_id,
+              SUM(s.total_amount) AS total_customer_sales
+          FROM sales s
+          WHERE s.user_id = $1
+          GROUP BY s.customer_id
+      ) AS customer_sales ON c.id = customer_sales.customer_id
+      WHERE c.user_id = $1
+      GROUP BY bucket;
+    `, [user_id]);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching customer value distribution:', error);
+    res.status(500).json({ error: 'Failed to fetch customer value chart' });
+  }
+});
+
+
+app.get('/api/charts/product-stock-levels', authMiddleware, async (req, res) => {
+  const user_id = req.user!.parent_user_id;
+  try {
+    const result = await pool.query(`
+      SELECT name, stock_quantity, min_quantity, max_quantity
+      FROM products_services
+      WHERE user_id = $1
+    `, [user_id]);
+
+    const transformed = result.rows.map(row => ({
+      name: row.name,
+      current: row.stock_quantity,
+      min: row.min_quantity,
+      max: row.max_quantity,
+    }));
+
+    res.json(transformed);
+  } catch (error) {
+    console.error('Error fetching stock levels:', error);
+    res.status(500).json({ error: 'Failed to fetch stock level chart' });
+  }
+});
+
+
+app.get('/api/charts/transaction-type-breakdown', authMiddleware, async (req, res) => {
+  const user_id = req.user!.parent_user_id;
+  try {
+    const result = await pool.query(`
+      SELECT 
+        TO_CHAR(date, 'YYYY-MM') AS month,
+        type,
+        SUM(amount) AS total
+      FROM transactions
+      WHERE user_id = $1
+      GROUP BY month, type
+      ORDER BY month
+    `, [user_id]);
+
+    // 🔧 Explicitly type the shape of the aggregated data
+    interface MonthlyBreakdown {
+      sale: number;
+      income: number;
+      expense: number;
+      cash_in: number;
+    }
+
+    const data: Record<string, MonthlyBreakdown> = {};
+
+    for (const row of result.rows) {
+      const month = row.month as string;
+      const type = row.type as keyof MonthlyBreakdown;
+      const total = Number(row.total);
+
+      if (!data[month]) {
+        data[month] = { sale: 0, income: 0, expense: 0, cash_in: 0 };
+      }
+
+      // 🧠 Type-safe assignment
+      if (type in data[month]) {
+        data[month][type] += total;
+      }
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error('Error fetching transaction breakdown:', error);
+    res.status(500).json({ error: 'Failed to fetch breakdown' });
+  }
+});
+
+
+
+app.get('/api/charts/payroll-distribution', authMiddleware, async (req, res) => {
+  const user_id = req.user!.parent_user_id;
+  try {
+    const result = await pool.query(`
+      SELECT 
+        TO_CHAR(created_at, 'YYYY-MM') AS month,
+        SUM(
+          CASE 
+            WHEN payment_type = 'salary' THEN base_salary
+            ELSE hourly_rate * hours_worked_total
+          END
+        ) AS total_payroll
+      FROM employees
+      WHERE user_id = $1
+      GROUP BY month
+      ORDER BY month
+    `, [user_id]);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching payroll distribution:', error);
+    res.status(500).json({ error: 'Failed to fetch payroll chart' });
   }
 });
 
