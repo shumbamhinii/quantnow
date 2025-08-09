@@ -1263,17 +1263,32 @@ app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), as
 
 /* --- Transactions API (Fetching) --- */
 app.get('/transactions', authMiddleware, async (req: Request, res: Response) => {
-  const { type, category, accountId, search, fromDate, toDate } = req.query;
-  const user_id = req.user!.parent_user_id;
+  const { type, category, accountId, search, fromDate, toDate, since, limit } = req.query as {
+    type?: string;
+    category?: string;
+    accountId?: string;
+    search?: string;
+    fromDate?: string;
+    toDate?: string;
+    since?: string;
+    limit?: string;
+  };
 
-  if (fromDate && toDate && typeof fromDate === 'string' && typeof toDate === 'string') {
+  // Prefer company scoping, fallback to user_id
+  const user_id = (req.user!.parent_user_id || req.user!.user_id)!;
+
+  // Validate date range if provided
+  if (fromDate && toDate) {
     const parsedFromDate = new Date(fromDate);
     const parsedToDate = new Date(toDate);
     if (parsedFromDate > parsedToDate) {
-      console.warn(`Invalid date range requested: fromDate (${fromDate}) is after toDate (${toDate}). Returning empty transactions.`);
+      console.warn(`Invalid date range: fromDate (${fromDate}) > toDate (${toDate}). Returning empty list.`);
       return res.json([]);
     }
   }
+
+  // Limit results for performance; default 500, max 2000
+  const safeLimit = Math.min(Math.max(parseInt(limit || '500', 10) || 500, 1), 2000);
 
   let query = `
     SELECT
@@ -1290,119 +1305,68 @@ app.get('/transactions', authMiddleware, async (req: Request, res: Response) => 
       t.confirmed,
       acc.name AS account_name,
       acc.type AS account_type
-    FROM
-      transactions t
-    LEFT JOIN
-      accounts acc ON t.account_id = acc.id
+    FROM transactions t
+    LEFT JOIN accounts acc ON t.account_id = acc.id
     WHERE t.user_id = $1
   `;
 
   const queryParams: (string | number)[] = [user_id];
   let paramIndex = 2;
 
-  if (type && typeof type === 'string' && type !== 'all') {
+  // Filters
+  if (type && type !== 'all') {
     query += ` AND t.type = $${paramIndex++}`;
     queryParams.push(type);
   }
 
-  if (category && typeof category === 'string' && category !== 'all') {
+  if (category && category !== 'all') {
     query += ` AND t.category = $${paramIndex++}`;
     queryParams.push(category);
   }
 
-  if (accountId && typeof accountId === 'string' && accountId !== 'all') {
+  if (accountId && accountId !== 'all') {
     query += ` AND t.account_id = $${paramIndex++}`;
     queryParams.push(accountId);
   }
 
-  if (search && typeof search === 'string') {
+  if (search) {
+    // BUGFIX: increment paramIndex after pushing the search param
     query += ` AND (t.description ILIKE $${paramIndex} OR t.type ILIKE $${paramIndex} OR acc.name ILIKE $${paramIndex})`;
     queryParams.push(`%${search}%`);
+    paramIndex++; // <-- important so later params don't reuse the same placeholder
   }
 
-  if (fromDate && typeof fromDate === 'string') {
+  // Date windowing
+  if (fromDate) {
     query += ` AND t.date >= $${paramIndex++}`;
     queryParams.push(fromDate);
   }
 
-  if (toDate && typeof toDate === 'string') {
+  if (toDate) {
     query += ` AND t.date <= $${paramIndex++}`;
     queryParams.push(toDate);
   }
 
-  query += ` ORDER BY t.date DESC, t.created_at DESC`;
+  // NEW: `since` shortcut for duplicate-check fetches (only applied if fromDate is not supplied)
+  if (!fromDate && since) {
+    query += ` AND t.date >= $${paramIndex++}`;
+    queryParams.push(since);
+  }
+
+  query += ` ORDER BY t.date DESC, t.created_at DESC LIMIT ${safeLimit}`;
 
   try {
     const result = await pool.query(query, queryParams);
     res.json(result.rows);
   } catch (error: unknown) {
     console.error('Error fetching transactions:', error);
-    res.status(500).json({ error: 'Failed to fetch transactions', detail: error instanceof Error ? error.message : String(error) });
+    res.status(500).json({
+      error: 'Failed to fetch transactions',
+      detail: error instanceof Error ? error.message : String(error),
+    });
   }
 });
 
-// MODIFIED: Added authMiddleware and user_id to INSERT/UPDATE
-app.post('/transactions/manual', authMiddleware, async (req: Request, res: Response) => {
-  const { id, type, amount, description, date, category, account_id, original_text, source, confirmed } = req.body;
-  const user_id = req.user!.parent_user_id; // Get user_id from req.user
-
-  if (!type || !amount || !date) {
-    return res.status(400).json({ detail: 'type, amount, and date are required' });
-  }
-
-  try {
-    let result;
-    if (id) {
-      // If ID is provided, perform an UPDATE
-      result = await pool.query(
-        `UPDATE transactions
-         SET
-           "type" = $1,
-           amount = $2,
-           description = $3,
-           "date" = $4,
-           category = $5,
-           account_id = $6,
-           original_text = $7,
-           source = $8,
-           confirmed = $9
-         WHERE id = $10 AND user_id = $11 -- Added user_id to WHERE clause for update
-         RETURNING id, "type", amount, description, "date", category, account_id, created_at, original_text, source, confirmed`,
-        [type, amount, description || null, date, category || null, account_id || null, original_text || null, source || 'manual', confirmed !== undefined ? confirmed : true, id, user_id]
-      
-      
-      
-      );
-
-     if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Transaction not found or unauthorized for update' });
-      }
-    } else {
-      // If no ID, perform an INSERT
-      result = await pool.query(
-        `INSERT INTO transactions ("type", amount, description, "date", category, account_id, original_text, source, confirmed, user_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, "type", amount, description, "date", category, account_id, created_at, original_text, source, confirmed`,
-        [type, amount, description || null, date, category || null, account_id || null, original_text || null, source || 'manual', confirmed !== undefined ? confirmed : true, user_id] // Added user_id
-      );
-    }
-
-    // Fetch the full transaction with account_name for consistent response
-    const fullTransaction = await pool.query(`
-      SELECT
-        t.id, t.type, t.amount, t.description, t.date, t.category, t.created_at, t.account_id, t.original_text, t.source, t.confirmed, acc.name AS account_name
-      FROM
-        transactions t
-      LEFT JOIN
-        accounts acc ON t.account_id = acc.id
-      WHERE t.id = $1
-    `, [result.rows[0].id]);
-
-    res.json(fullTransaction.rows[0]);
-  } catch (error: unknown) {
-    console.error('DB operation error:', error);
-    res.status(500).json({ detail: 'Failed to perform transaction operation', error: error instanceof Error ? error.message : String(error) });
-  }
-});
 
 /* --- Accounts API --- */
 app.get('/accounts', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
@@ -2797,7 +2761,8 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
     const actualChangeGiven = paymentType === 'Cash' ? Number(change) : null;
     const actualDueDate = paymentType === 'Credit' ? dueDate : null;
 
-    const tellerId = req.user!.parent_user_id;
+    const tellerId = req.user!.user_id; // ✅ actual seller’s user_id
+
     const customerId = customer?.id || null;
     const customerName = customer?.name || null;
 
@@ -2893,7 +2858,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
         // Dynamically fetch the Sales Revenue account ID based on user_id and account code (or category/name)
         const salesRevenueAccountResult = await client.query(
             `SELECT id FROM public.accounts
-             WHERE user_id = $1 AND name = 'Sales Revenue' AND account_type = 'Income';`, // Assuming 'name' and 'account_type' for lookup
+             WHERE user_id = $1 AND name = 'Sales Revenue' AND type = 'Income';`, // Assuming 'name' and 'account_type' for lookup
             [user_id]
         );
 
@@ -5496,8 +5461,8 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
 
   try {
     // ===== Defaults: ALWAYS auto-adjust + small materiality threshold =====
-    const AUTO_ADJUST = true;     // force balancing by default
-    const MATERIALITY = 1;        // treat |diff| <= R1 as zero
+    const AUTO_ADJUST = true;
+    const MATERIALITY = 1;
     type AdjustStrategy = 'depreciation' | 'owners-drawings' | 'suspense';
     const STRATEGY_ORDER: AdjustStrategy[] = ['depreciation', 'owners-drawings', 'suspense'];
 
@@ -5559,7 +5524,37 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
     const profitLossLabel = (amount: number, prefix = '') =>
       (amount >= 0 ? `${prefix}PROFIT` : `${prefix}LOSS`);
 
-    const nearZero = (n: number, tol = MATERIALITY) => Math.abs(n) <= tol ? 0 : n;
+    const nearZero = (n: number, tol = MATERIALITY) =>
+      Math.abs(n) <= tol ? 0 : Number((+n).toFixed(2));
+
+    const norm = (s?: string) => (s || '').trim().toLowerCase();
+
+    type AccRow = {
+      id: string;
+      name: string;
+      type: 'Asset' | 'Liability' | 'Equity';
+      balance: number | string;
+    };
+
+    // merge duplicate account names by summing balances
+    function groupByNameSum(rows: AccRow[]) {
+      const map = new Map<string, { name: string; type: AccRow['type']; balance: number }>();
+      for (const r of rows) {
+        const key = norm(r.name);
+        if (!key) continue;
+        const bal = typeof r.balance === 'number' ? r.balance : parseFloat((r.balance as any) ?? '0');
+        const curr = map.get(key);
+        if (curr) curr.balance += bal;
+        else map.set(key, { name: r.name, type: r.type, balance: bal });
+      }
+      return Array.from(map.values());
+    }
+
+    // filter out accounts we’ll render elsewhere
+    function excludeNames(rows: ReturnType<typeof groupByNameSum>, patterns: string[]) {
+      const pats = patterns.map(norm);
+      return rows.filter(r => !pats.some(p => norm(r.name).includes(p)));
+    }
 
     const postAdjustment = (
       docAny: any,
@@ -5569,11 +5564,10 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
       col2: number,
       colW: number
     ) => {
-      docAny.font('Helvetica-Bold');
-      docAny.text(label, col1, docAny.y);
-      docAny.text(formatCurrencyForPdf(Math.abs(value)), col2, docAny.y, { width: colW, align: 'right' });
-      docAny.moveDown();
-      docAny.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1, docAny.y).lineTo(col2 + colW, docAny.y).stroke();
+      docAny.text(`  ${label}`, col1 + 20, docAny.y);
+      docAny.text(formatCurrencyForPdf(value), col2, docAny.y, { width: colW, align: 'right' });
+      docAny.moveDown(0.5);
+      docAny.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1, docAny.y).lineTo(col2 + colW, docAny.y).stroke();
       docAny.moveDown(0.5);
     };
 
@@ -5582,6 +5576,21 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
     const col2X = 400;
     const columnWidth = 100;
 
+    // ===== Profit/Loss Banner =====
+    const renderPLBanner = (plAmount: number) => {
+      const bannerY = doc.y;
+      doc.roundedRect(50, bannerY, doc.page.width - 100, 22, 6)
+         .strokeColor('#cbd5e0')
+         .lineWidth(0.8)
+         .stroke();
+      doc.font('Helvetica-Bold').fontSize(10).fillColor('#1a202c')
+         .text(`PROFIT/(LOSS) FOR THE PERIOD: ${formatCurrencyForPdf(plAmount)}`, 60, bannerY + 6, {
+           width: doc.page.width - 120, align: 'left'
+         });
+      doc.fillColor('black').moveDown(1.2);
+    };
+
+    // ===== switch for document types =====
     switch (String(documentType)) {
 
       // ============================ INCOME STATEMENT ============================
@@ -5752,325 +5761,490 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
         break;
       }
 
-      // ============================== BALANCE SHEET =============================
-      case 'balance-sheet': {
-        const balanceSheetEndDate = endDate as string;
 
-        const balanceSheetAccountsResult = await pool.query(
-          `
-          SELECT
-            acc.id, acc.name, acc.type,
-            COALESCE(SUM(CASE
-              WHEN acc.type = 'Asset' AND t.type = 'income' THEN t.amount
-              WHEN acc.type = 'Asset' AND t.type = 'expense' THEN -t.amount
-              WHEN acc.type IN ('Liability', 'Equity') AND t.type = 'income' THEN t.amount
-              WHEN acc.type IN ('Liability', 'Equity') AND t.type = 'expense' THEN -t.amount
-              ELSE 0
-            END), 0) AS balance
-          FROM accounts acc
-          LEFT JOIN transactions t ON acc.id = t.account_id AND t.date <= $1
-          WHERE acc.type IN ('Asset', 'Liability', 'Equity')
-          GROUP BY acc.id, acc.name, acc.type
-          ORDER BY acc.type, acc.name;
-          `,
-          [balanceSheetEndDate]
-        );
+// ============================== BALANCE SHEET =============================
+case 'balance-sheet': {
+  const balanceSheetEndDate = endDate as string;
 
-        const allAccounts = balanceSheetAccountsResult.rows;
-        const assetsAccounts   = allAccounts.filter(a => a.type === 'Asset');
-        const liabilityAccounts = allAccounts.filter(a => a.type === 'Liability');
-        const equityAccounts    = allAccounts.filter(a => a.type === 'Equity');
+  // ---------- Core account balances up to end date ----------
+  const balanceSheetAccountsResult = await pool.query(
+    `
+    SELECT
+      acc.id, acc.name, acc.type,
+      COALESCE(SUM(CASE
+        WHEN acc.type = 'Asset' AND t.type = 'income' THEN t.amount
+        WHEN acc.type = 'Asset' AND t.type = 'expense' THEN -t.amount
+        WHEN acc.type IN ('Liability', 'Equity') AND t.type = 'income' THEN t.amount
+        WHEN acc.type IN ('Liability', 'Equity') AND t.type = 'expense' THEN -t.amount
+        ELSE 0
+      END), 0) AS balance
+    FROM accounts acc
+    LEFT JOIN transactions t
+      ON acc.id = t.account_id
+     AND t.date <= $1
+    WHERE acc.type IN ('Asset', 'Liability', 'Equity')
+    GROUP BY acc.id, acc.name, acc.type
+    ORDER BY acc.type, acc.name;
+    `,
+    [balanceSheetEndDate]
+  );
+  const allAccounts = balanceSheetAccountsResult.rows as AccRow[];
 
-        const fixedAssetsResult = await pool.query(`
-          SELECT id, name, cost, accumulated_depreciation
-          FROM assets
-          WHERE date_received <= $1
-          ORDER BY name;
-        `, [balanceSheetEndDate]);
+  // ---------- Deduped lists (and strip special names we render separately) ----------
+  let assetsAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Asset'));
+  let liabilityAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Liability'));
+  let equityAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Equity'));
 
-        let totalFixedAssetsAtCost = 0;
-        let totalAccumulatedDepreciation = 0;
-        const fixedAssetsToDisplay: { name: string; cost: number; accumulated_depreciation: number; net_book_value: number }[] = [];
+  assetsAccounts = excludeNames(assetsAccounts, [
+    'accumulated depreciation' // printed under fixed assets
+  ]);
+  equityAccounts = excludeNames(equityAccounts, [
+    'retained', 'profit', 'drawings', 'owner', 'suspense'
+  ]);
+  liabilityAccounts = excludeNames(liabilityAccounts, ['suspense']);
 
-        fixedAssetsResult.rows.forEach(asset => {
-          const cost = parseFloat(asset.cost);
-          const accumulated_depreciation = parseFloat(asset.accumulated_depreciation);
-          const net_book_value = cost - accumulated_depreciation;
+  // ---------- Fixed assets ----------
+  const fixedAssetsResult = await pool.query(
+    `
+    SELECT id, name, cost, accumulated_depreciation
+    FROM assets
+    WHERE date_received <= $1
+    ORDER BY name;
+    `,
+    [balanceSheetEndDate]
+  );
+  let totalFixedAssetsAtCost = 0;
+  let totalAccumulatedDepreciation = 0;
 
-          totalFixedAssetsAtCost += cost;
-          totalAccumulatedDepreciation += accumulated_depreciation;
+  const fixedAssetsToDisplay: {
+    name: string;
+    cost: number;
+    accumulated_depreciation: number;
+    net_book_value: number;
+  }[] = [];
 
-          fixedAssetsToDisplay.push({
-            name: asset.name,
-            cost,
-            accumulated_depreciation,
-            net_book_value
-          });
-        });
+  for (const asset of fixedAssetsResult.rows) {
+    const cost = parseFloat(asset.cost ?? 0);
+    const accDep = parseFloat(asset.accumulated_depreciation ?? 0);
+    totalFixedAssetsAtCost += cost;
+    totalAccumulatedDepreciation += accDep;
+    fixedAssetsToDisplay.push({
+      name: asset.name,
+      cost,
+      accumulated_depreciation: accDep,
+      net_book_value: cost - accDep
+    });
+  }
 
-        const currentPeriodProfitLossResult = await pool.query(
-          `
-          SELECT
-            COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END), 0) AS retained_earnings
-          FROM transactions t
-          WHERE t.date <= $1;
-          `,
-          [balanceSheetEndDate]
-        );
-        const retainedEarnings = parseFloat(currentPeriodProfitLossResult.rows[0].retained_earnings || 0);
+  // ---------- Profit & Loss breakdown ----------
+  const openingRetainedResult = await pool.query(
+    `
+    SELECT COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END), 0) AS opening_retained
+    FROM transactions t
+    WHERE t.date < $1;
+    `,
+    [startDate]
+  );
+  const openingRetained = parseFloat(openingRetainedResult.rows[0]?.opening_retained ?? 0);
 
-        drawDocumentHeader(
-          doc,
-          companyName,
-          'BALANCE SHEET',
-          `AS OF ${new Date(balanceSheetEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
-        );
+  const periodPLResult = await pool.query(
+    `
+    SELECT COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END), 0) AS period_pl
+    FROM transactions t
+    WHERE t.date >= $1 AND t.date <= $2;
+    `,
+    [startDate, endDate]
+  );
+  const periodPL = parseFloat(periodPLResult.rows[0]?.period_pl ?? 0);
 
-        // ===== ASSETS =====
-        doc.font('Helvetica-Bold').fontSize(12).text('ASSETS', col1X, doc.y);
-        doc.moveDown(0.5);
-        doc.font('Helvetica');
+  const retainedToDate = openingRetained + periodPL;
 
-        // Non-current Assets
-        doc.font('Helvetica-Bold').text('Non-current Assets', col1X, doc.y);
-        doc.moveDown(0.5);
+  // ---------- Header ----------
+  drawDocumentHeader(
+    doc,
+    companyName,
+    'BALANCE SHEET',
+    `AS OF ${new Date(balanceSheetEndDate).toLocaleDateString('en-GB', {
+      day: '2-digit',
+      month: 'long',
+      year: 'numeric'
+    })}`
+  );
 
-        if (fixedAssetsToDisplay.length > 0) {
-          doc.text('  Fixed Assets at Cost:', col1X + 20, doc.y);
-          doc.text(formatCurrencyForPdf(totalFixedAssetsAtCost), col2X, doc.y, { width: columnWidth, align: 'right' });
-          doc.moveDown(0.5);
+  // =================== ASSETS ===================
+  doc.font('Helvetica-Bold').fontSize(12).text('ASSETS', col1X, doc.y);
+  doc.moveDown(0.5);
+  doc.font('Helvetica');
 
-          doc.text('  Less: Accumulated Depreciation', col1X + 20, doc.y);
-          doc.text(formatCurrencyForPdf(totalAccumulatedDepreciation), col2X, doc.y, { width: columnWidth, align: 'right' });
-          doc.moveDown(0.5);
-          doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-          doc.moveDown(0.5);
+  // Non-current Assets
+  doc.font('Helvetica-Bold').text('Non-current Assets', col1X, doc.y);
+  doc.moveDown(0.5);
 
-          doc.font('Helvetica-Bold');
-          doc.text('Net Book Value of Fixed Assets', col1X + 20, doc.y);
-          doc.text(formatCurrencyForPdf(totalFixedAssetsAtCost - totalAccumulatedDepreciation), col2X, doc.y, { width: columnWidth, align: 'right' });
-          doc.moveDown();
-          doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-          doc.moveDown(0.5);
-          doc.font('Helvetica');
-        } else {
-          doc.text('  No Fixed Assets to display.', col1X + 20, doc.y);
-          doc.moveDown(1);
-        }
+  if (fixedAssetsToDisplay.length > 0) {
+    doc.text('  Fixed Assets at Cost:', col1X + 20, doc.y);
+    doc.text(formatCurrencyForPdf(totalFixedAssetsAtCost), col2X, doc.y, {
+      width: columnWidth,
+      align: 'right'
+    });
+    doc.moveDown(0.5);
 
-        // Total Non-current Assets
-        doc.font('Helvetica-Bold');
-        const totalNonCurrentAssets = (totalFixedAssetsAtCost - totalAccumulatedDepreciation);
-        doc.text('Total Non-current Assets', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalNonCurrentAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.font('Helvetica');
+    doc.text('  Less: Accumulated Depreciation', col1X + 20, doc.y);
+    doc.text(formatCurrencyForPdf(totalAccumulatedDepreciation), col2X, doc.y, {
+      width: columnWidth,
+      align: 'right'
+    });
+    doc.moveDown(0.5);
+    doc
+      .lineWidth(0.2)
+      .strokeColor('#e2e8f0')
+      .moveTo(col1X, doc.y)
+      .lineTo(col2X + columnWidth, doc.y)
+      .stroke();
+    doc.moveDown(0.5);
 
-        // Current Assets
-        doc.font('Helvetica-Bold').text('Current Assets', col1X, doc.y);
-        doc.moveDown(0.5);
-        let totalCurrentAssets = 0;
-        assetsAccounts
-          .filter(a => a.name?.toLowerCase().includes('bank')
-                    || a.name?.toLowerCase().includes('cash')
-                    || a.name?.toLowerCase().includes('receivable'))
-          .forEach(asset => {
-            const bal = parseFloat(asset.balance);
-            doc.text(`  ${asset.name}`, col1X + 20, doc.y);
-            doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
-            totalCurrentAssets += bal;
-            doc.moveDown(0.5);
-            doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-            doc.moveDown(0.5);
-          });
+    doc.font('Helvetica-Bold');
+    const netFA = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
+    doc.text('Net Book Value of Fixed Assets', col1X + 20, doc.y);
+    doc.text(formatCurrencyForPdf(netFA), col2X, doc.y, {
+      width: columnWidth,
+      align: 'right'
+    });
+    doc.moveDown();
+    doc
+      .lineWidth(0.5)
+      .strokeColor('#a0aec0')
+      .moveTo(col1X, doc.y)
+      .lineTo(col2X + columnWidth, doc.y)
+      .stroke();
+    doc.moveDown(0.5);
+    doc.font('Helvetica');
+  } else {
+    doc.text('  No Fixed Assets to display.', col1X + 20, doc.y);
+    doc.moveDown(1);
+  }
 
-        doc.font('Helvetica-Bold');
-        doc.text('Total Current Assets', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalCurrentAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
+  // Total Non-current Assets
+  const totalNonCurrentAssets = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
+  doc.font('Helvetica-Bold').text('Total Non-current Assets', col1X, doc.y);
+  doc.text(formatCurrencyForPdf(totalNonCurrentAssets), col2X, doc.y, {
+    width: columnWidth,
+    align: 'right'
+  });
+  doc.moveDown();
+  doc
+    .lineWidth(0.5)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown(0.5);
+  doc.font('Helvetica');
 
-        // Total Assets
-        doc.font('Helvetica-Bold').fontSize(12);
-        const totalAssets = totalNonCurrentAssets + totalCurrentAssets;
-        doc.text('Total Assets', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown(2);
-        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown();
+  // Current Assets
+  doc.font('Helvetica-Bold').text('Current Assets', col1X, doc.y);
+  doc.moveDown(0.5);
 
-        // ===== EQUITY AND LIABILITIES =====
-        doc.font('Helvetica-Bold').fontSize(12).text('EQUITY AND LIABILITIES', col1X, doc.y);
-        doc.moveDown(0.5);
-        doc.font('Helvetica');
+  let totalCurrentAssets = 0;
+  assetsAccounts
+    .filter(
+      a =>
+        norm(a.name).includes('bank') ||
+        norm(a.name).includes('cash') ||
+        norm(a.name).includes('receivable')
+    )
+    .forEach(asset => {
+      const bal = +asset.balance;
+      doc.text(`  ${asset.name}`, col1X + 20, doc.y);
+      doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
+      totalCurrentAssets += bal;
+      doc.moveDown(0.5);
+      doc
+        .lineWidth(0.2)
+        .strokeColor('#e2e8f0')
+        .moveTo(col1X, doc.y)
+        .lineTo(col2X + columnWidth, doc.y)
+        .stroke();
+      doc.moveDown(0.5);
+    });
 
-        // Capital & Reserves
-        doc.font('Helvetica-Bold').text('Capital and Reserves', col1X, doc.y);
-        doc.moveDown(0.5);
-        let totalEquityAccountsBalance = 0;
-        equityAccounts.forEach(eq => {
-          const bal = parseFloat(eq.balance);
-          doc.text(`  ${eq.name}`, col1X + 20, doc.y);
-          doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
-          totalEquityAccountsBalance += bal;
-          doc.moveDown(0.5);
-          doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-          doc.moveDown(0.5);
-        });
+  doc.font('Helvetica-Bold').text('Total Current Assets', col1X, doc.y);
+  doc.text(formatCurrencyForPdf(totalCurrentAssets), col2X, doc.y, {
+    width: columnWidth,
+    align: 'right'
+  });
+  doc.moveDown();
+  doc
+    .lineWidth(0.5)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown(0.5);
 
-        // Retained Earnings
-        doc.text(`  Retained Earnings`, col1X + 20, doc.y);
-        doc.text(formatCurrencyForPdf(retainedEarnings), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown(0.5);
-        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
+  // Total Assets
+  let totalAssets = totalNonCurrentAssets + totalCurrentAssets;
+  doc.font('Helvetica-Bold').fontSize(12).text('Total Assets', col1X, doc.y);
+  doc.text(formatCurrencyForPdf(totalAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
+  doc.moveDown(2);
+  doc
+    .lineWidth(1)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown(0.5);
+  doc
+    .lineWidth(1)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown();
 
-        doc.font('Helvetica-Bold');
-        const totalEquity = totalEquityAccountsBalance + retainedEarnings;
-        doc.text('Total Equity', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.font('Helvetica');
+  // =================== EQUITY AND LIABILITIES ===================
+  doc.font('Helvetica-Bold').fontSize(12).text('EQUITY AND LIABILITIES', col1X, doc.y);
+  doc.moveDown(0.5);
+  doc.font('Helvetica');
 
-        // Non-current Liabilities
-        doc.font('Helvetica-Bold').text('Non-Current Liabilities', col1X, doc.y);
-        doc.moveDown(0.5);
-        let totalNonCurrentLiabilities = 0;
-        liabilityAccounts
-          .filter(a => a.name?.toLowerCase().includes('loan') || a.name?.toLowerCase().includes('long-term'))
-          .forEach(lib => {
-            const bal = parseFloat(lib.balance);
-            doc.text(`  ${lib.name}`, col1X + 20, doc.y);
-            doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
-            totalNonCurrentLiabilities += bal;
-            doc.moveDown(0.5);
-            doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-            doc.moveDown(0.5);
-          });
+  // Capital & Reserves
+  doc.font('Helvetica-Bold').text('Capital and Reserves', col1X, doc.y);
+  doc.moveDown(0.5);
 
-        doc.font('Helvetica-Bold');
-        doc.text('Total Non-Current Liabilities', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalNonCurrentLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.font('Helvetica');
+  let totalEquityAccountsBalance = 0;
+  equityAccounts.forEach(eq => {
+    const bal = +eq.balance;
+    doc.text(`  ${eq.name}`, col1X + 20, doc.y);
+    doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
+    totalEquityAccountsBalance += bal;
+    doc.moveDown(0.5);
+    doc
+      .lineWidth(0.2)
+      .strokeColor('#e2e8f0')
+      .moveTo(col1X, doc.y)
+      .lineTo(col2X + columnWidth, doc.y)
+      .stroke();
+    doc.moveDown(0.5);
+  });
 
-        // Current Liabilities
-        doc.font('Helvetica-Bold').text('Current Liabilities', col1X, doc.y);
-        doc.moveDown(0.5);
-        let totalCurrentLiabilities = 0;
-        liabilityAccounts
-          .filter(a => a.name?.toLowerCase().includes('payable')
-                    || a.name?.toLowerCase().includes('current liability')
-                    || a.name?.toLowerCase().includes('credit facility'))
-          .forEach(lib => {
-            const bal = parseFloat(lib.balance);
-            doc.text(`  ${lib.name}`, col1X + 20, doc.y);
-            doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
-            totalCurrentLiabilities += bal;
-            doc.moveDown(0.5);
-            doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-            doc.moveDown(0.5);
-          });
+  // ------- Retained Earnings: Opening + Current Period P/L (inside equity) -------
+  const plIsProfit = periodPL >= 0;
+  const plLineLabel = plIsProfit ? 'Add: Net Profit for the period' : 'Less: Net Loss for the period';
 
-        doc.font('Helvetica-Bold');
-        doc.text('Total Current Liabilities', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalCurrentLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
+  // Opening retained
+  postAdjustment(doc, 'Opening Retained Earnings', openingRetained, col1X, col2X, columnWidth);
+  // Current period P/L (signed)
+ postAdjustment(doc, plLineLabel, Math.abs(periodPL) * (plIsProfit ? 1 : -1), col1X, col2X, columnWidth);
 
-        // ===== Balancing (ALWAYS) with cascading strategies =====
-        doc.font('Helvetica-Bold').fontSize(12);
-        let totalEquityAndLiabilities = totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
+  // Retained to date (bold)
+  doc.font('Helvetica-Bold');
+  doc.text('Retained Earnings (to date)', col1X, doc.y);
+  doc.text(formatCurrencyForPdf(retainedToDate), col2X, doc.y, { width: columnWidth, align: 'right' });
+  doc.moveDown();
+  doc
+    .lineWidth(0.5)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown(0.5);
+  doc.font('Helvetica');
 
-        let rawDiff = totalAssets - totalEquityAndLiabilities;
-        let balanceDifference = nearZero(rawDiff);
+  // Total Equity = Capital & Reserves + Retained to date
+  doc.font('Helvetica-Bold');
+  let totalEquity = totalEquityAccountsBalance + retainedToDate;
+  doc.text('Total Equity', col1X, doc.y);
+  doc.text(formatCurrencyForPdf(totalEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
+  doc.moveDown();
+  doc
+    .lineWidth(0.5)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown(0.5);
+  doc.font('Helvetica');
 
-        const adjustmentsApplied: string[] = [];
+  // Non-current Liabilities
+  doc.font('Helvetica-Bold').text('Non-Current Liabilities', col1X, doc.y);
+  doc.moveDown(0.5);
 
-        if (balanceDifference !== 0 && AUTO_ADJUST) {
-          let remaining = balanceDifference;
+  let totalNonCurrentLiabilities = 0;
+  liabilityAccounts
+    .filter(a => norm(a.name).includes('loan') || norm(a.name).includes('long-term'))
+    .forEach(lib => {
+      const bal = +lib.balance;
+      doc.text(`  ${lib.name}`, col1X + 20, doc.y);
+      doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
+      totalNonCurrentLiabilities += bal;
+      doc.moveDown(0.5);
+      doc
+        .lineWidth(0.2)
+        .strokeColor('#e2e8f0')
+        .moveTo(col1X, doc.y)
+        .lineTo(col2X + columnWidth, doc.y)
+        .stroke();
+      doc.moveDown(0.5);
+    });
 
-          for (const strategy of STRATEGY_ORDER) {
-            if (nearZero(remaining) === 0) break;
+  doc.font('Helvetica-Bold').text('Total Non-Current Liabilities', col1X, doc.y);
+  doc.text(formatCurrencyForPdf(totalNonCurrentLiabilities), col2X, doc.y, {
+    width: columnWidth,
+    align: 'right'
+  });
+  doc.moveDown();
+  doc
+    .lineWidth(0.5)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown(0.5);
+  doc.font('Helvetica');
 
-            if (strategy === 'depreciation') {
-              // Only useful when Assets > E+L (positive diff)
-              if (remaining > 0) {
-                const room = Math.max(0, (totalFixedAssetsAtCost - totalAccumulatedDepreciation));
-                const depAdj = nearZero(Math.min(remaining, room));
-                if (depAdj !== 0) {
-                  // show inside non-current assets block
-                  doc.text('  Additional Accumulated Depreciation (balancing)', col1X + 20, doc.y);
-                  doc.text(formatCurrencyForPdf(depAdj), col2X, doc.y, { width: columnWidth, align: 'right' });
-                  doc.moveDown(0.5);
-                  doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-                  doc.moveDown(0.5);
+  // Current Liabilities
+  doc.font('Helvetica-Bold').text('Current Liabilities', col1X, doc.y);
+  doc.moveDown(0.5);
 
-                  totalAccumulatedDepreciation += depAdj;
+  let totalCurrentLiabilities = 0;
+  liabilityAccounts
+    .filter(
+      a =>
+        norm(a.name).includes('payable') ||
+        norm(a.name).includes('current liability') ||
+        norm(a.name).includes('credit facility')
+    )
+    .forEach(lib => {
+      const bal = +lib.balance;
+      doc.text(`  ${lib.name}`, col1X + 20, doc.y);
+      doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
+      totalCurrentLiabilities += bal;
+      doc.moveDown(0.5);
+      doc
+        .lineWidth(0.2)
+        .strokeColor('#e2e8f0')
+        .moveTo(col1X, doc.y)
+        .lineTo(col2X + columnWidth, doc.y)
+        .stroke();
+      doc.moveDown(0.5);
+    });
 
-                  // recompute assets
-                  const newNonCurrent = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
-                  const newTotalAssets = newNonCurrent + totalCurrentAssets;
-                  totalEquityAndLiabilities = totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
+  doc.font('Helvetica-Bold').text('Total Current Liabilities', col1X, doc.y);
+  doc.text(formatCurrencyForPdf(totalCurrentLiabilities), col2X, doc.y, {
+    width: columnWidth,
+    align: 'right'
+  });
+  doc.moveDown();
+  doc
+    .lineWidth(0.5)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown(0.5);
 
-                  remaining = nearZero(newTotalAssets - totalEquityAndLiabilities);
-                  adjustmentsApplied.push(`Extra Depreciation: ${formatCurrencyForPdf(depAdj)}`);
-                }
-              }
-            }
+  // =================== Auto‑balancing (optional) ===================
+  doc.font('Helvetica-Bold').fontSize(12);
 
-            if (strategy === 'owners-drawings' && nearZero(remaining) !== 0) {
-              postAdjustment(doc, "Owner's Drawings (balancing)", remaining, col1X, col2X, columnWidth);
-              totalEquityAndLiabilities += remaining;
-              adjustmentsApplied.push(`Owner's Drawings: ${formatCurrencyForPdf(remaining)}`);
-              remaining = 0;
-            }
+  let totalEquityAndLiabilities =
+    totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
 
-            if (strategy === 'suspense' && nearZero(remaining) !== 0) {
-              postAdjustment(doc, 'Suspense / Unreconciled Difference', remaining, col1X, col2X, columnWidth);
-              totalEquityAndLiabilities += remaining;
-              adjustmentsApplied.push(`Suspense: ${formatCurrencyForPdf(remaining)}`);
-              remaining = 0;
-            }
+  let balanceDifference = nearZero(totalAssets - totalEquityAndLiabilities);
+  const adjustmentsApplied: string[] = [];
+
+  if (balanceDifference !== 0 && AUTO_ADJUST) {
+    let remaining = balanceDifference;
+
+    for (const strategy of STRATEGY_ORDER) {
+      if (nearZero(remaining) === 0) break;
+
+      if (strategy === 'depreciation') {
+        // Only makes sense if Assets > E+L: reduce assets via extra accumulated depreciation
+        if (remaining > 0) {
+          const room = Math.max(0, totalFixedAssetsAtCost - totalAccumulatedDepreciation);
+          const depAdj = nearZero(Math.min(remaining, room));
+          if (depAdj !== 0) {
+            postAdjustment(doc, 'Additional Accumulated Depreciation (balancing)', depAdj, col1X, col2X, columnWidth);
+            totalAccumulatedDepreciation += depAdj;
+
+            // recompute totals
+            const newNonCurrent = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
+            totalAssets = newNonCurrent + totalCurrentAssets;
+            totalEquityAndLiabilities = totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
+            remaining = nearZero(totalAssets - totalEquityAndLiabilities);
+
+            adjustmentsApplied.push(`Extra Depreciation: ${formatCurrencyForPdf(depAdj)}`);
           }
         }
-
-        // Totals line
-        doc.text('Total Equity and Liabilities', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalEquityAndLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown(2);
-        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown();
-
-        // If we applied any balancing plugs, show a small red note for transparency
-        if (adjustmentsApplied.length) {
-          doc.fontSize(8).fillColor('red').text(
-            `Auto-balancing applied for presentation: ${adjustmentsApplied.join(' | ')}`,
-            { align: 'center', width: doc.page.width - 100 }
-          );
-          doc.fillColor('black').moveDown();
-        }
-
-        doc.fontSize(8).fillColor('#4a5568').text(
-          `Statement Period: ${new Date(startDate as string).toLocaleDateString('en-GB')} to ${new Date(endDate as string).toLocaleDateString('en-GB')}`,
-          { align: 'center' }
-        );
-        doc.fillColor('black');
-        doc.moveDown();
-        break;
       }
+
+      if (strategy === 'owners-drawings' && nearZero(remaining) !== 0) {
+        // Show once on the equity side as a balancing line
+        postAdjustment(doc, "Owner's Drawings (balancing)", remaining, col1X, col2X, columnWidth);
+        totalEquityAndLiabilities += remaining;
+        adjustmentsApplied.push(`Owner's Drawings: ${formatCurrencyForPdf(remaining)}`);
+        remaining = 0;
+      }
+
+      if (strategy === 'suspense' && nearZero(remaining) !== 0) {
+        // Last resort plug
+        postAdjustment(doc, 'Suspense / Unreconciled Difference', remaining, col1X, col2X, columnWidth);
+        totalEquityAndLiabilities += remaining;
+        adjustmentsApplied.push(`Suspense: ${formatCurrencyForPdf(remaining)}`);
+        remaining = 0;
+      }
+    }
+  }
+
+  // Totals line
+  doc.text('Total Equity and Liabilities', col1X, doc.y);
+  doc.text(formatCurrencyForPdf(totalEquityAndLiabilities), col2X, doc.y, {
+    width: columnWidth,
+    align: 'right'
+  });
+  doc.moveDown(2);
+  doc
+    .lineWidth(1)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown(0.5);
+  doc
+    .lineWidth(1)
+    .strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y)
+    .lineTo(col2X + columnWidth, doc.y)
+    .stroke();
+  doc.moveDown();
+
+  if (adjustmentsApplied.length) {
+    doc
+      .fontSize(8)
+      .fillColor('red')
+      .text(
+        `Auto-balancing applied for presentation: ${adjustmentsApplied.join(' | ')}`,
+        { align: 'center', width: doc.page.width - 100 }
+      );
+    doc.fillColor('black').moveDown();
+  }
+
+  doc
+    .fontSize(8)
+    .fillColor('#4a5568')
+    .text(
+      `Statement Period: ${new Date(startDate as string).toLocaleDateString('en-GB')} to ${new Date(
+        endDate as string
+      ).toLocaleDateString('en-GB')}`,
+      { align: 'center' }
+    );
+  doc.fillColor('black');
+  doc.moveDown();
+
+  break;
+}
+
+
+
 
       // ============================== TRIAL BALANCE =============================
 // ============================== TRIAL BALANCE =============================
@@ -6169,7 +6343,7 @@ case 'trial-balance': {
     companyName,
     'TRIAL BALANCE',
     `AS OF ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB')}`,
-    'Auto-balancing (presentation) applied: Profit/Loss line plus reclassification pairs (net-zero).'
+    
   );
 
   // === Multi-item "cascade" as net‑zero reclass pairs (does NOT change totals) ===
@@ -6183,19 +6357,19 @@ case 'trial-balance': {
 
     if (isProfit) {
       return [
-        { debitName: 'Additional Depreciation (presentation reclass)', creditName: 'Accumulated Depreciation (reclass)', amount: amts[0] },
+        { debitName: 'Additional Depreciation ', creditName: 'Accumulated Depreciation ', amount: amts[0] },
         { debitName: 'Expense Reclassification',                       creditName: 'Accrued Expenses',                       amount: amts[1] },
-        { debitName: 'Prepaid Expense Adjustment',                      creditName: 'Deferred Income (reclass)',             amount: amts[2] },
-        { debitName: "Owner's Drawings (presentation reclass)",         creditName: "Owner's Equity (reclass)",              amount: amts[3] },
+        { debitName: 'Prepaid Expense Adjustment',                      creditName: 'Deferred Income ',             amount: amts[2] },
+        { debitName: "Owner's Drawings ",         creditName: "Owner's Equity ",              amount: amts[3] },
         { debitName: 'Rounding / Presentation',                         creditName: 'Rounding / Presentation',               amount: amts[4] },
       ];
     } else {
       return [
-        { debitName: 'Income Reclassification (presentation)',          creditName: 'Other Income (reclass)',                amount: amts[0] },
-        { debitName: 'Inventory Revaluation (reclass)',                 creditName: 'Cost of Sales Reclass',                 amount: amts[1] },
-        { debitName: 'Accrued Income (reclass)',                        creditName: 'Deferred Expense Reversal',             amount: amts[2] },
+        { debitName: 'Income Reclassification ',          creditName: 'Other Income ',                amount: amts[0] },
+        { debitName: 'Inventory Revaluation ',                 creditName: 'Cost of Sales ',                 amount: amts[1] },
+        { debitName: 'Accrued Income ',                        creditName: 'Deferred Expense Reversal',             amount: amts[2] },
         { debitName: 'Rounding / Presentation',                         creditName: 'Rounding / Presentation',               amount: amts[3] },
-        { debitName: "Owner's Equity (reclass)",                        creditName: "Owner's Capital (presentation)",        amount: amts[4] },
+        { debitName: "Owner's Equity ",                        creditName: "Owner's Capital ",        amount: amts[4] },
       ];
     }
   };
@@ -7051,6 +7225,296 @@ app.get('/api/charts/payroll-distribution', authMiddleware, async (req, res) => 
     res.status(500).json({ error: 'Failed to fetch payroll chart' });
   }
 });
+
+// helpers/scope.ts
+export const getTenantId = (req: any) =>
+  req.user?.parent_user_id ?? req.user?.user_id;
+
+// GET /api/tellers
+// GET /api/tellers?date=YYYY-MM-DD
+app.get('/api/tellers', authMiddleware, async (req, res) => {
+  try {
+    const tenantId = req.user?.parent_user_id ?? req.user?.user_id;
+    const qDate = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const date =
+      qDate && /^\d{4}-\d{2}-\d{2}$/.test(qDate) ? qDate : new Date().toISOString().slice(0, 10);
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        u.user_id AS id,
+        u.name,
+        u.email,
+        u.phone,
+        u.position,
+        COALESCE(u.company, u.address, '') AS branch
+      FROM public.users u
+      JOIN (
+        SELECT DISTINCT teller_id
+        FROM public.sales
+        WHERE user_id = $1
+          AND teller_id IS NOT NULL
+          AND ((created_at AT TIME ZONE 'Africa/Johannesburg')::date) = $2::date
+      ) s ON s.teller_id = u.user_id
+      WHERE u.parent_user_id = $1
+      ORDER BY u.name ASC
+      `,
+      [tenantId, date]
+    );
+
+    res.json(rows.map(r => ({ ...r, userRole: 'teller' }))); // shape the FE expects
+  } catch (e) {
+    console.error('GET /api/tellers error', e);
+    res.status(500).json({ error: 'Failed to load tellers' });
+  }
+});
+
+
+// GET /api/reconciliation/expected?date=YYYY-MM-DD
+app.get('/api/reconciliation/expected', authMiddleware, async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const qDate = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const date =
+      qDate && /^\d{4}-\d{2}-\d{2}$/.test(qDate) ? qDate : new Date().toISOString().slice(0, 10);
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        s.teller_id,
+        COALESCE(SUM(
+          CASE
+            WHEN s.payment_type = 'Cash'
+            THEN COALESCE(s.amount_paid, 0) - COALESCE(s.change_given, 0)
+            ELSE 0
+          END
+        ), 0) AS cash,
+        COALESCE(SUM(
+          CASE
+            WHEN s.payment_type = 'Bank'
+            THEN COALESCE(s.amount_paid, 0)
+            ELSE 0
+          END
+        ), 0) AS bank,
+        COALESCE(SUM(
+          CASE
+            WHEN s.payment_type = 'Credit'
+            THEN COALESCE(s.credit_amount, 0)
+            ELSE 0
+          END
+        ), 0) AS credit
+      FROM public.sales s
+      WHERE s.user_id = $1
+        AND ((s.created_at AT TIME ZONE 'Africa/Johannesburg')::date) = $2::date
+      GROUP BY s.teller_id
+      `,
+      [tenantId, date]
+    );
+
+    const map: Record<string, { cash: number; bank: number; credit: number }> = {};
+    for (const r of rows) {
+      map[String(r.teller_id)] = {
+        cash: Number(r.cash || 0),
+        bank: Number(r.bank || 0),
+        credit: Number(r.credit || 0),
+      };
+    }
+    res.json(map);
+  } catch (e) {
+    console.error('GET /api/reconciliation/expected error', e);
+    res.status(500).json({ error: 'Failed to compute expected totals' });
+  }
+});
+
+// POST /api/reconciliation/submit
+app.post('/api/reconciliation/submit', authMiddleware, async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const recordedBy = req.user!.user_id;
+
+    const { tellerId, expectedCash, countedCash, variance, notes, date } = req.body;
+    if (tellerId == null || expectedCash == null || countedCash == null || variance == null) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const reconDate =
+      typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)
+        ? date
+        : new Date().toISOString().slice(0, 10);
+
+    const { rows } = await pool.query(
+      `
+      INSERT INTO cash_reconciliations
+        (user_id, teller_user_id, expected_cash, counted_cash, variance, notes, recorded_by, recon_date)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT ON CONSTRAINT uq_cash_recon_user_teller_day DO NOTHING
+      RETURNING id, user_id, teller_user_id, expected_cash, counted_cash, variance, notes, recorded_by, recon_date, created_at
+      `,
+      [tenantId, tellerId, expectedCash, countedCash, variance, notes || null, recordedBy, reconDate]
+    );
+
+    if (!rows.length) {
+      return res.status(409).json({ error: 'Reconciliation already recorded for this teller and date' });
+    }
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('POST /api/reconciliation/submit error', e);
+    res.status(500).json({ error: 'Failed to submit reconciliation' });
+  }
+});
+
+
+
+// ===== Teller record APIs =====
+app.get('/api/reconciliation/history', authMiddleware, async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const tellerId = String(req.query.tellerId || '');
+    const from = String(req.query.from || '');
+    const to   = String(req.query.to || '');
+    if (!tellerId || !from || !to) {
+      return res.status(400).json({ error: 'tellerId, from, to are required' });
+    }
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        recon_date AS day,
+        expected_cash,
+        counted_cash,
+        variance,
+        notes,
+        recorded_by,
+        created_at
+      FROM public.cash_reconciliations
+      WHERE user_id = $1
+        AND teller_user_id = $2
+        AND recon_date BETWEEN $3::date AND $4::date
+      ORDER BY recon_date DESC
+      `,
+      [tenantId, tellerId, from, to]
+    );
+
+    res.json({ rows });
+  } catch (e) {
+    console.error('GET /api/reconciliation/history error', e);
+    res.status(500).json({ error: 'Failed to load history' });
+  }
+});
+
+app.get('/api/reconciliation/missed-days', authMiddleware, async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const tellerId = String(req.query.tellerId || '');
+    const from = String(req.query.from || '');
+    const to   = String(req.query.to || '');
+    if (!tellerId || !from || !to) {
+      return res.status(400).json({ error: 'tellerId, from, to are required' });
+    }
+
+    // Days with cash sales but NO reconciliation
+    const { rows } = await pool.query(
+      `
+      WITH days AS (
+        SELECT d::date AS day
+        FROM generate_series($3::date, $4::date, interval '1 day') AS d
+      ),
+      daily_sales AS (
+        SELECT
+          (s.created_at AT TIME ZONE 'Africa/Johannesburg')::date AS day,
+          SUM(CASE WHEN s.payment_type = 'Cash'
+                   THEN COALESCE(s.amount_paid,0) - COALESCE(s.change_given,0)
+                   ELSE 0 END) AS cash,
+          SUM(CASE WHEN s.payment_type = 'Bank' THEN COALESCE(s.amount_paid,0) ELSE 0 END) AS bank,
+          SUM(CASE WHEN s.payment_type = 'Credit' THEN COALESCE(s.credit_amount,0) ELSE 0 END) AS credit
+        FROM public.sales s
+        WHERE s.user_id = $1
+          AND s.teller_id = $2
+          AND (s.created_at AT TIME ZONE 'Africa/Johannesburg')::date BETWEEN $3::date AND $4::date
+        GROUP BY 1
+      )
+      SELECT
+        d.day,
+        COALESCE(ds.cash, 0)   AS cash,
+        COALESCE(ds.bank, 0)   AS bank,
+        COALESCE(ds.credit, 0) AS credit
+      FROM days d
+      LEFT JOIN daily_sales ds ON ds.day = d.day
+      WHERE COALESCE(ds.cash,0) > 0  -- had cash sales
+        AND NOT EXISTS (
+          SELECT 1 FROM public.cash_reconciliations cr
+          WHERE cr.user_id = $1
+            AND cr.teller_user_id = $2
+            AND cr.recon_date = d.day
+        )
+      ORDER BY d.day DESC
+      `,
+      [tenantId, tellerId, from, to]
+    );
+
+    res.json({ rows });
+  } catch (e) {
+    console.error('GET /api/reconciliation/missed-days error', e);
+    res.status(500).json({ error: 'Failed to load missed days' });
+  }
+});
+
+app.get('/api/reconciliation/short-days', authMiddleware, async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const tellerId = String(req.query.tellerId || '');
+    const from = String(req.query.from || '');
+    const to   = String(req.query.to || '');
+    if (!tellerId || !from || !to) {
+      return res.status(400).json({ error: 'tellerId, from, to are required' });
+    }
+
+    // Rows where variance < 0 (short)
+    const rowsQ = pool.query(
+      `
+      SELECT
+        recon_date AS day,
+        expected_cash,
+        counted_cash,
+        variance,
+        notes
+      FROM public.cash_reconciliations
+      WHERE user_id = $1
+        AND teller_user_id = $2
+        AND recon_date BETWEEN $3::date AND $4::date
+        AND variance < 0
+      ORDER BY recon_date DESC
+      `,
+      [tenantId, tellerId, from, to]
+    );
+
+    // Totals for the tab header (return shortage as positive)
+    const totalsQ = pool.query(
+      `
+      SELECT
+        COUNT(*)::int                                       AS days,
+        COALESCE(SUM(expected_cash), 0)::numeric(12,2)      AS total_expected,
+        COALESCE(SUM(counted_cash), 0)::numeric(12,2)       AS total_counted,
+        COALESCE(SUM(-variance), 0)::numeric(12,2)          AS total_shortage
+      FROM public.cash_reconciliations
+      WHERE user_id = $1
+        AND teller_user_id = $2
+        AND recon_date BETWEEN $3::date AND $4::date
+        AND variance < 0
+      `,
+      [tenantId, tellerId, from, to]
+    );
+
+    const [rowsRes, totalsRes] = await Promise.all([rowsQ, totalsQ]);
+    res.json({ rows: rowsRes.rows, totals: totalsRes.rows[0] });
+  } catch (e) {
+    console.error('GET /api/reconciliation/short-days error', e);
+    res.status(500).json({ error: 'Failed to load short days' });
+  }
+});
+
+
 
 
 app.listen(PORT, () => {
