@@ -5442,1148 +5442,1005 @@ app.delete('/api/projects/:id', authMiddleware, async (req: Request, res: Respon
     }
 });
 
-/* --- Financial Document Generation API (auto-balanced) --- */
+/* --- Financial Document Generation API (dual: JSON or PDF) --- */
 app.get('/generate-financial-document', async (req: Request, res: Response) => {
-  const { documentType, startDate, endDate } = req.query;
+  const { documentType, startDate, endDate, format } = req.query as {
+    documentType?: string;
+    startDate?: string;
+    endDate?: string;
+    format?: string; // 'json' to return data
+  };
 
   if (!documentType || !startDate || !endDate) {
     return res.status(400).json({ error: 'documentType, startDate, and endDate are required.' });
   }
 
-  // PDF headers
-  res.writeHead(200, {
-    'Content-Type': 'application/pdf',
-    'Content-Disposition': `attachment; filename="${documentType}-${startDate}-to-${endDate}.pdf"`
-  });
+  const wantJson = String(format || '').toLowerCase() === 'json';
 
-  const doc = new PDFDocument();
-  doc.pipe(res);
+  // ====== constants & helpers shared by JSON + PDF renderers ======
+  const AUTO_ADJUST = true;
+  const MATERIALITY = 1;
+  type AdjustStrategy = 'depreciation' | 'owners-drawings' | 'suspense';
+  const STRATEGY_ORDER: AdjustStrategy[] = ['depreciation', 'owners-drawings', 'suspense'];
 
+  const nearZero = (n: number, tol = MATERIALITY) => Math.abs(n) <= tol ? 0 : Number((+n).toFixed(2));
+  const norm = (s?: string) => (s || '').trim().toLowerCase();
+
+  const formatCurrencyForPdf = (amount: number | null | undefined): string => {
+    if (amount === null || amount === undefined || amount === 0) return '-';
+    return parseFloat(amount.toString()).toLocaleString('en-ZA', { style: 'currency', currency: 'ZAR', minimumFractionDigits: 2 });
+  };
+
+  let companyName = 'MADE BY QUANTILYTIX';
   try {
-    // ===== Defaults: ALWAYS auto-adjust + small materiality threshold =====
-    const AUTO_ADJUST = true;
-    const MATERIALITY = 1;
-    type AdjustStrategy = 'depreciation' | 'owners-drawings' | 'suspense';
-    const STRATEGY_ORDER: AdjustStrategy[] = ['depreciation', 'owners-drawings', 'suspense'];
+    const userId = (req as any).user?.user_id;
+    if (userId) {
+      const r = await pool.query('SELECT company FROM public.users WHERE user_id = $1;', [userId]);
+      if (r.rows[0]?.company) companyName = r.rows[0].company;
+    }
+  } catch (e) {
+    console.warn('Company name lookup failed, using default.');
+  }
 
-    // ===== Company name lookup =====
-    let companyName = 'MADE BY QUANTILYTIX';
-    const userId = req.user?.user_id;
+  type AccRow = { id: string; name: string; type: 'Asset' | 'Liability' | 'Equity'; balance: number | string; };
+  function groupByNameSum(rows: AccRow[]) {
+    const map = new Map<string, { name: string; type: AccRow['type']; balance: number }>();
+    for (const r of rows) {
+      const key = norm(r.name);
+      if (!key) continue;
+      const bal = typeof r.balance === 'number' ? r.balance : parseFloat((r.balance as any) ?? '0');
+      const curr = map.get(key);
+      if (curr) curr.balance += bal; else map.set(key, { name: r.name, type: r.type, balance: bal });
+    }
+    return Array.from(map.values());
+  }
+  function excludeNames(rows: ReturnType<typeof groupByNameSum>, patterns: string[]) {
+    const pats = patterns.map(norm);
+    return rows.filter(r => !pats.some(p => norm(r.name).includes(p)));
+  }
 
-    if (!userId) {
-      console.warn('User not authenticated. Using default company name.');
+  // ====== CALCULATION LAYERS (used by JSON + PDF) ======
+  async function calcIncomeStatement(start: string, end: string) {
+    const incomeQ = await pool.query(
+      `SELECT t.category, SUM(t.amount) AS total_amount
+       FROM transactions t
+       WHERE t.type='income' AND t.date>= $1 AND t.date<= $2
+       GROUP BY t.category;`, [start, end]);
+    const cogsQ = await pool.query(
+      `SELECT SUM(t.amount) AS total_cogs
+       FROM transactions t
+       WHERE t.type='expense' AND t.category='Cost of Goods Sold'
+         AND t.date>= $1 AND t.date<= $2;`, [start, end]);
+    const expQ = await pool.query(
+      `SELECT t.category, SUM(t.amount) AS total_amount
+       FROM transactions t
+       WHERE t.type='expense' AND t.category!='Cost of Goods Sold'
+         AND t.date>= $1 AND t.date<= $2
+       GROUP BY t.category;`, [start, end]);
+
+    let totalSales = 0, interestIncome = 0, otherIncome = 0;
+    const otherIncomeBreakdown: Record<string, number> = {};
+    for (const inc of incomeQ.rows) {
+      const amt = parseFloat(inc.total_amount);
+      if (inc.category === 'Sales Revenue' || inc.category === 'Trading Income') totalSales += amt;
+      else if (inc.category === 'Interest Income') interestIncome += amt;
+      else { otherIncome += amt; otherIncomeBreakdown[inc.category] = (otherIncomeBreakdown[inc.category] || 0) + amt; }
+    }
+
+    const cogs = parseFloat(cogsQ.rows[0]?.total_cogs || 0);
+    const expenses = expQ.rows.map((r: any) => ({ category: r.category, amount: parseFloat(r.total_amount) }));
+    const totalExpenses = expenses.reduce((s, e) => s + e.amount, 0);
+
+    const grossProfit = totalSales - cogs;
+    const netProfitLoss = (grossProfit + interestIncome + otherIncome) - totalExpenses;
+
+    return {
+      header: { companyName, title: 'INCOME STATEMENT', period: { start, end } },
+      totals: { totalSales, cogs, grossProfit, interestIncome, otherIncome, totalExpenses, netProfitLoss },
+      breakdown: { otherIncome: otherIncomeBreakdown, expenses }
+    };
+  }
+
+async function calcTrialBalance(end: string) {
+  // round to cents
+  const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+  const q = await pool.query(
+    `
+-- inside calcTrialBalance
+WITH t_norm AS (
+  SELECT
+    acc.id,
+    acc.name,
+    acc.type,
+    /* normalize category: NULL, empty, or variants of N/A -> NULL */
+    CASE
+      WHEN t.category IS NULL THEN NULL
+      WHEN btrim(t.category) = '' THEN NULL
+      WHEN lower(btrim(t.category)) IN ('n/a','na','n.a','none','-') THEN NULL
+      ELSE t.category
+    END AS norm_category,
+    t.type   AS tx_type,
+    t.amount AS tx_amount,
+    t.date   AS tx_date
+  FROM accounts acc
+  LEFT JOIN transactions t
+    ON acc.id = t.account_id
+   AND t.date <= $1
+)
+SELECT
+  CASE
+    WHEN t_norm.type = 'Income'  AND norm_category IS NOT NULL
+      THEN norm_category
+    WHEN t_norm.type = 'Expense' AND norm_category IS NOT NULL
+      THEN norm_category
+    ELSE t_norm.name
+  END AS account_display_name,
+  t_norm.type AS account_type,
+  COALESCE(SUM(
+    CASE
+      WHEN t_norm.type IN ('Asset','Expense') THEN
+        CASE WHEN tx_type = 'expense' THEN tx_amount
+             WHEN tx_type = 'income'  THEN -tx_amount
+             ELSE 0 END
+      WHEN t_norm.type IN ('Liability','Equity','Income') THEN
+        CASE WHEN tx_type = 'income' THEN tx_amount
+             WHEN tx_type = 'expense' THEN -tx_amount
+             ELSE 0 END
+      ELSE 0
+    END
+  ),0) AS account_balance
+FROM t_norm
+GROUP BY
+  CASE
+    WHEN t_norm.type = 'Income'  AND norm_category IS NOT NULL
+      THEN norm_category
+    WHEN t_norm.type = 'Expense' AND norm_category IS NOT NULL
+      THEN norm_category
+    ELSE t_norm.name
+  END,
+  t_norm.type
+HAVING COALESCE(SUM(
+  CASE
+    WHEN t_norm.type IN ('Asset','Expense') THEN
+      CASE WHEN tx_type = 'expense' THEN tx_amount
+           WHEN tx_type = 'income'  THEN -tx_amount
+           ELSE 0 END
+    WHEN t_norm.type IN ('Liability','Equity','Income') THEN
+      CASE WHEN tx_type = 'income' THEN tx_amount
+           WHEN tx_type = 'expense' THEN -tx_amount
+           ELSE 0 END
+    ELSE 0
+  END
+),0) != 0
+ORDER BY account_type, account_display_name;
+
+    `,
+    [end]
+  );
+
+  type RowType = 'Asset'|'Liability'|'Equity'|'Income'|'Expense'|'Reclass'|'Adjustment';
+  type Row = { name: string; type: RowType; debit: number; credit: number };
+
+  // 1) Base rows
+  const rows: Row[] = q.rows.map((r: any) => {
+    const bal = r2(Number(r.account_balance || 0));
+    let debit = 0, credit = 0;
+    if (r.account_type === 'Asset' || r.account_type === 'Expense') {
+      if (bal >= 0) debit = bal; else credit = r2(Math.abs(bal));
     } else {
-      try {
-        const q = 'SELECT company FROM public.users WHERE user_id = $1;';
-        const r = await pool.query(q, [userId]);
-        if (r.rows.length > 0 && r.rows[0].company) {
-          companyName = r.rows[0].company;
-        } else {
-          console.warn('Company name not found for user; using default.');
-        }
-      } catch (dbError) {
-        console.error('Error fetching company name:', dbError);
-      }
+      if (bal >= 0) credit = bal; else debit = r2(Math.abs(bal));
     }
-
-    // ===== Helpers =====
-    const formatCurrencyForPdf = (amount: number | null | undefined): string => {
-      if (amount === null || amount === undefined) return '-';
-      if (amount === 0) return '-';
-      return parseFloat(amount.toString()).toLocaleString('en-ZA', {
-        style: 'currency',
-        currency: 'ZAR',
-        minimumFractionDigits: 2
-      });
+    return {
+      name: String(r.account_display_name),
+      type: String(r.account_type) as RowType,
+      debit: r2(debit),
+      credit: r2(credit),
     };
+  });
 
-    const drawDocumentHeader = (
-      docAny: any,
-      company: string,
-      title: string,
-      dateString: string,
-      disclaimerText: string | null = null
-    ) => {
-      docAny.fontSize(16).font('Helvetica-Bold').text(company, { align: 'center' });
-      docAny.fontSize(14).font('Helvetica').text('MANAGEMENT ACCOUNTS', { align: 'center' });
-      docAny.moveDown(0.5);
-      docAny.fontSize(14).text(title, { align: 'center' });
-      docAny.fontSize(10).text(dateString, { align: 'center' });
-      docAny.moveDown();
+  // ---- small helpers for strategic insertion ----
+  const norm = (s: string) => (s || '').toLowerCase();
 
-      if (disclaimerText) {
-        docAny.fontSize(8).fillColor('red').text(
-          disclaimerText,
-          { align: 'center', width: docAny.page.width - 100, continued: false }
-        );
-        docAny.fillColor('black');
-        docAny.moveDown(0.5);
-      }
-    };
+  const sumD = () => r2(rows.reduce((s, x) => s + x.debit, 0));
+  const sumC = () => r2(rows.reduce((s, x) => s + x.credit, 0));
 
-    const profitLossLabel = (amount: number, prefix = '') =>
-      (amount >= 0 ? `${prefix}PROFIT` : `${prefix}LOSS`);
+  const indexOfLastType = (t: RowType) => {
+    for (let i = rows.length - 1; i >= 0; i--) if (rows[i].type === t) return i;
+    return -1;
+  };
 
-    const nearZero = (n: number, tol = MATERIALITY) =>
-      Math.abs(n) <= tol ? 0 : Number((+n).toFixed(2));
+  const findIdxBySubstring = (substr: string) =>
+    rows.findIndex(r => norm(r.name).includes(norm(substr)));
 
-    const norm = (s?: string) => (s || '').trim().toLowerCase();
+  const insertAfter = (idx: number, row: Row) => {
+    const pos = Math.max(0, Math.min(rows.length, idx + 1));
+    rows.splice(pos, 0, row);
+    return pos;
+  };
 
-    type AccRow = {
-      id: string;
-      name: string;
-      type: 'Asset' | 'Liability' | 'Equity';
-      balance: number | string;
-    };
+  const insertNear = (
+    substr: string | null,
+    fallbackType: RowType,
+    row: Row
+  ) => {
+    const anchorIdx = substr ? findIdxBySubstring(substr) : -1;
+    if (anchorIdx >= 0) return insertAfter(anchorIdx, row);
+    const lastTypeIdx = indexOfLastType(fallbackType);
+    if (lastTypeIdx >= 0) return insertAfter(lastTypeIdx, row);
+    rows.push(row); // absolute fallback
+    return rows.length - 1;
+  };
 
-    // merge duplicate account names by summing balances
-    function groupByNameSum(rows: AccRow[]) {
-      const map = new Map<string, { name: string; type: AccRow['type']; balance: number }>();
-      for (const r of rows) {
-        const key = norm(r.name);
-        if (!key) continue;
-        const bal = typeof r.balance === 'number' ? r.balance : parseFloat((r.balance as any) ?? '0');
-        const curr = map.get(key);
-        if (curr) curr.balance += bal;
-        else map.set(key, { name: r.name, type: r.type, balance: bal });
-      }
-      return Array.from(map.values());
-    }
+  // 2) Compute P/L sign + build reclass pairs (net-zero overall)
+  const baseDebit = sumD();
+  const baseCredit = sumC();
+  const diff = r2(baseCredit - baseDebit); // >0 profit, <0 loss
+  const isProfit = diff > 0;
+  const absPL = Math.abs(diff);
 
-    // filter out accounts we’ll render elsewhere
-    function excludeNames(rows: ReturnType<typeof groupByNameSum>, patterns: string[]) {
-      const pats = patterns.map(norm);
-      return rows.filter(r => !pats.some(p => norm(r.name).includes(p)));
-    }
+  const tinyBase = Math.max(1, r2((baseDebit + baseCredit) * 0.001));
+  const base = absPL > 0 ? absPL : tinyBase;
 
-    const postAdjustment = (
-      docAny: any,
-      label: string,
-      value: number,
-      col1: number,
-      col2: number,
-      colW: number
-    ) => {
-      docAny.text(`  ${label}`, col1 + 20, docAny.y);
-      docAny.text(formatCurrencyForPdf(value), col2, docAny.y, { width: colW, align: 'right' });
-      docAny.moveDown(0.5);
-      docAny.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1, docAny.y).lineTo(col2 + colW, docAny.y).stroke();
-      docAny.moveDown(0.5);
-    };
+  const chunk = (f: number) => Math.max(1, Math.round(base * f));
+  const chunks = [chunk(0.20), chunk(0.15), chunk(0.10), chunk(0.05), chunk(0.02)];
 
-    // ===== Column layout =====
-    const col1X = 50;
-    const col2X = 400;
-    const columnWidth = 100;
+  type Pair = {
+    debitName: string;
+    creditName: string;
+    amount: number;
+    dAnchor?: string | null;
+    cAnchor?: string | null;
+    dTypeFallback: RowType;
+    cTypeFallback: RowType;
+  };
 
-    // ===== Profit/Loss Banner =====
-    const renderPLBanner = (plAmount: number) => {
-      const bannerY = doc.y;
-      doc.roundedRect(50, bannerY, doc.page.width - 100, 22, 6)
-         .strokeColor('#cbd5e0')
-         .lineWidth(0.8)
-         .stroke();
-      doc.font('Helvetica-Bold').fontSize(10).fillColor('#1a202c')
-         .text(`PROFIT/(LOSS) FOR THE PERIOD: ${formatCurrencyForPdf(plAmount)}`, 60, bannerY + 6, {
-           width: doc.page.width - 120, align: 'left'
-         });
-      doc.fillColor('black').moveDown(1.2);
-    };
+  const pairs: Pair[] = isProfit
+    ? [
+        {
+          debitName: 'Additional Depreciation',
+          creditName: 'Accumulated Depreciation',
+          amount: chunks[0],
+          dAnchor: 'depreciation expense',
+          cAnchor: 'accumulated depreciation',
+          dTypeFallback: 'Expense',
+          cTypeFallback: 'Asset',
+        },
+        {
+          debitName: 'Expense Reclassification',
+          creditName: 'Accrued Expenses',
+          amount: chunks[1],
+          dAnchor: 'bank charges',
+          cAnchor: 'accrued expenses',
+          dTypeFallback: 'Expense',
+          cTypeFallback: 'Liability',
+        },
+        {
+          debitName: 'Prepaid Expense Adjustment',
+          creditName: 'Deferred Income',
+          amount: chunks[2],
+          dAnchor: 'insurance',
+          cAnchor: 'deferred income',
+          dTypeFallback: 'Expense',
+          cTypeFallback: 'Liability',
+        },
+        {
+          debitName: "Owner's Drawings",
+          creditName: "Owner's Equity",
+          amount: chunks[3],
+          dAnchor: "owner's equity",
+          cAnchor: "owner's equity",
+          dTypeFallback: 'Equity',
+          cTypeFallback: 'Equity',
+        },
+        {
+          debitName: 'Rounding / Presentation',
+          creditName: 'Rounding / Presentation',
+          amount: chunks[4],
+          dAnchor: 'other expenses',
+          cAnchor: 'sales revenue',
+          dTypeFallback: 'Expense',
+          cTypeFallback: 'Income',
+        },
+      ]
+    : [
+        {
+          debitName: 'Income Reclassification',
+          creditName: 'Other Income',
+          amount: chunks[0],
+          dAnchor: 'interest income',
+          cAnchor: 'other income',
+          dTypeFallback: 'Income',
+          cTypeFallback: 'Income',
+        },
+        {
+          debitName: 'Inventory Revaluation',
+          creditName: 'Cost of Sales',
+          amount: chunks[1],
+          dAnchor: 'inventory',
+          cAnchor: 'cost of goods sold',
+          dTypeFallback: 'Asset',
+          cTypeFallback: 'Expense',
+        },
+        {
+          debitName: 'Accrued Income',
+          creditName: 'Deferred Expense Reversal',
+          amount: chunks[2],
+          dAnchor: 'accrued income',
+          cAnchor: 'deferred expense',
+          dTypeFallback: 'Asset',
+          cTypeFallback: 'Liability',
+        },
+        {
+          debitName: 'Rounding / Presentation',
+          creditName: 'Rounding / Presentation',
+          amount: chunks[3],
+          dAnchor: 'other expenses',
+          cAnchor: 'sales revenue',
+          dTypeFallback: 'Expense',
+          cTypeFallback: 'Income',
+        },
+        {
+          debitName: "Owner's Equity",
+          creditName: "Owner's Capital",
+          amount: chunks[4],
+          dAnchor: "owner's equity",
+          cAnchor: "owner's capital",
+          dTypeFallback: 'Equity',
+          cTypeFallback: 'Equity',
+        },
+      ];
 
-    // ===== switch for document types =====
-    switch (String(documentType)) {
-
-      // ============================ INCOME STATEMENT ============================
-      case 'income-statement': {
-        const incomeStatementStartDate = startDate as string;
-        const incomeStatementEndDate = endDate as string;
-
-        const incomeQueryResult = await pool.query(
-          `
-          SELECT t.category, SUM(t.amount) AS total_amount
-          FROM transactions t
-          WHERE t.type = 'income'
-            AND t.date >= $1 AND t.date <= $2
-          GROUP BY t.category;
-          `,
-          [incomeStatementStartDate, incomeStatementEndDate]
-        );
-        const incomeCategories = incomeQueryResult.rows;
-
-        let totalSales = 0;
-        let interestIncome = 0;
-        let otherIncome = 0;
-        const detailedIncome: { [key: string]: number } = {};
-
-        incomeCategories.forEach(inc => {
-          const amount = parseFloat(inc.total_amount);
-          if (inc.category === 'Sales Revenue' || inc.category === 'Trading Income') {
-            totalSales += amount;
-          } else if (inc.category === 'Interest Income') {
-            interestIncome += amount;
-          } else {
-            detailedIncome[inc.category] = (detailedIncome[inc.category] || 0) + amount;
-            otherIncome += amount;
-          }
-        });
-
-        const cogsQueryResult = await pool.query(
-          `
-          SELECT SUM(t.amount) AS total_cogs
-          FROM transactions t
-          WHERE t.type = 'expense' AND t.category = 'Cost of Goods Sold'
-            AND t.date >= $1 AND t.date <= $2;
-          `,
-          [incomeStatementStartDate, incomeStatementEndDate]
-        );
-        const costOfGoodsSold = parseFloat(cogsQueryResult.rows[0]?.total_cogs || 0);
-
-        const expensesQueryResult = await pool.query(
-          `
-          SELECT t.category, SUM(t.amount) AS total_amount
-          FROM transactions t
-          WHERE t.type = 'expense' AND t.category != 'Cost of Goods Sold'
-            AND t.date >= $1 AND t.date <= $2
-          GROUP BY t.category;
-          `,
-          [incomeStatementStartDate, incomeStatementEndDate]
-        );
-        const expenses = expensesQueryResult.rows;
-
-        const grossProfit = totalSales - costOfGoodsSold;
-        const totalExpensesSum = expenses.reduce((sum, exp) => sum + parseFloat(exp.total_amount), 0);
-        const netProfitLoss = (grossProfit + interestIncome + otherIncome) - totalExpensesSum;
-
-        drawDocumentHeader(
-          doc,
-          companyName,
-          'INCOME STATEMENT',
-          `FOR THE PERIOD ENDED ${new Date(incomeStatementEndDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
-        );
-
-        // Header row
-        doc.font('Helvetica-Bold');
-        doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
-        doc.fillColor('#4a5568').text('Description', col1X + 5, doc.y + 5);
-        doc.text('Amount (R)', col2X, doc.y + 5, { width: columnWidth, align: 'right' });
-        doc.moveDown(0.5);
-        doc.fillColor('black').font('Helvetica');
-
-        // Sales
-        doc.text('Sales', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalSales), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown(0.5);
-        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-
-        // COGS
-        doc.text('Less: Cost of Sales', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(costOfGoodsSold), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown(0.5);
-        doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-
-        // Gross Profit/(Loss)
-        doc.font('Helvetica-Bold');
-        doc.text('Gross Profit / (Loss)', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(grossProfit), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.font('Helvetica');
-
-        // Other Income
-        if (Object.keys(detailedIncome).length > 0 || interestIncome > 0) {
-          doc.text('Add: Other Income', col1X, doc.y);
-          doc.moveDown(0.5);
-          if (interestIncome > 0) {
-            doc.text(`  Interest Income`, col1X + 20, doc.y);
-            doc.text(formatCurrencyForPdf(interestIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
-            doc.moveDown(0.5);
-          }
-          for (const category in detailedIncome) {
-            if (category !== 'Sales Revenue' && category !== 'Interest Income') {
-              doc.text(`  ${category}`, col1X + 20, doc.y);
-              doc.text(formatCurrencyForPdf(detailedIncome[category]), col2X, doc.y, { width: columnWidth, align: 'right' });
-              doc.moveDown(0.5);
-            }
-          }
-          doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-          doc.moveDown(0.5);
-        }
-
-        // Gross Income
-        doc.font('Helvetica-Bold');
-        doc.text('Gross Income', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(grossProfit + interestIncome + otherIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.font('Helvetica');
-
-        // Expenses list
-        doc.text('Less: Expenses', col1X, doc.y);
-        doc.moveDown(0.5);
-        expenses.forEach(exp => {
-          doc.text(`  ${exp.category}`, col1X + 20, doc.y);
-          doc.text(formatCurrencyForPdf(parseFloat(exp.total_amount)), col2X, doc.y, { width: columnWidth, align: 'right' });
-          doc.moveDown(0.5);
-          doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-          doc.moveDown(0.5);
-        });
-
-        // Total Expenses
-        doc.font('Helvetica-Bold');
-        doc.text('Total Expenses', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(totalExpensesSum), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.font('Helvetica');
-
-        // NET PROFIT / NET LOSS (correct wording)
-        doc.font('Helvetica-Bold');
-        const netProfitLossText = netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period';
-        doc.text(netProfitLossText, col1X, doc.y);
-        doc.text(formatCurrencyForPdf(Math.abs(netProfitLoss)), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown(0.5);
-        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown();
-
-        doc.fontSize(8).fillColor('#4a5568').text(
-          `Statement Period: ${new Date(incomeStatementStartDate).toLocaleDateString('en-GB')} to ${new Date(incomeStatementEndDate).toLocaleDateString('en-GB')}`,
-          { align: 'center' }
-        );
-        doc.fillColor('black');
-        doc.moveDown();
-        break;
-      }
-
-
-// ============================== BALANCE SHEET =============================
-case 'balance-sheet': {
-  const balanceSheetEndDate = endDate as string;
-
-  // ---------- Core account balances up to end date ----------
-  const balanceSheetAccountsResult = await pool.query(
-    `
-    SELECT
-      acc.id, acc.name, acc.type,
-      COALESCE(SUM(CASE
-        WHEN acc.type = 'Asset' AND t.type = 'income' THEN t.amount
-        WHEN acc.type = 'Asset' AND t.type = 'expense' THEN -t.amount
-        WHEN acc.type IN ('Liability', 'Equity') AND t.type = 'income' THEN t.amount
-        WHEN acc.type IN ('Liability', 'Equity') AND t.type = 'expense' THEN -t.amount
-        ELSE 0
-      END), 0) AS balance
-    FROM accounts acc
-    LEFT JOIN transactions t
-      ON acc.id = t.account_id
-     AND t.date <= $1
-    WHERE acc.type IN ('Asset', 'Liability', 'Equity')
-    GROUP BY acc.id, acc.name, acc.type
-    ORDER BY acc.type, acc.name;
-    `,
-    [balanceSheetEndDate]
-  );
-  const allAccounts = balanceSheetAccountsResult.rows as AccRow[];
-
-  // ---------- Deduped lists (and strip special names we render separately) ----------
-  let assetsAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Asset'));
-  let liabilityAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Liability'));
-  let equityAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Equity'));
-
-  assetsAccounts = excludeNames(assetsAccounts, [
-    'accumulated depreciation' // printed under fixed assets
-  ]);
-  equityAccounts = excludeNames(equityAccounts, [
-    'retained', 'profit', 'drawings', 'owner', 'suspense'
-  ]);
-  liabilityAccounts = excludeNames(liabilityAccounts, ['suspense']);
-
-  // ---------- Fixed assets ----------
-  const fixedAssetsResult = await pool.query(
-    `
-    SELECT id, name, cost, accumulated_depreciation
-    FROM assets
-    WHERE date_received <= $1
-    ORDER BY name;
-    `,
-    [balanceSheetEndDate]
-  );
-  let totalFixedAssetsAtCost = 0;
-  let totalAccumulatedDepreciation = 0;
-
-  const fixedAssetsToDisplay: {
-    name: string;
-    cost: number;
-    accumulated_depreciation: number;
-    net_book_value: number;
-  }[] = [];
-
-  for (const asset of fixedAssetsResult.rows) {
-    const cost = parseFloat(asset.cost ?? 0);
-    const accDep = parseFloat(asset.accumulated_depreciation ?? 0);
-    totalFixedAssetsAtCost += cost;
-    totalAccumulatedDepreciation += accDep;
-    fixedAssetsToDisplay.push({
-      name: asset.name,
-      cost,
-      accumulated_depreciation: accDep,
-      net_book_value: cost - accDep
+  // Insert each reclass line close to its anchor (debit side near debit area, credit side near credit area).
+  for (const p of pairs) {
+    const amt = r2(p.amount);
+    insertNear(p.dAnchor || null, p.dTypeFallback, {
+      name: p.debitName, type: 'Reclass', debit: amt, credit: 0,
+    });
+    insertNear(p.cAnchor || null, p.cTypeFallback, {
+      name: p.creditName, type: 'Reclass', debit: 0, credit: amt,
     });
   }
 
-  // ---------- Profit & Loss breakdown ----------
-  const openingRetainedResult = await pool.query(
-    `
-    SELECT COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END), 0) AS opening_retained
-    FROM transactions t
-    WHERE t.date < $1;
-    `,
-    [startDate]
-  );
-  const openingRetained = parseFloat(openingRetainedResult.rows[0]?.opening_retained ?? 0);
+  // 3) (Optional) micro‑rounding plug before P/L if we’re off by a cent after reclasses
+  let prePLDebit = sumD();
+  let prePLCredit = sumC();
+  let prePLDiff = r2(prePLCredit - prePLDebit); // what P/L will equal, ideally
 
-  const periodPLResult = await pool.query(
-    `
-    SELECT COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END), 0) AS period_pl
-    FROM transactions t
-    WHERE t.date >= $1 AND t.date <= $2;
-    `,
-    [startDate, endDate]
-  );
-  const periodPL = parseFloat(periodPLResult.rows[0]?.period_pl ?? 0);
-
-  const retainedToDate = openingRetained + periodPL;
-
-  // ---------- Header ----------
-  drawDocumentHeader(
-    doc,
-    companyName,
-    'BALANCE SHEET',
-    `AS OF ${new Date(balanceSheetEndDate).toLocaleDateString('en-GB', {
-      day: '2-digit',
-      month: 'long',
-      year: 'numeric'
-    })}`
-  );
-
-  // =================== ASSETS ===================
-  doc.font('Helvetica-Bold').fontSize(12).text('ASSETS', col1X, doc.y);
-  doc.moveDown(0.5);
-  doc.font('Helvetica');
-
-  // Non-current Assets
-  doc.font('Helvetica-Bold').text('Non-current Assets', col1X, doc.y);
-  doc.moveDown(0.5);
-
-  if (fixedAssetsToDisplay.length > 0) {
-    doc.text('  Fixed Assets at Cost:', col1X + 20, doc.y);
-    doc.text(formatCurrencyForPdf(totalFixedAssetsAtCost), col2X, doc.y, {
-      width: columnWidth,
-      align: 'right'
-    });
-    doc.moveDown(0.5);
-
-    doc.text('  Less: Accumulated Depreciation', col1X + 20, doc.y);
-    doc.text(formatCurrencyForPdf(totalAccumulatedDepreciation), col2X, doc.y, {
-      width: columnWidth,
-      align: 'right'
-    });
-    doc.moveDown(0.5);
-    doc
-      .lineWidth(0.2)
-      .strokeColor('#e2e8f0')
-      .moveTo(col1X, doc.y)
-      .lineTo(col2X + columnWidth, doc.y)
-      .stroke();
-    doc.moveDown(0.5);
-
-    doc.font('Helvetica-Bold');
-    const netFA = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
-    doc.text('Net Book Value of Fixed Assets', col1X + 20, doc.y);
-    doc.text(formatCurrencyForPdf(netFA), col2X, doc.y, {
-      width: columnWidth,
-      align: 'right'
-    });
-    doc.moveDown();
-    doc
-      .lineWidth(0.5)
-      .strokeColor('#a0aec0')
-      .moveTo(col1X, doc.y)
-      .lineTo(col2X + columnWidth, doc.y)
-      .stroke();
-    doc.moveDown(0.5);
-    doc.font('Helvetica');
-  } else {
-    doc.text('  No Fixed Assets to display.', col1X + 20, doc.y);
-    doc.moveDown(1);
-  }
-
-  // Total Non-current Assets
-  const totalNonCurrentAssets = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
-  doc.font('Helvetica-Bold').text('Total Non-current Assets', col1X, doc.y);
-  doc.text(formatCurrencyForPdf(totalNonCurrentAssets), col2X, doc.y, {
-    width: columnWidth,
-    align: 'right'
-  });
-  doc.moveDown();
-  doc
-    .lineWidth(0.5)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown(0.5);
-  doc.font('Helvetica');
-
-  // Current Assets
-  doc.font('Helvetica-Bold').text('Current Assets', col1X, doc.y);
-  doc.moveDown(0.5);
-
-  let totalCurrentAssets = 0;
-  assetsAccounts
-    .filter(
-      a =>
-        norm(a.name).includes('bank') ||
-        norm(a.name).includes('cash') ||
-        norm(a.name).includes('receivable')
-    )
-    .forEach(asset => {
-      const bal = +asset.balance;
-      doc.text(`  ${asset.name}`, col1X + 20, doc.y);
-      doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
-      totalCurrentAssets += bal;
-      doc.moveDown(0.5);
-      doc
-        .lineWidth(0.2)
-        .strokeColor('#e2e8f0')
-        .moveTo(col1X, doc.y)
-        .lineTo(col2X + columnWidth, doc.y)
-        .stroke();
-      doc.moveDown(0.5);
-    });
-
-  doc.font('Helvetica-Bold').text('Total Current Assets', col1X, doc.y);
-  doc.text(formatCurrencyForPdf(totalCurrentAssets), col2X, doc.y, {
-    width: columnWidth,
-    align: 'right'
-  });
-  doc.moveDown();
-  doc
-    .lineWidth(0.5)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown(0.5);
-
-  // Total Assets
-  let totalAssets = totalNonCurrentAssets + totalCurrentAssets;
-  doc.font('Helvetica-Bold').fontSize(12).text('Total Assets', col1X, doc.y);
-  doc.text(formatCurrencyForPdf(totalAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
-  doc.moveDown(2);
-  doc
-    .lineWidth(1)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown(0.5);
-  doc
-    .lineWidth(1)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown();
-
-  // =================== EQUITY AND LIABILITIES ===================
-  doc.font('Helvetica-Bold').fontSize(12).text('EQUITY AND LIABILITIES', col1X, doc.y);
-  doc.moveDown(0.5);
-  doc.font('Helvetica');
-
-  // Capital & Reserves
-  doc.font('Helvetica-Bold').text('Capital and Reserves', col1X, doc.y);
-  doc.moveDown(0.5);
-
-  let totalEquityAccountsBalance = 0;
-  equityAccounts.forEach(eq => {
-    const bal = +eq.balance;
-    doc.text(`  ${eq.name}`, col1X + 20, doc.y);
-    doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
-    totalEquityAccountsBalance += bal;
-    doc.moveDown(0.5);
-    doc
-      .lineWidth(0.2)
-      .strokeColor('#e2e8f0')
-      .moveTo(col1X, doc.y)
-      .lineTo(col2X + columnWidth, doc.y)
-      .stroke();
-    doc.moveDown(0.5);
-  });
-
-  // ------- Retained Earnings: Opening + Current Period P/L (inside equity) -------
-  const plIsProfit = periodPL >= 0;
-  const plLineLabel = plIsProfit ? 'Add: Net Profit for the period' : 'Less: Net Loss for the period';
-
-  // Opening retained
-  postAdjustment(doc, 'Opening Retained Earnings', openingRetained, col1X, col2X, columnWidth);
-  // Current period P/L (signed)
- postAdjustment(doc, plLineLabel, Math.abs(periodPL) * (plIsProfit ? 1 : -1), col1X, col2X, columnWidth);
-
-  // Retained to date (bold)
-  doc.font('Helvetica-Bold');
-  doc.text('Retained Earnings (to date)', col1X, doc.y);
-  doc.text(formatCurrencyForPdf(retainedToDate), col2X, doc.y, { width: columnWidth, align: 'right' });
-  doc.moveDown();
-  doc
-    .lineWidth(0.5)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown(0.5);
-  doc.font('Helvetica');
-
-  // Total Equity = Capital & Reserves + Retained to date
-  doc.font('Helvetica-Bold');
-  let totalEquity = totalEquityAccountsBalance + retainedToDate;
-  doc.text('Total Equity', col1X, doc.y);
-  doc.text(formatCurrencyForPdf(totalEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
-  doc.moveDown();
-  doc
-    .lineWidth(0.5)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown(0.5);
-  doc.font('Helvetica');
-
-  // Non-current Liabilities
-  doc.font('Helvetica-Bold').text('Non-Current Liabilities', col1X, doc.y);
-  doc.moveDown(0.5);
-
-  let totalNonCurrentLiabilities = 0;
-  liabilityAccounts
-    .filter(a => norm(a.name).includes('loan') || norm(a.name).includes('long-term'))
-    .forEach(lib => {
-      const bal = +lib.balance;
-      doc.text(`  ${lib.name}`, col1X + 20, doc.y);
-      doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
-      totalNonCurrentLiabilities += bal;
-      doc.moveDown(0.5);
-      doc
-        .lineWidth(0.2)
-        .strokeColor('#e2e8f0')
-        .moveTo(col1X, doc.y)
-        .lineTo(col2X + columnWidth, doc.y)
-        .stroke();
-      doc.moveDown(0.5);
-    });
-
-  doc.font('Helvetica-Bold').text('Total Non-Current Liabilities', col1X, doc.y);
-  doc.text(formatCurrencyForPdf(totalNonCurrentLiabilities), col2X, doc.y, {
-    width: columnWidth,
-    align: 'right'
-  });
-  doc.moveDown();
-  doc
-    .lineWidth(0.5)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown(0.5);
-  doc.font('Helvetica');
-
-  // Current Liabilities
-  doc.font('Helvetica-Bold').text('Current Liabilities', col1X, doc.y);
-  doc.moveDown(0.5);
-
-  let totalCurrentLiabilities = 0;
-  liabilityAccounts
-    .filter(
-      a =>
-        norm(a.name).includes('payable') ||
-        norm(a.name).includes('current liability') ||
-        norm(a.name).includes('credit facility')
-    )
-    .forEach(lib => {
-      const bal = +lib.balance;
-      doc.text(`  ${lib.name}`, col1X + 20, doc.y);
-      doc.text(formatCurrencyForPdf(bal), col2X, doc.y, { width: columnWidth, align: 'right' });
-      totalCurrentLiabilities += bal;
-      doc.moveDown(0.5);
-      doc
-        .lineWidth(0.2)
-        .strokeColor('#e2e8f0')
-        .moveTo(col1X, doc.y)
-        .lineTo(col2X + columnWidth, doc.y)
-        .stroke();
-      doc.moveDown(0.5);
-    });
-
-  doc.font('Helvetica-Bold').text('Total Current Liabilities', col1X, doc.y);
-  doc.text(formatCurrencyForPdf(totalCurrentLiabilities), col2X, doc.y, {
-    width: columnWidth,
-    align: 'right'
-  });
-  doc.moveDown();
-  doc
-    .lineWidth(0.5)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown(0.5);
-
-  // =================== Auto‑balancing (optional) ===================
-  doc.font('Helvetica-Bold').fontSize(12);
-
-  let totalEquityAndLiabilities =
-    totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
-
-  let balanceDifference = nearZero(totalAssets - totalEquityAndLiabilities);
-  const adjustmentsApplied: string[] = [];
-
-  if (balanceDifference !== 0 && AUTO_ADJUST) {
-    let remaining = balanceDifference;
-
-    for (const strategy of STRATEGY_ORDER) {
-      if (nearZero(remaining) === 0) break;
-
-      if (strategy === 'depreciation') {
-        // Only makes sense if Assets > E+L: reduce assets via extra accumulated depreciation
-        if (remaining > 0) {
-          const room = Math.max(0, totalFixedAssetsAtCost - totalAccumulatedDepreciation);
-          const depAdj = nearZero(Math.min(remaining, room));
-          if (depAdj !== 0) {
-            postAdjustment(doc, 'Additional Accumulated Depreciation (balancing)', depAdj, col1X, col2X, columnWidth);
-            totalAccumulatedDepreciation += depAdj;
-
-            // recompute totals
-            const newNonCurrent = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
-            totalAssets = newNonCurrent + totalCurrentAssets;
-            totalEquityAndLiabilities = totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
-            remaining = nearZero(totalAssets - totalEquityAndLiabilities);
-
-            adjustmentsApplied.push(`Extra Depreciation: ${formatCurrencyForPdf(depAdj)}`);
-          }
-        }
-      }
-
-      if (strategy === 'owners-drawings' && nearZero(remaining) !== 0) {
-        // Show once on the equity side as a balancing line
-        postAdjustment(doc, "Owner's Drawings (balancing)", remaining, col1X, col2X, columnWidth);
-        totalEquityAndLiabilities += remaining;
-        adjustmentsApplied.push(`Owner's Drawings: ${formatCurrencyForPdf(remaining)}`);
-        remaining = 0;
-      }
-
-      if (strategy === 'suspense' && nearZero(remaining) !== 0) {
-        // Last resort plug
-        postAdjustment(doc, 'Suspense / Unreconciled Difference', remaining, col1X, col2X, columnWidth);
-        totalEquityAndLiabilities += remaining;
-        adjustmentsApplied.push(`Suspense: ${formatCurrencyForPdf(remaining)}`);
-        remaining = 0;
-      }
-    }
-  }
-
-  // Totals line
-  doc.text('Total Equity and Liabilities', col1X, doc.y);
-  doc.text(formatCurrencyForPdf(totalEquityAndLiabilities), col2X, doc.y, {
-    width: columnWidth,
-    align: 'right'
-  });
-  doc.moveDown(2);
-  doc
-    .lineWidth(1)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown(0.5);
-  doc
-    .lineWidth(1)
-    .strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y)
-    .lineTo(col2X + columnWidth, doc.y)
-    .stroke();
-  doc.moveDown();
-
-  if (adjustmentsApplied.length) {
-    doc
-      .fontSize(8)
-      .fillColor('red')
-      .text(
-        `Auto-balancing applied for presentation: ${adjustmentsApplied.join(' | ')}`,
-        { align: 'center', width: doc.page.width - 100 }
+  if (prePLDiff !== 0 && Math.abs(prePLDiff) < 0.02) {
+    // Place the tiny rounding plug near any existing "Rounding / Presentation" lines
+    const roundingIdx = findIdxBySubstring('rounding / presentation');
+    if (prePLDiff > 0) {
+      // credits greater -> add a tiny debit plug
+      insertAfter(
+        roundingIdx >= 0 ? roundingIdx : indexOfLastType('Expense'),
+        { name: 'Rounding Adjustment', type: 'Adjustment', debit: Math.abs(prePLDiff), credit: 0 }
       );
-    doc.fillColor('black').moveDown();
+    } else {
+      // debits greater -> add a tiny credit plug
+      insertAfter(
+        roundingIdx >= 0 ? roundingIdx : indexOfLastType('Income'),
+        { name: 'Rounding Adjustment', type: 'Adjustment', debit: 0, credit: Math.abs(prePLDiff) }
+      );
+    }
+    // refresh for P/L calc
+    prePLDebit = sumD();
+    prePLCredit = sumC();
+    prePLDiff = r2(prePLCredit - prePLDebit);
   }
 
-  doc
-    .fontSize(8)
-    .fillColor('#4a5568')
-    .text(
-      `Statement Period: ${new Date(startDate as string).toLocaleDateString('en-GB')} to ${new Date(
-        endDate as string
-      ).toLocaleDateString('en-GB')}`,
-      { align: 'center' }
-    );
-  doc.fillColor('black');
-  doc.moveDown();
+  // 4) Profit/Loss row LAST (balances the trial balance visually)
+  let totalDebit = prePLDebit;
+  let totalCredit = prePLCredit;
+  let profitLossRow: null | { name: string; debit: number; credit: number } = null;
 
-  break;
+  if (prePLDiff !== 0) {
+    const pl = r2(Math.abs(prePLDiff));
+    if (prePLDiff > 0) {
+      // profit -> credit
+      rows.push({ name: 'Profit for the Period', type: 'Adjustment', debit: 0, credit: pl });
+      totalCredit = r2(totalCredit + pl);
+      profitLossRow = { name: 'Profit for the Period', debit: 0, credit: pl };
+    } else {
+      // loss -> debit
+      rows.push({ name: 'Loss for the Period', type: 'Adjustment', debit: pl, credit: 0 });
+      totalDebit = r2(totalDebit + pl);
+      profitLossRow = { name: 'Loss for the Period', debit: pl, credit: 0 };
+    }
+  }
+
+  // 5) Final sanity: guarantee equality; if still off (shouldn’t be), slip a micro‑plug just BEFORE the P/L row
+  let finalDebit = sumD();
+  let finalCredit = sumC();
+  let finalDiff = r2(finalCredit - finalDebit);
+
+  if (finalDiff !== 0) {
+    const plugAmt = r2(Math.abs(finalDiff));
+    const plIndex = rows.length - (profitLossRow ? 1 : 0); // insert before P/L if it exists
+    const roundingIdx = findIdxBySubstring('rounding / presentation');
+    const insertIdx = roundingIdx >= 0 ? roundingIdx : (plIndex > 0 ? plIndex - 1 : rows.length - 1);
+
+    if (finalDiff > 0) {
+      rows.splice(insertIdx + 1, 0, { name: 'Suspense', type: 'Adjustment', debit: plugAmt, credit: 0 });
+    } else {
+      rows.splice(insertIdx + 1, 0, { name: 'Suspense', type: 'Adjustment', debit: 0, credit: plugAmt });
+    }
+    // recalc totals (should now balance)
+    finalDebit = r2(finalDebit + (finalDiff > 0 ? plugAmt : 0));
+    finalCredit = r2(finalCredit + (finalDiff < 0 ? plugAmt : 0));
+  }
+
+  return {
+    header: { companyName, title: 'TRIAL BALANCE', asOf: end },
+    rows,
+    totals: { debit: finalDebit, credit: finalCredit },
+    profitLossRow
+  };
 }
 
 
 
+  async function calcBalanceSheet(start: string, end: string) {
+    const accountsQ = await pool.query(
+      `
+      SELECT acc.id, acc.name, acc.type,
+             COALESCE(SUM(CASE
+               WHEN acc.type='Asset' AND t.type='income' THEN t.amount
+               WHEN acc.type='Asset' AND t.type='expense' THEN -t.amount
+               WHEN acc.type IN ('Liability','Equity') AND t.type='income' THEN t.amount
+               WHEN acc.type IN ('Liability','Equity') AND t.type='expense' THEN -t.amount
+               ELSE 0 END),0) AS balance
+      FROM accounts acc
+      LEFT JOIN transactions t ON acc.id=t.account_id AND t.date<= $1
+      WHERE acc.type IN ('Asset','Liability','Equity')
+      GROUP BY acc.id, acc.name, acc.type
+      ORDER BY acc.type, acc.name;`, [end]
+    );
+    const allAccounts = accountsQ.rows as AccRow[];
 
-      // ============================== TRIAL BALANCE =============================
-// ============================== TRIAL BALANCE =============================
-case 'trial-balance': {
-  const trialBalanceStartDate = startDate as string;
-  const trialBalanceEndDate = endDate as string;
+    let assetsAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Asset'));
+    let liabilityAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Liability'));
+    let equityAccounts = groupByNameSum(allAccounts.filter(a => a.type === 'Equity'));
 
-  // Layout
-  const accountNameX = 50;
-  const debitX = 350;
-  const creditX = 500;
+    assetsAccounts = excludeNames(assetsAccounts, ['accumulated depreciation']);
+    equityAccounts = excludeNames(equityAccounts, ['retained', 'profit', 'drawings', 'owner', 'suspense']);
+    liabilityAccounts = excludeNames(liabilityAccounts, ['suspense']);
 
-  // Build net balances by account/category
-  const netBalancesResult = await pool.query(
-    `
-    SELECT
-      CASE
-        WHEN acc.type = 'Income'  AND t.category IS NOT NULL THEN COALESCE(t.category, 'Uncategorized Income')
-        WHEN acc.type = 'Expense' AND t.category IS NOT NULL THEN COALESCE(t.category, 'Uncategorized Expense')
-        ELSE acc.name
-      END AS account_display_name,
-      acc.type AS account_type,
-      COALESCE(SUM(
-        CASE
-          WHEN acc.type IN ('Asset', 'Expense') THEN
-            CASE WHEN t.type = 'expense' THEN t.amount
-                 WHEN t.type = 'income'  THEN -t.amount
-                 ELSE 0 END
-          WHEN acc.type IN ('Liability', 'Equity', 'Income') THEN
-            CASE WHEN t.type = 'income' THEN t.amount
-                 WHEN t.type = 'expense' THEN -t.amount
-                 ELSE 0 END
-          ELSE 0
-        END
-      ), 0) AS account_balance
-    FROM accounts acc
-    LEFT JOIN transactions t ON acc.id = t.account_id AND t.date <= $1
-    GROUP BY
-      CASE
-        WHEN acc.type = 'Income'  AND t.category IS NOT NULL THEN COALESCE(t.category, 'Uncategorized Income')
-        WHEN acc.type = 'Expense' AND t.category IS NOT NULL THEN COALESCE(t.category, 'Uncategorized Expense')
-        ELSE acc.name
-      END,
-      acc.type
-    HAVING COALESCE(SUM(
-      CASE
-        WHEN acc.type IN ('Asset', 'Expense') THEN
-          CASE WHEN t.type = 'expense' THEN t.amount
-               WHEN t.type = 'income'  THEN -t.amount
-               ELSE 0 END
-        WHEN acc.type IN ('Liability', 'Equity', 'Income') THEN
-          CASE WHEN t.type = 'income' THEN t.amount
-               WHEN t.type = 'expense' THEN -t.amount
-               ELSE 0 END
-        ELSE 0
-      END
-    ), 0) != 0
-    ORDER BY account_type, account_display_name;
-    `,
-    [trialBalanceEndDate]
-  );
+    const faQ = await pool.query(
+      `SELECT id, name, cost, accumulated_depreciation
+       FROM assets WHERE date_received <= $1 ORDER BY name;`, [end]
+    );
+    let totalFixedAssetsAtCost = 0;
+    let totalAccumulatedDepreciation = 0;
+    const fixedAssets = faQ.rows.map((a: any) => {
+      const cost = parseFloat(a.cost ?? 0);
+      const accDep = parseFloat(a.accumulated_depreciation ?? 0);
+      totalFixedAssetsAtCost += cost;
+      totalAccumulatedDepreciation += accDep;
+      return { name: a.name, cost, accumulated_depreciation: accDep, net_book_value: cost - accDep };
+    });
 
-  let trialAccounts = netBalancesResult.rows.map((account: any) => {
-    const bal = parseFloat(String(account.account_balance || 0));
-    let debitAmount = 0, creditAmount = 0;
+    const openingRetainedQ = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END),0) AS opening_retained
+       FROM transactions t WHERE t.date < $1;`, [start]
+    );
+    const openingRetained = parseFloat(openingRetainedQ.rows[0]?.opening_retained ?? 0);
 
-    if (account.account_type === 'Asset' || account.account_type === 'Expense') {
-      if (bal >= 0) debitAmount = bal; else creditAmount = Math.abs(bal);
-    } else { // Liability, Equity, Income
-      if (bal >= 0) creditAmount = bal; else debitAmount = Math.abs(bal);
+    const periodPLQ = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END),0) AS period_pl
+       FROM transactions t WHERE t.date >= $1 AND t.date <= $2;`, [start, end]
+    );
+    const periodPL = parseFloat(periodPLQ.rows[0]?.period_pl ?? 0);
+    const retainedToDate = openingRetained + periodPL;
+
+    // Build display sections
+    let totalCurrentAssets = 0;
+    const currentAssets = assetsAccounts
+      .filter(a => ['bank','cash','receivable'].some(k => norm(a.name).includes(k)))
+      .map(a => ({ item: a.name, amount: +a.balance }));
+    currentAssets.forEach(a => totalCurrentAssets += a.amount);
+
+    const totalNonCurrentAssets = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
+    const totalAssets = totalCurrentAssets + totalNonCurrentAssets;
+
+    let totalEquityAccountsBalance = 0;
+    const equityLines = equityAccounts.map(eq => {
+      const amt = +eq.balance; totalEquityAccountsBalance += amt; return { item: eq.name, amount: amt };
+    });
+    const totalEquity = totalEquityAccountsBalance + retainedToDate;
+
+    let totalNonCurrentLiabilities = 0;
+    const nonCurrentLiabs = liabilityAccounts
+      .filter(a => norm(a.name).includes('loan') || norm(a.name).includes('long-term'))
+      .map(l => { const amt = +l.balance; totalNonCurrentLiabilities += amt; return { item: l.name, amount: amt }; });
+
+    let totalCurrentLiabilities = 0;
+    const currentLiabs = liabilityAccounts
+      .filter(a =>
+        norm(a.name).includes('payable') ||
+        norm(a.name).includes('current liability') ||
+        norm(a.name).includes('credit facility')
+      )
+      .map(l => { const amt = +l.balance; totalCurrentLiabilities += amt; return { item: l.name, amount: amt }; });
+
+    let totalEquityAndLiabilities = totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
+
+    // optional auto-balance (presentation)
+    const adjustments: string[] = [];
+    let balanceDifference = nearZero(totalAssets - totalEquityAndLiabilities);
+    if (balanceDifference !== 0 && AUTO_ADJUST) {
+      let remaining = balanceDifference;
+
+      for (const strategy of STRATEGY_ORDER) {
+        if (nearZero(remaining) === 0) break;
+
+        if (strategy === 'depreciation' && remaining > 0) {
+          const room = Math.max(0, totalFixedAssetsAtCost - totalAccumulatedDepreciation);
+          const depAdj = nearZero(Math.min(remaining, room));
+          if (depAdj !== 0) {
+            totalAccumulatedDepreciation += depAdj;
+            const newNonCurrent = totalFixedAssetsAtCost - totalAccumulatedDepreciation;
+            const newTotalAssets = newNonCurrent + totalCurrentAssets;
+            totalEquityAndLiabilities = totalEquity + totalNonCurrentLiabilities + totalCurrentLiabilities;
+            remaining = nearZero(newTotalAssets - totalEquityAndLiabilities);
+            adjustments.push(`Extra Depreciation: ${formatCurrencyForPdf(depAdj)}`);
+          }
+        }
+
+        if (strategy === 'owners-drawings' && nearZero(remaining) !== 0) {
+          totalEquityAndLiabilities += remaining;
+          adjustments.push(`Owner's Drawings: ${formatCurrencyForPdf(remaining)}`);
+          remaining = 0;
+        }
+
+        if (strategy === 'suspense' && nearZero(remaining) !== 0) {
+          totalEquityAndLiabilities += remaining;
+          adjustments.push(`Suspense: ${formatCurrencyForPdf(remaining)}`);
+          remaining = 0;
+        }
+      }
+      balanceDifference = nearZero(totalAssets - totalEquityAndLiabilities);
     }
 
     return {
-      account_display_name: account.account_display_name,
-      account_type: account.account_type,
-      debitAmount,
-      creditAmount
+      header: { companyName, title: 'BALANCE SHEET', asOf: end, period: { start, end } },
+      assets: {
+        nonCurrent: {
+          fixedAssets,
+          totals: {
+            totalFixedAssetsAtCost,
+            totalAccumulatedDepreciation,
+            netBookValue: totalNonCurrentAssets
+          }
+        },
+        current: { lines: currentAssets, totalCurrentAssets },
+        totals: { totalAssets }
+      },
+      equityAndLiabilities: {
+        equity: {
+          lines: equityLines,
+          openingRetained,
+          periodPL,
+          retainedToDate,
+          totalEquity
+        },
+        liabilities: {
+          nonCurrent: { lines: nonCurrentLiabs, totalNonCurrentLiabilities },
+          current: { lines: currentLiabs, totalCurrentLiabilities }
+        },
+        totals: { totalEquityAndLiabilities, balanceDifference, adjustments }
+      }
     };
-  });
+  }
 
-  // remove zero rows
-  trialAccounts = trialAccounts.filter(a => a.debitAmount !== 0 || a.creditAmount !== 0);
+  async function calcCashFlow(start: string, end: string) {
+    type Tx = { type: 'income'|'expense'|'debt'; category: string|null; description?: string|null; amount: number; };
+    const r = await pool.query(
+      `SELECT type, category, description, amount
+       FROM transactions
+       WHERE date >= $1 AND date <= $2 AND (type='income' OR type='expense' OR type='debt');`,
+      [start, end]
+    );
+    const rows: Tx[] = r.rows.map((x: any) => ({ ...x, amount: parseFloat(x.amount) }));
 
-  // Totals BEFORE any plugs
-  let baseTotalDebit  = trialAccounts.reduce((s, a) => s + a.debitAmount, 0);
-  let baseTotalCredit = trialAccounts.reduce((s, a) => s + a.creditAmount, 0);
+    const classify = (row: Tx): 'operating'|'investing'|'financing' => {
+      const cat = (row.category || '').toLowerCase();
+      const desc = (row.description || '').toLowerCase();
+      if (['equipment','property','asset','vehicle'].some(k => cat.includes(k) || desc.includes(k))) return 'investing';
+      if (row.type === 'debt' || ['loan repayment','loan proceeds','share issuance','dividend','drawings']
+          .some(k => cat.includes(k) || desc.includes(k))) return 'financing';
+      return 'operating';
+    };
 
-  // Diff (credit - debit): >0 = PROFIT (credits larger), <0 = LOSS (debits larger)
-  const baseDiff = baseTotalCredit - baseTotalDebit;
-  const isProfit = baseDiff > 0;
-  const plAmount = Math.abs(baseDiff);
+    const sections = {
+      operating: new Map<string, number>(),
+      investing: new Map<string, number>(),
+      financing: new Map<string, number>(),
+    };
+    const totals = { operating: 0, investing: 0, financing: 0 };
 
-  // Header (we will always show P/L and reclass pairs)
+    for (const tx of rows) {
+      const sec = classify(tx);
+      const key = tx.description || tx.category || 'Uncategorized';
+      const curr = sections[sec].get(key) || 0;
+
+      if (tx.type === 'income') { sections[sec].set(key, curr + tx.amount); totals[sec] += tx.amount; }
+      else if (tx.type === 'expense') { sections[sec].set(key, curr - tx.amount); totals[sec] -= tx.amount; }
+      else if (tx.type === 'debt') { sections[sec].set(key, curr + tx.amount); totals[sec] += tx.amount; }
+    }
+
+    const formatSection = (label: string, m: Map<string, number>, total: number) => ({
+      label, items: Array.from(m.entries()).map(([item, amount]) => ({ item, amount })), total
+    });
+
+    const operating = formatSection('Operating Activities', sections.operating, totals.operating);
+    const investing = formatSection('Investing Activities', sections.investing, totals.investing);
+    const financing = formatSection('Financing Activities', sections.financing, totals.financing);
+    const netChange = totals.operating + totals.investing + totals.financing;
+
+    return {
+      header: { companyName, title: 'CASH FLOW STATEMENT', period: { start, end } },
+      sections: { operating, investing, financing },
+      totals: { netChange }
+    };
+  }
+
+  // ====== RENDERERS (PDF) ======
+  function drawDocumentHeader(docAny: any, company: string, title: string, dateString: string, disclaimerText: string | null = null) {
+    docAny.fontSize(16).font('Helvetica-Bold').text(company, { align: 'center' });
+    docAny.fontSize(14).font('Helvetica').text('MANAGEMENT ACCOUNTS', { align: 'center' });
+    docAny.moveDown(0.5);
+    docAny.fontSize(14).text(title, { align: 'center' });
+    docAny.fontSize(10).text(dateString, { align: 'center' });
+    docAny.moveDown();
+    if (disclaimerText) {
+      docAny.fontSize(8).fillColor('red').text(disclaimerText, { align: 'center', width: docAny.page.width - 100 });
+      docAny.fillColor('black').moveDown(0.5);
+    }
+  }
+
+  try {
+    // ======= JSON mode =======
+    if (wantJson) {
+      switch (documentType) {
+        case 'income-statement': {
+          const data = await calcIncomeStatement(startDate, endDate);
+          return res.json({ type: 'income-statement', data });
+        }
+        case 'trial-balance': {
+          const data = await calcTrialBalance(endDate);
+          return res.json({ type: 'trial-balance', data });
+        }
+        case 'balance-sheet': {
+          const data = await calcBalanceSheet(startDate, endDate);
+          return res.json({ type: 'balance-sheet', data });
+        }
+        case 'cash-flow-statement': {
+          const data = await calcCashFlow(startDate, endDate);
+          return res.json({ type: 'cash-flow-statement', data });
+        }
+        default:
+          return res.status(400).json({ error: 'Document type not supported.' });
+      }
+    }
+
+    // ======= PDF mode =======
+    // set headers ONLY in PDF mode
+    res.writeHead(200, {
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${documentType}-${startDate}-to-${endDate}.pdf"`
+    });
+
+    const doc = new PDFDocument();
+    doc.pipe(res);
+
+    const col1X = 50, col2X = 400, columnWidth = 100;
+
+    switch (documentType) {
+      case 'income-statement': {
+        const data = await calcIncomeStatement(startDate, endDate);
+        const { totals, breakdown } = data;
+
+        drawDocumentHeader(
+          doc, companyName, 'INCOME STATEMENT',
+          `FOR THE PERIOD ENDED ${new Date(endDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+        );
+
+        doc.font('Helvetica-Bold');
+        doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
+        doc.fillColor('#4a5568').text('Description', col1X + 5, doc.y + 5);
+        doc.text('Amount (R)', col2X, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5).fillColor('black').font('Helvetica');
+
+        doc.text('Sales', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(totals.totalSales), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0')
+          .moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+
+        doc.text('Less: Cost of Sales', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(totals.cogs), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0')
+          .moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+
+        doc.font('Helvetica-Bold');
+        doc.text('Gross Profit / (Loss)', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(totals.grossProfit), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0')
+          .moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5).font('Helvetica');
+
+        if (Object.keys(breakdown.otherIncome).length > 0 || totals.interestIncome > 0) {
+          doc.text('Add: Other Income', col1X, doc.y).moveDown(0.5);
+          if (totals.interestIncome > 0) {
+            doc.text('  Interest Income', col1X + 20, doc.y);
+            doc.text(formatCurrencyForPdf(totals.interestIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
+            doc.moveDown(0.5);
+          }
+          for (const k of Object.keys(breakdown.otherIncome)) {
+            doc.text(`  ${k}`, col1X + 20, doc.y);
+            doc.text(formatCurrencyForPdf(breakdown.otherIncome[k]), col2X, doc.y, { width: columnWidth, align: 'right' });
+            doc.moveDown(0.5);
+          }
+          doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        }
+
+        doc.font('Helvetica-Bold');
+        doc.text('Gross Income', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(totals.grossProfit + totals.interestIncome + totals.otherIncome), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5).font('Helvetica');
+
+        doc.text('Less: Expenses', col1X, doc.y).moveDown(0.5);
+        for (const e of breakdown.expenses) {
+          doc.text(`  ${e.category}`, col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(e.amount), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        }
+
+        doc.font('Helvetica-Bold');
+        doc.text('Total Expenses', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(totals.totalExpenses), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5).font('Helvetica');
+
+        doc.font('Helvetica-Bold');
+        doc.text(totals.netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(Math.abs(totals.netProfitLoss)), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(1).strokeColor('#a0aec0')
+          .moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5)
+          .moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown();
+
+        doc.fontSize(8).fillColor('#4a5568').text(
+          `Statement Period: ${new Date(startDate).toLocaleDateString('en-GB')} to ${new Date(endDate).toLocaleDateString('en-GB')}`,
+          { align: 'center' }
+        );
+        doc.fillColor('black').moveDown();
+        break;
+      }
+
+case 'trial-balance': {
+  const data = await calcTrialBalance(endDate);
+  const accountNameX = 50, debitX = 350, creditX = 500;
+  const col1X = 50, columnWidth = 100;
+
   drawDocumentHeader(
-    doc,
-    companyName,
-    'TRIAL BALANCE',
-    `AS OF ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB')}`,
-    
+    doc, companyName, 'TRIAL BALANCE',
+    `AS OF ${new Date(endDate).toLocaleDateString('en-GB')}`
   );
 
-  // === Multi-item "cascade" as net‑zero reclass pairs (does NOT change totals) ===
-  type ReclassPair = { debitName: string; creditName: string; amount: number };
-  const choosePairs = (): ReclassPair[] => {
-    // Use fractions of (plAmount || tiny base) so we always have small reclasses
-    const tinyBase = Math.max(1, (baseTotalDebit + baseTotalCredit) * 0.001);
-    const base = plAmount > 0 ? plAmount : tinyBase;
-    const fractions = [0.20, 0.15, 0.10, 0.05, 0.02]; // five pairs
-    const amts = fractions.map(f => Math.max(1, Math.round(base * f)));
-
-    if (isProfit) {
-      return [
-        { debitName: 'Additional Depreciation ', creditName: 'Accumulated Depreciation ', amount: amts[0] },
-        { debitName: 'Expense Reclassification',                       creditName: 'Accrued Expenses',                       amount: amts[1] },
-        { debitName: 'Prepaid Expense Adjustment',                      creditName: 'Deferred Income ',             amount: amts[2] },
-        { debitName: "Owner's Drawings ",         creditName: "Owner's Equity ",              amount: amts[3] },
-        { debitName: 'Rounding / Presentation',                         creditName: 'Rounding / Presentation',               amount: amts[4] },
-      ];
-    } else {
-      return [
-        { debitName: 'Income Reclassification ',          creditName: 'Other Income ',                amount: amts[0] },
-        { debitName: 'Inventory Revaluation ',                 creditName: 'Cost of Sales ',                 amount: amts[1] },
-        { debitName: 'Accrued Income ',                        creditName: 'Deferred Expense Reversal',             amount: amts[2] },
-        { debitName: 'Rounding / Presentation',                         creditName: 'Rounding / Presentation',               amount: amts[3] },
-        { debitName: "Owner's Equity ",                        creditName: "Owner's Capital ",        amount: amts[4] },
-      ];
-    }
-  };
-
-  const pairs = choosePairs();
-
-  // Push net-zero pairs (each pair adds same amount to debit and credit)
-  pairs.forEach(p => {
-    trialAccounts.push({
-      account_display_name: p.debitName,
-      account_type: 'Reclass',
-      debitAmount: p.amount,
-      creditAmount: 0
-    });
-    trialAccounts.push({
-      account_display_name: p.creditName,
-      account_type: 'Reclass',
-      debitAmount: 0,
-      creditAmount: p.amount
-    });
-  });
-
-  // ================= Table header =================
   doc.font('Helvetica-Bold');
   doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
   doc.fillColor('#4a5568').text('Account Name', accountNameX + 5, doc.y + 5);
   doc.text('Debit (R)', debitX, doc.y + 5, { width: columnWidth, align: 'right' });
   doc.text('Credit (R)', creditX, doc.y + 5, { width: columnWidth, align: 'right' });
-  doc.moveDown(0.5);
-  doc.fillColor('black').font('Helvetica');
+  doc.moveDown(0.5).fillColor('black').font('Helvetica');
 
-  // =========== Append Profit/Loss at the VERY BOTTOM on the CORRECT side ===========
-  // Recalculate totals BEFORE P/L (reclass pairs are net-zero)
-  let finalTotalDebit  = trialAccounts.reduce((s, a) => s + a.debitAmount, 0);
-  let finalTotalCredit = trialAccounts.reduce((s, a) => s + a.creditAmount, 0);
-  const finalDiff = finalTotalCredit - finalTotalDebit; // sign tells us side again
-  const finalIsProfit = finalDiff > 0;
-  const finalPL = Math.abs(finalDiff);
-
-  if (finalPL > 0) {
-    trialAccounts.push({
-      account_display_name: finalIsProfit ? 'Profit for the Period' : 'Loss for the Period',
-      account_type: 'Adjustment',
-      debitAmount: finalIsProfit ? 0 : finalPL,    // Loss → DEBIT
-      creditAmount: finalIsProfit ? finalPL : 0    // Profit → CREDIT
-    });
-
-    finalTotalDebit  += finalIsProfit ? 0 : finalPL;
-    finalTotalCredit += finalIsProfit ? finalPL : 0;
+  // If profitLossRow exists, it will be last. Render all non-PL rows first.
+  const lastIndex = data.profitLossRow ? data.rows.length - 1 : data.rows.length;
+  for (let i = 0; i < lastIndex; i++) {
+    const r = data.rows[i];
+    doc.text(r.name, accountNameX, doc.y);
+    doc.text(formatCurrencyForPdf(r.debit), debitX, doc.y, { width: columnWidth, align: 'right' });
+    doc.text(formatCurrencyForPdf(r.credit), creditX, doc.y, { width: columnWidth, align: 'right' });
+    doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0')
+      .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5);
   }
 
-  // ================= Render all rows (P/L is last before totals) =================
-  const hasPLRow = finalPL > 0;
-  const normalRowsEnd = hasPLRow ? trialAccounts.length - 1 : trialAccounts.length;
-
-  // Render normal rows
-  for (let i = 0; i < normalRowsEnd; i++) {
-    const account = trialAccounts[i];
-    doc.text(account.account_display_name, accountNameX, doc.y);
-    doc.text(formatCurrencyForPdf(account.debitAmount), debitX, doc.y, { width: columnWidth, align: 'right' });
-    doc.text(formatCurrencyForPdf(account.creditAmount), creditX, doc.y, { width: columnWidth, align: 'right' });
-    doc.moveDown(0.5);
-    doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
-    doc.moveDown(0.5);
-  }
-
-  // Render emphasized Profit/Loss row last (if present)
-  if (hasPLRow) {
-    const plRow = trialAccounts[trialAccounts.length - 1];
-
-    const rowY = doc.y;
-    const rowHeight = 18;
-
-    // Shaded background for P/L row
-    doc.save();
-    doc.fillColor('#f1f5f9').rect(col1X, rowY, doc.page.width - 100, rowHeight).fill();
-    doc.restore();
-
-    // Bold text on shaded row
+  // Emphasized Profit/Loss row
+  if (data.profitLossRow) {
+    const r = data.profitLossRow;
+    const rowY = doc.y, rowH = 18;
+    doc.save(); doc.fillColor('#f1f5f9').rect(col1X, rowY, doc.page.width - 100, rowH).fill(); doc.restore();
     doc.font('Helvetica-Bold');
-    doc.text(plRow.account_display_name, accountNameX, rowY + 3);
-    doc.text(formatCurrencyForPdf(plRow.debitAmount), debitX, rowY + 3, { width: columnWidth, align: 'right' });
-    doc.text(formatCurrencyForPdf(plRow.creditAmount), creditX, rowY + 3, { width: columnWidth, align: 'right' });
-    doc.y = rowY + rowHeight;
-
-    // Separator under the P/L row
+    doc.text(r.name, accountNameX, rowY + 3);
+    doc.text(formatCurrencyForPdf(r.debit), debitX, rowY + 3, { width: columnWidth, align: 'right' });
+    doc.text(formatCurrencyForPdf(r.credit), creditX, rowY + 3, { width: columnWidth, align: 'right' });
+    doc.y = rowY + rowH;
     doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
-    doc.moveDown(0.25);
-    doc.font('Helvetica'); // reset
+    doc.moveDown(0.25).font('Helvetica');
   }
 
-  // ===== Totals (after P/L line) =====
+  // If there was a final balancing plug, render it (it will be after PL in rows)
+  const tailStart = data.profitLossRow ? data.rows.length - 1 : data.rows.length;
+  for (let i = tailStart; i < data.rows.length; i++) {
+    const r = data.rows[i];
+    if (r.name === 'Suspense') {
+      doc.text(r.name, accountNameX, doc.y);
+      doc.text(formatCurrencyForPdf(r.debit), debitX, doc.y, { width: columnWidth, align: 'right' });
+      doc.text(formatCurrencyForPdf(r.credit), creditX, doc.y, { width: columnWidth, align: 'right' });
+      doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0')
+        .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5);
+    }
+  }
+
+  // Totals
   doc.font('Helvetica-Bold');
   doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
-  doc.fillColor('#4a5568').text('Total', col1X + 5, doc.y + 5);
-  doc.text(formatCurrencyForPdf(finalTotalDebit), debitX, doc.y + 5, { width: columnWidth, align: 'right' });
-  doc.text(formatCurrencyForPdf(finalTotalCredit), creditX, doc.y + 5, { width: columnWidth, align: 'right' });
+  doc.fillColor('#4a5568').text('Total', accountNameX + 5, doc.y + 5);
+  doc.text(formatCurrencyForPdf(data.totals.debit), debitX, doc.y + 5, { width: columnWidth, align: 'right' });
+  doc.text(formatCurrencyForPdf(data.totals.credit), creditX, doc.y + 5, { width: columnWidth, align: 'right' });
   doc.moveDown();
   doc.fillColor('black').font('Helvetica');
-  doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
-  doc.moveDown(0.5);
-  doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
-  doc.moveDown();
-
-  // Small disclosure
-  doc.fontSize(8).fillColor('red').text(
-    'Note: Profit/Loss line balances the trial balance. Additional reclassification pairs are presentation-only (net-zero).',
-    { align: 'center', width: doc.page.width - 100 }
-  );
-  doc.fillColor('black').moveDown();
+  doc.lineWidth(1).strokeColor('#a0aec0')
+    .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5)
+    .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown();
 
   doc.fontSize(8).fillColor('#4a5568').text(
-    `Statement Period: ${new Date(trialBalanceStartDate).toLocaleDateString('en-GB')} to ${new Date(trialBalanceEndDate).toLocaleDateString('en-GB')}`,
+    `Statement Period: ${new Date(startDate).toLocaleDateString('en-GB')} to ${new Date(endDate).toLocaleDateString('en-GB')}`,
     { align: 'center' }
   );
-  doc.fillColor('black');
-  doc.moveDown();
+  doc.fillColor('black').moveDown();
   break;
 }
 
 
-      // =========================== CASH FLOW STATEMENT ==========================
-      case 'cash-flow-statement': {
-        type TransactionRow = { type: string; category: string; amount: number; };
-        const classify = (row: { category: string }): 'operating' | 'investing' | 'financing' => {
-          const cat = (row.category || '').toLowerCase();
-          if (['equipment', 'property', 'asset', 'vehicle'].some(k => cat.includes(k))) return 'investing';
-          if (['loan', 'members loan', 'shareholders loan', 'credit facility'].some(k => cat.includes(k))) return 'financing';
-          return 'operating';
-        };
-
-        const cashFlows: { operating: TransactionRow[]; investing: TransactionRow[]; financing: TransactionRow[] } = {
-          operating: [], investing: [], financing: []
-        };
-
-        const rowsResult = await pool.query(
-          `SELECT type, category, amount FROM transactions
-           WHERE date >= $1 AND date <= $2 AND (type = 'income' OR type = 'expense');`,
-          [startDate, endDate]
-        );
-        const rows: TransactionRow[] = rowsResult.rows;
-
-        rows.forEach((row) => {
-          const section = classify(row);
-          const amount = row.type === 'income'
-            ? parseFloat(row.amount as any)
-            : -parseFloat(row.amount as any);
-          cashFlows[section].push({ ...row, amount });
-        });
-
-        const renderSection = (title: string, items: TransactionRow[]) => {
-          doc.font('Helvetica-Bold').fontSize(12).text(title, col1X, doc.y);
-          doc.moveDown(0.5);
-          doc.font('Helvetica');
-
-          const aggregated: Record<string, number> = {};
-          items.forEach(item => {
-            const cat = item.category || 'Uncategorized';
-            aggregated[cat] = (aggregated[cat] || 0) + item.amount;
-          });
-
-          let total = 0;
-          Object.keys(aggregated).forEach(cat => {
-            const amt = aggregated[cat];
-            doc.text(`  ${cat}`, col1X + 20, doc.y);
-            doc.text(formatCurrencyForPdf(amt), col2X, doc.y, { width: columnWidth, align: 'right' });
-            total += amt;
-            doc.moveDown(0.5);
-            doc.lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-            doc.moveDown(0.5);
-          });
-
-          doc.font('Helvetica-Bold');
-          doc.text(`Net ${title}`, col1X, doc.y);
-          doc.text(formatCurrencyForPdf(total), col2X, doc.y, { width: columnWidth, align: 'right' });
-          doc.moveDown(1);
-          doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-          doc.moveDown(0.5);
-          doc.font('Helvetica');
-
-          return total;
-        };
+      case 'balance-sheet': {
+        const data = await calcBalanceSheet(startDate, endDate);
 
         drawDocumentHeader(
-          doc,
-          companyName,
-          'CASH FLOW STATEMENT',
-          `FOR THE PERIOD ENDED ${new Date(endDate.toString()).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+          doc, companyName, 'BALANCE SHEET',
+          `AS OF ${new Date(endDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
         );
 
-        const totalOperating  = renderSection('Operating Activities', cashFlows.operating);
-        const totalInvesting  = renderSection('Investing Activities', cashFlows.investing);
-        const totalFinancing  = renderSection('Financing Activities', cashFlows.financing);
+        // ASSETS
+        doc.font('Helvetica-Bold').fontSize(12).text('ASSETS', col1X, doc.y).moveDown(0.5).font('Helvetica');
 
-        const netIncreaseInCash = totalOperating + totalInvesting + totalFinancing;
+        doc.font('Helvetica-Bold').text('Non-current Assets', col1X, doc.y).moveDown(0.5).font('Helvetica');
 
-        doc.font('Helvetica-Bold').fontSize(12).text('Net Increase / (Decrease) in Cash', col1X, doc.y);
-        doc.text(formatCurrencyForPdf(netIncreaseInCash), col2X, doc.y, { width: columnWidth, align: 'right' });
-        doc.moveDown();
-        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
+        if (data.assets.nonCurrent.fixedAssets.length) {
+          doc.text('  Fixed Assets at Cost:', col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(data.assets.nonCurrent.totals.totalFixedAssetsAtCost), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5);
+          doc.text('  Less: Accumulated Depreciation', col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(data.assets.nonCurrent.totals.totalAccumulatedDepreciation), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+          doc.font('Helvetica-Bold');
+          doc.text('Net Book Value of Fixed Assets', col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(data.assets.nonCurrent.totals.netBookValue), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5).font('Helvetica');
+        } else {
+          doc.text('  No Fixed Assets to display.', col1X + 20, doc.y).moveDown(1);
+        }
+
+        doc.font('Helvetica-Bold').text('Total Non-current Assets', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(data.assets.nonCurrent.totals.netBookValue), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5).font('Helvetica');
+
+        doc.font('Helvetica-Bold').text('Current Assets', col1X, doc.y).moveDown(0.5).font('Helvetica');
+        for (const ca of data.assets.current.lines) {
+          doc.text(`  ${ca.item}`, col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(ca.amount), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        }
+        doc.font('Helvetica-Bold').text('Total Current Assets', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(data.assets.current.totalCurrentAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+
+        doc.font('Helvetica-Bold').fontSize(12).text('Total Assets', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(data.assets.totals.totalAssets), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(2).lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown();
+
+        // EQUITY AND LIABILITIES
+        doc.font('Helvetica-Bold').fontSize(12).text('EQUITY AND LIABILITIES', col1X, doc.y).moveDown(0.5).font('Helvetica');
+
+        doc.font('Helvetica-Bold').text('Capital and Reserves', col1X, doc.y).moveDown(0.5);
+        for (const eq of data.equityAndLiabilities.equity.lines) {
+          doc.font('Helvetica').text(`  ${eq.item}`, col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(eq.amount), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        }
+        const e = data.equityAndLiabilities.equity;
+        doc.font('Helvetica').text('  Opening Retained Earnings', col1X + 20, doc.y);
+        doc.text(formatCurrencyForPdf(e.openingRetained), col2X, doc.y, { width: columnWidth, align: 'right' });
         doc.moveDown(0.5);
-        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke();
-        doc.moveDown();
+        doc.text(e.periodPL >= 0 ? '  Add: Net Profit for the period' : '  Less: Net Loss for the period', col1X + 20, doc.y);
+        doc.text(formatCurrencyForPdf(e.periodPL), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        doc.font('Helvetica-Bold').text('Retained Earnings (to date)', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(e.retainedToDate), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+
+        doc.font('Helvetica-Bold').text('Total Equity', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(e.totalEquity), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5).font('Helvetica');
+
+        doc.font('Helvetica-Bold').text('Non-Current Liabilities', col1X, doc.y).moveDown(0.5).font('Helvetica');
+        for (const ncl of data.equityAndLiabilities.liabilities.nonCurrent.lines) {
+          doc.text(`  ${ncl.item}`, col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(ncl.amount), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        }
+        doc.font('Helvetica-Bold').text('Total Non-Current Liabilities', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(data.equityAndLiabilities.liabilities.nonCurrent.totalNonCurrentLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5).font('Helvetica');
+
+        doc.font('Helvetica-Bold').text('Current Liabilities', col1X, doc.y).moveDown(0.5).font('Helvetica');
+        for (const cl of data.equityAndLiabilities.liabilities.current.lines) {
+          doc.text(`  ${cl.item}`, col1X + 20, doc.y);
+          doc.text(formatCurrencyForPdf(cl.amount), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        }
+        doc.font('Helvetica-Bold').text('Total Current Liabilities', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(data.equityAndLiabilities.liabilities.current.totalCurrentLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+
+        doc.text('Total Equity and Liabilities', col1X, doc.y).font('Helvetica');
+        doc.text(formatCurrencyForPdf(data.equityAndLiabilities.totals.totalEquityAndLiabilities), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown(2).lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+        doc.lineWidth(1).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown();
+
+        if (data.equityAndLiabilities.totals.adjustments.length) {
+          doc.fontSize(8).fillColor('red').text(
+            `Auto-balancing applied for presentation: ${data.equityAndLiabilities.totals.adjustments.join(' | ')}`,
+            { align: 'center', width: doc.page.width - 100 }
+          );
+          doc.fillColor('black').moveDown();
+        }
 
         doc.fontSize(8).fillColor('#4a5568').text(
-          `Statement Period: ${new Date(startDate as string).toLocaleDateString('en-GB')} to ${new Date(endDate as string).toLocaleDateString('en-GB')}`,
+          `Statement Period: ${new Date(startDate).toLocaleDateString('en-GB')} to ${new Date(endDate).toLocaleDateString('en-GB')}`,
           { align: 'center' }
         );
-        doc.fillColor('black');
-        doc.moveDown();
+        doc.fillColor('black').moveDown();
         break;
       }
 
-      // ========================================================================
+      case 'cash-flow-statement': {
+        const data = await calcCashFlow(startDate, endDate);
+
+        drawDocumentHeader(
+          doc, companyName, 'CASH FLOW STATEMENT',
+          `FOR THE PERIOD ENDED ${new Date(endDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}`
+        );
+
+        const renderSec = (title: string, sec: { items: { item: string; amount: number }[]; total: number }) => {
+          doc.font('Helvetica-Bold').fontSize(12).text(title, col1X, doc.y).moveDown(0.5).font('Helvetica');
+          for (const it of sec.items) {
+            doc.text(`  ${it.item}`, col1X + 20, doc.y);
+            doc.text(formatCurrencyForPdf(it.amount), col2X, doc.y, { width: columnWidth, align: 'right' });
+            doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5);
+          }
+          doc.font('Helvetica-Bold').text(`Net ${title}`, col1X, doc.y);
+          doc.text(formatCurrencyForPdf(sec.total), col2X, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(1).lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5).font('Helvetica');
+        };
+
+        renderSec(data.sections.operating.label, data.sections.operating);
+        renderSec(data.sections.investing.label, data.sections.investing);
+        renderSec(data.sections.financing.label, data.sections.financing);
+
+        doc.font('Helvetica-Bold').fontSize(12).text('Net Increase / (Decrease) in Cash', col1X, doc.y);
+        doc.text(formatCurrencyForPdf(data.totals.netChange), col2X, doc.y, { width: columnWidth, align: 'right' });
+        doc.moveDown().lineWidth(1).strokeColor('#a0aec0')
+          .moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown(0.5)
+          .moveTo(col1X, doc.y).lineTo(col2X + columnWidth, doc.y).stroke().moveDown();
+
+        doc.fontSize(8).fillColor('#4a5568').text(
+          `Statement Period: ${new Date(startDate).toLocaleDateString('en-GB')} to ${new Date(endDate).toLocaleDateString('en-GB')}`,
+          { align: 'center' }
+        );
+        doc.fillColor('black').moveDown();
+        break;
+      }
+
       default:
         doc.text('Document type not supported.', { align: 'center' });
         doc.end();
@@ -6591,18 +6448,16 @@ case 'trial-balance': {
     }
 
     doc.end();
-
-  } catch (error: unknown) {
+  } catch (error: any) {
     console.error(`Error generating ${documentType}:`, error);
-    res.removeHeader('Content-Disposition');
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    if (error instanceof Error) {
-      res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: error.message }));
-    } else {
-      res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: String(error) }));
+    if (!wantJson) {
+      res.removeHeader('Content-Disposition');
+      if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
     }
+    res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: error?.message || String(error) }));
   }
 });
+
 
 // Profile endpoints
 // GET /api/profile
