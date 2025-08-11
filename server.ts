@@ -5570,7 +5570,8 @@ app.delete('/api/projects/:id', authMiddleware, async (req: Request, res: Respon
 /* --- Financial Document Generation API (dual: JSON or PDF) --- */
 /* --- Financial Document Generation API (dual: JSON or PDF) --- */
 /* --- Financial Document Generation API (dual: JSON or PDF) --- */
-app.get('/generate-financial-document', async (req: Request, res: Response) => {
+/* --- Financial Document Generation API (dual: JSON or PDF) --- */
+app.get('/generate-financial-document', authMiddleware, async (req: Request, res: Response) => {
   const { documentType, startDate, endDate, format } = req.query as {
     documentType?: string;
     startDate?: string;
@@ -5582,6 +5583,8 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'documentType, startDate, and endDate are required.' });
   }
 
+  // Scope to the company owner (tenant)
+  const user_id = req.user!.parent_user_id;
   const wantJson = String(format || '').toLowerCase() === 'json';
 
   // ====== constants & helpers shared by JSON + PDF renderers ======
@@ -5600,12 +5603,10 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
 
   let companyName = 'MADE BY QUANTILYTIX';
   try {
-    const userId = (req as any).user?.user_id;
-    if (userId) {
-      const r = await pool.query('SELECT company FROM public.users WHERE user_id = $1;', [userId]);
-      if (r.rows[0]?.company) companyName = r.rows[0].company;
-    }
-  } catch (e) {
+    // Look up the company for the tenant (parent account)
+    const r = await pool.query('SELECT company FROM public.users WHERE user_id = $1;', [user_id]);
+    if (r.rows[0]?.company) companyName = r.rows[0].company;
+  } catch {
     console.warn('Company name lookup failed, using default.');
   }
 
@@ -5626,24 +5627,32 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
     return rows.filter(r => !pats.some(p => norm(r.name).includes(p)));
   }
 
-  // ====== CALCULATION LAYERS (used by JSON + PDF) ======
+  // ====== CALCULATION LAYERS (all tenant-filtered) ======
   async function calcIncomeStatement(start: string, end: string) {
     const incomeQ = await pool.query(
       `SELECT t.category, SUM(t.amount) AS total_amount
        FROM transactions t
-       WHERE t.type='income' AND t.date>= $1 AND t.date<= $2
-       GROUP BY t.category;`, [start, end]);
+       WHERE t.user_id = $1 AND t.type='income' AND t.date>= $2 AND t.date<= $3
+       GROUP BY t.category;`,
+      [user_id, start, end]
+    );
+
     const cogsQ = await pool.query(
       `SELECT SUM(t.amount) AS total_cogs
        FROM transactions t
-       WHERE t.type='expense' AND t.category='Cost of Goods Sold'
-         AND t.date>= $1 AND t.date<= $2;`, [start, end]);
+       WHERE t.user_id = $1 AND t.type='expense' AND t.category='Cost of Goods Sold'
+         AND t.date>= $2 AND t.date<= $3;`,
+      [user_id, start, end]
+    );
+
     const expQ = await pool.query(
       `SELECT t.category, SUM(t.amount) AS total_amount
        FROM transactions t
-       WHERE t.type='expense' AND t.category!='Cost of Goods Sold'
-         AND t.date>= $1 AND t.date<= $2
-       GROUP BY t.category;`, [start, end]);
+       WHERE t.user_id = $1 AND t.type='expense' AND t.category!='Cost of Goods Sold'
+         AND t.date>= $2 AND t.date<= $3
+       GROUP BY t.category;`,
+      [user_id, start, end]
+    );
 
     let totalSales = 0, interestIncome = 0, otherIncome = 0;
     const otherIncomeBreakdown: Record<string, number> = {};
@@ -5670,22 +5679,19 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
 
   // === Trial Balance: align displayed P/L to canonical Income Statement P/L ===
   async function calcTrialBalance(start: string, end: string) {
-    // round to cents
     const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-    // 0) Get canonical P/L from Income Statement
+    // 0) Get canonical P/L from Income Statement (already tenant-scoped)
     const isData = await calcIncomeStatement(start, end);
-    const targetPL = r2(isData.totals.netProfitLoss); // this is the truth (credit - debit)
+    const targetPL = r2(isData.totals.netProfitLoss); // credit - debit
 
     const q = await pool.query(
       `
--- inside calcTrialBalance
 WITH t_norm AS (
   SELECT
     acc.id,
     acc.name,
     acc.type,
-    /* normalize category: NULL, empty, or variants of N/A -> NULL */
     CASE
       WHEN t.category IS NULL THEN NULL
       WHEN btrim(t.category) = '' THEN NULL
@@ -5698,14 +5704,14 @@ WITH t_norm AS (
   FROM accounts acc
   LEFT JOIN transactions t
     ON acc.id = t.account_id
-   AND t.date <= $1
+   AND t.user_id = $1
+   AND t.date <= $2
+  WHERE acc.user_id = $1
 )
 SELECT
   CASE
-    WHEN t_norm.type = 'Income'  AND norm_category IS NOT NULL
-      THEN norm_category
-    WHEN t_norm.type = 'Expense' AND norm_category IS NOT NULL
-      THEN norm_category
+    WHEN t_norm.type = 'Income'  AND norm_category IS NOT NULL THEN norm_category
+    WHEN t_norm.type = 'Expense' AND norm_category IS NOT NULL THEN norm_category
     ELSE t_norm.name
   END AS account_display_name,
   t_norm.type AS account_type,
@@ -5725,10 +5731,8 @@ SELECT
 FROM t_norm
 GROUP BY
   CASE
-    WHEN t_norm.type = 'Income'  AND norm_category IS NOT NULL
-      THEN norm_category
-    WHEN t_norm.type = 'Expense' AND norm_category IS NOT NULL
-      THEN norm_category
+    WHEN t_norm.type = 'Income'  AND norm_category IS NOT NULL THEN norm_category
+    WHEN t_norm.type = 'Expense' AND norm_category IS NOT NULL THEN norm_category
     ELSE t_norm.name
   END,
   t_norm.type
@@ -5747,13 +5751,12 @@ HAVING COALESCE(SUM(
 ),0) != 0
 ORDER BY account_type, account_display_name;
       `,
-      [end]
+      [user_id, end]
     );
 
     type RowType = 'Asset'|'Liability'|'Equity'|'Income'|'Expense'|'Reclass'|'Adjustment';
     type Row = { name: string; type: RowType; debit: number; credit: number };
 
-    // 1) Base rows
     const rows: Row[] = q.rows.map((r: any) => {
       const bal = r2(Number(r.account_balance || 0));
       let debit = 0, credit = 0;
@@ -5762,28 +5765,16 @@ ORDER BY account_type, account_display_name;
       } else {
         if (bal >= 0) credit = bal; else debit = r2(Math.abs(bal));
       }
-      return {
-        name: String(r.account_display_name),
-        type: String(r.account_type) as RowType,
-        debit: r2(debit),
-        credit: r2(credit),
-      };
+      return { name: String(r.account_display_name), type: String(r.account_type) as RowType, debit: r2(debit), credit: r2(credit) };
     });
 
     // ---- helpers
     const _norm = (s: string) => (s || '').toLowerCase();
     const sumD = () => r2(rows.reduce((s, x) => s + x.debit, 0));
     const sumC = () => r2(rows.reduce((s, x) => s + x.credit, 0));
-    const indexOfLastType = (t: RowType) => {
-      for (let i = rows.length - 1; i >= 0; i--) if (rows[i].type === t) return i;
-      return -1;
-    };
+    const indexOfLastType = (t: RowType) => { for (let i = rows.length - 1; i >= 0; i--) if (rows[i].type === t) return i; return -1; };
     const findIdxBySubstring = (substr: string) => rows.findIndex(r => _norm(r.name).includes(_norm(substr)));
-    const insertAfter = (idx: number, row: Row) => {
-      const pos = Math.max(0, Math.min(rows.length, idx + 1));
-      rows.splice(pos, 0, row);
-      return pos;
-    };
+    const insertAfter = (idx: number, row: Row) => { const pos = Math.max(0, Math.min(rows.length, idx + 1)); rows.splice(pos, 0, row); return pos; };
     const insertNear = (substr: string | null, fallbackType: RowType, row: Row) => {
       const anchorIdx = substr ? findIdxBySubstring(substr) : -1;
       if (anchorIdx >= 0) return insertAfter(anchorIdx, row);
@@ -5793,7 +5784,7 @@ ORDER BY account_type, account_display_name;
       return rows.length - 1;
     };
 
-    // 2) Build presentation reclass pairs (net‑zero overall; do NOT change PL)
+    // 2) Presentation reclasses (no net impact on P/L)
     const baseDebit = sumD();
     const baseCredit = sumC();
     const absBase = Math.max(1, r2((baseDebit + baseCredit) * 0.001));
@@ -5862,7 +5853,7 @@ ORDER BY account_type, account_display_name;
       }
       prePLDebit = sumD();
       prePLCredit = sumC();
-      prePLDiff = r2(prePLCredit - prePLDebit); // should equal targetPL now
+      prePLDiff = r2(prePLCredit - prePLDebit);
     }
 
     // 4) Profit/Loss row LAST, using the canonical value
@@ -5909,7 +5900,6 @@ ORDER BY account_type, account_display_name;
 
   // === Balance Sheet: consume the SAME period P/L from Income Statement ===
   async function calcBalanceSheet(start: string, end: string) {
-    // Canonical P/L for the period
     const isData = await calcIncomeStatement(start, end);
     const periodPL = parseFloat(String(isData.totals.netProfitLoss || 0)); // same sign as IS
 
@@ -5923,10 +5913,14 @@ ORDER BY account_type, account_display_name;
                WHEN acc.type IN ('Liability','Equity') AND t.type='expense' THEN -t.amount
                ELSE 0 END),0) AS balance
       FROM accounts acc
-      LEFT JOIN transactions t ON acc.id=t.account_id AND t.date<= $1
-      WHERE acc.type IN ('Asset','Liability','Equity')
+      LEFT JOIN transactions t ON acc.id=t.account_id
+                               AND t.user_id = $1
+                               AND t.date<= $2
+      WHERE acc.user_id = $1
+        AND acc.type IN ('Asset','Liability','Equity')
       GROUP BY acc.id, acc.name, acc.type
-      ORDER BY acc.type, acc.name;`, [end]
+      ORDER BY acc.type, acc.name;`,
+      [user_id, end]
     );
     const allAccounts = accountsQ.rows as AccRow[];
 
@@ -5940,7 +5934,10 @@ ORDER BY account_type, account_display_name;
 
     const faQ = await pool.query(
       `SELECT id, name, cost, accumulated_depreciation
-       FROM assets WHERE date_received <= $1 ORDER BY name;`, [end]
+       FROM assets
+       WHERE user_id = $1 AND date_received <= $2
+       ORDER BY name;`,
+      [user_id, end]
     );
     let totalFixedAssetsAtCost = 0;
     let totalAccumulatedDepreciation = 0;
@@ -5954,7 +5951,9 @@ ORDER BY account_type, account_display_name;
 
     const openingRetainedQ = await pool.query(
       `SELECT COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END),0) AS opening_retained
-       FROM transactions t WHERE t.date < $1;`, [start]
+       FROM transactions t
+       WHERE t.user_id = $1 AND t.date < $2;`,
+      [user_id, start]
     );
     const openingRetained = parseFloat(openingRetainedQ.rows[0]?.opening_retained ?? 0);
 
@@ -6066,8 +6065,9 @@ ORDER BY account_type, account_display_name;
     const r = await pool.query(
       `SELECT type, category, description, amount
        FROM transactions
-       WHERE date >= $1 AND date <= $2 AND (type='income' OR type='expense' OR type='debt');`,
-      [start, end]
+       WHERE user_id = $1 AND date >= $2 AND date <= $3
+         AND (type='income' OR type='expense' OR type='debt');`,
+      [user_id, start, end]
     );
     const rows: Tx[] = r.rows.map((x: any) => ({ ...x, amount: parseFloat(x.amount) }));
 
@@ -6154,7 +6154,6 @@ ORDER BY account_type, account_display_name;
     }
 
     // ======= PDF mode =======
-    // set headers ONLY in PDF mode
     res.writeHead(200, {
       'Content-Type': 'application/pdf',
       'Content-Disposition': `attachment; filename="${documentType}-${startDate}-to-${endDate}.pdf"`
@@ -6475,7 +6474,7 @@ ORDER BY account_type, account_display_name;
   } catch (error: any) {
     console.error(`Error generating ${documentType}:`, error);
     if (!wantJson) {
-      res.removeHeader('Content-Disposition');
+      try { res.removeHeader('Content-Disposition'); } catch {}
       if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
     }
     res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: error?.message || String(error) }));
