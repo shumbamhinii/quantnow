@@ -2485,6 +2485,10 @@ app.post('/transactions/manual', authMiddleware, async (req: Request, res: Respo
     });
   }
 });
+// Simple ping route to keep service alive
+app.get('/ping', (req, res) => {
+  res.status(200).send('pong');
+});
 
 
 /* --- Audio upload & processing --- */
