@@ -2350,6 +2350,143 @@ app.post('/transactions/process-text', authMiddleware, async (req: Request, res:
   }
 });
 
+/* --- Create a manual transaction (aligned to your DDL) --- */
+// Create/Update manual transaction WITH auth + user_id scoping
+app.post('/transactions/manual', authMiddleware, async (req: Request, res: Response) => {
+  // company scope first, fallback to individual
+  const user_id = (req.user!.parent_user_id || req.user!.user_id)!;
+
+  // Accept both snake & camel from UI
+  const {
+    id,
+    type,
+    amount,
+    description,
+    date,
+    category,
+    account_id: account_id_raw,
+    accountId,
+    original_text,
+    source,
+    confirmed,
+  } = req.body ?? {};
+
+  const account_id = account_id_raw ?? accountId ?? null;
+
+  // Minimal validation (keep your behaviour, just clearer messages)
+  if (!type || !amount || !date) {
+    return res.status(400).json({ detail: 'type, amount, and date are required' });
+  }
+
+  try {
+    let result;
+
+    if (id) {
+      // UPDATE guarded by user_id so users can only update their own rows
+      result = await pool.query(
+        `
+        UPDATE public.transactions
+        SET
+          "type"        = $1,
+          amount        = $2::numeric(12,2),
+          description   = $3,
+          "date"        = $4::date,
+          category      = $5,
+          account_id    = $6,
+          original_text = $7,
+          "source"      = $8,
+          confirmed     = COALESCE($9, confirmed)
+        WHERE id = $10 AND user_id = $11
+        RETURNING id, user_id, account_id, "type", amount, description, "date",
+                  category, created_at, original_text, "source", confirmed
+        `,
+        [
+          String(type),
+          amount,
+          description ?? null,
+          date,
+          category ?? null,
+          account_id ?? null,
+          original_text ?? null,
+          (source ?? 'manual'),
+          (typeof confirmed === 'boolean' ? confirmed : null),
+          id,
+          user_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        // Either not found or not owned by this user
+        return res.status(404).json({ error: 'Transaction not found or not permitted' });
+      }
+    } else {
+      // INSERT includes user_id to scope row ownership
+      result = await pool.query(
+        `
+        INSERT INTO public.transactions
+          (user_id, "type", amount, description, "date", category, account_id,
+           original_text, "source", confirmed)
+        VALUES
+          ($1,      $2,     $3::numeric(12,2), $4,         $5::date, $6,       $7,
+           $8,           $9,        COALESCE($10, true))
+        RETURNING id, user_id, account_id, "type", amount, description, "date",
+                  category, created_at, original_text, "source", confirmed
+        `,
+        [
+          user_id,
+          String(type),
+          amount,
+          description ?? null,
+          date,
+          category ?? null,
+          account_id ?? null,
+          original_text ?? null,
+          (source ?? 'manual'),
+          (typeof confirmed === 'boolean' ? confirmed : null),
+        ]
+      );
+    }
+
+    // Fetch with account_name for consistent response (also scoped by user_id)
+    const full = await pool.query(
+      `
+      SELECT
+        t.id,
+        t.user_id,
+        t.account_id,
+        t."type",
+        t.amount,
+        t.description,
+        t."date",
+        t.category,
+        t.created_at,
+        t.original_text,
+        t."source",
+        t.confirmed,
+        acc.name AS account_name
+      FROM public.transactions t
+      LEFT JOIN public.accounts acc ON t.account_id = acc.id
+      WHERE t.id = $1 AND t.user_id = $2
+      `,
+      [result.rows[0].id, user_id]
+    );
+
+    if (full.rows.length === 0) {
+      // Extremely unlikely, but handle
+      return res.status(404).json({ error: 'Transaction not found after save' });
+    }
+
+    return res.json(full.rows[0]);
+  } catch (error: any) {
+    console.error('DB operation error:', error);
+    return res.status(500).json({
+      detail: 'Failed to perform transaction operation',
+      error: error?.message || String(error),
+    });
+  }
+});
+
+
 /* --- Audio upload & processing --- */
 app.post('/transactions/process-audio', authMiddleware, upload.single('audio_file'), async (req: Request, res: Response) => { // ADDED authMiddleware
   const user_id = req.user!.parent_user_id; // Get user_id from req.user
