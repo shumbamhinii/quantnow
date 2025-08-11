@@ -1367,53 +1367,178 @@ app.get('/transactions', authMiddleware, async (req: Request, res: Response) => 
   }
 });
 
+// ---- money helpers (server-side) ----
+const toNum = (v: unknown) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+/**
+ * Formats amounts for PDFs/HTML. Accepts:
+ *  - ISO currency like 'ZAR', 'USD'
+ *  - local symbol like 'R'
+ *  - empty/undefined -> defaults to South Africa Rand symbol 'R'
+ *
+ * Examples:
+ *  formatCurrency(1234.5, 'ZAR') -> "R 1,234.50"
+ *  formatCurrency(1234.5, 'R')   -> "R1,234.50"
+ *  formatCurrency('1234.5', '')  -> "R1,234.50"
+ */
+function formatCurrency(amount: number | string | null | undefined, currency?: string): string {
+  const val = toNum(amount);
+  const cur = (currency || '').trim().toUpperCase();
+
+  // If an ISO code is given (e.g., ZAR/USD/EUR), use Intl currency formatting
+  if (cur && cur.length === 3) {
+    try {
+      return new Intl.NumberFormat('en-ZA', {
+        style: 'currency',
+        currency: cur,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(val);
+    } catch {
+      // fall through to symbol formatting if Intl rejects the code
+    }
+  }
+
+  // Otherwise, assume symbol formatting (default 'R')
+  const symbol = (currency && currency.trim()) ? currency.trim() : 'R';
+  return `${symbol}${val.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 
 /* --- Accounts API --- */
-app.get('/accounts', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const user_id = req.user!.parent_user_id; // Get user_id from req.user
+app.get('/accounts', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.parent_user_id;
   try {
-    // Select 'type' and 'code' to match frontend's expected Account interface
-    const result = await pool.query('SELECT id, name, type, code FROM accounts WHERE user_id = $1 ORDER BY id', [user_id]); // ADDED user_id filter
+    const result = await pool.query(
+      `SELECT id, name, type, code
+         FROM accounts
+        WHERE user_id = $1
+        ORDER BY code ASC, name ASC`,
+      [user_id]
+    );
     res.json(result.rows);
-  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+  } catch (error: unknown) {
     console.error('Error fetching accounts:', error);
     res.status(500).json({ error: 'Failed to fetch accounts', detail: error instanceof Error ? error.message : String(error) });
   }
 });
 
-app.post('/accounts', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  // Expect 'type', 'name', and 'code' from the frontend
+app.post('/accounts', authMiddleware, async (req: Request, res: Response) => {
   const { type, name, code } = req.body;
-  const user_id = req.user!.parent_user_id; // Get user_id from req.user
+  const user_id = req.user!.parent_user_id;
 
-  // Validate all required fields based on your DB schema
   if (!type || !name || !code) {
     return res.status(400).json({ error: 'Missing required account fields: type, name, code' });
   }
 
   try {
+    // Enforce unique (user_id, code)
+    const dupe = await pool.query(`SELECT 1 FROM accounts WHERE user_id = $1 AND code = $2 LIMIT 1`, [user_id, code]);
+    if (dupe.rowCount) {
+      return res.status(409).json({ error: `Account code ${code} already exists.` });
+    }
+
     const insert = await pool.query(
-      // Insert into 'type', 'name', 'code' columns
-      `INSERT INTO accounts (type, name, code, user_id) VALUES ($1, $2, $3, $4) RETURNING id`, // ADDED user_id
+      `INSERT INTO accounts (type, name, code, user_id)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, type, code`,
       [type, name, code, user_id]
     );
-    const insertedId = insert.rows[0].id;
 
-    const fullAccount = await pool.query(
-      // Select the inserted account, including 'type' and 'code'
-      `SELECT id, name, type, code FROM accounts WHERE id = $1 AND user_id = $2`, // ADDED user_id filter
-      [insertedId, user_id]
-    );
-    res.json(fullAccount.rows[0]);
-  } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    res.status(201).json(insert.rows[0]);
+  } catch (error: unknown) {
     console.error('Error adding account:', error);
     res.status(500).json({ error: 'Failed to add account', detail: error instanceof Error ? error.message : String(error) });
   }
 });
 
-const formatCurrency = (amount: number, currency: string = 'R'): string => {
-  return `${currency}${amount.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-};
+app.put('/accounts/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { type, name, code } = req.body as Partial<{ type: string; name: string; code: string }>;
+  const user_id = req.user!.parent_user_id;
+
+  if (!type && !name && !code) {
+    return res.status(400).json({ error: 'Provide at least one field to update: type, name, or code' });
+  }
+
+  try {
+    // Ensure the account belongs to this user
+    const exists = await pool.query(`SELECT id, code FROM accounts WHERE id = $1 AND user_id = $2`, [id, user_id]);
+    if (!exists.rowCount) return res.status(404).json({ error: 'Account not found' });
+
+    // If changing code, enforce unique per user
+    if (code) {
+      const dupe = await pool.query(
+        `SELECT 1 FROM accounts WHERE user_id = $1 AND code = $2 AND id <> $3 LIMIT 1`,
+        [user_id, code, id]
+      );
+      if (dupe.rowCount) {
+        return res.status(409).json({ error: `Account code ${code} already exists.` });
+      }
+    }
+
+    // Build dynamic update
+    const fields: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+
+    if (type) { fields.push(`type = $${idx++}`); values.push(type); }
+    if (name) { fields.push(`name = $${idx++}`); values.push(name); }
+    if (code) { fields.push(`code = $${idx++}`); values.push(code); }
+
+    values.push(id, user_id);
+
+    const updated = await pool.query(
+      `UPDATE accounts
+          SET ${fields.join(', ')},
+              updated_at = NOW()
+        WHERE id = $${idx++} AND user_id = $${idx}
+        RETURNING id, name, type, code`,
+      values
+    );
+
+    res.json(updated.rows[0]);
+  } catch (error: unknown) {
+    console.error('Error updating account:', error);
+    res.status(500).json({ error: 'Failed to update account', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete('/accounts/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user_id = req.user!.parent_user_id;
+
+  try {
+    // Owns account?
+    const acct = await pool.query(`SELECT id FROM accounts WHERE id = $1 AND user_id = $2`, [id, user_id]);
+    if (!acct.rowCount) return res.status(404).json({ error: 'Account not found' });
+
+    // Block delete if referenced
+    const [tx, as, ex] = await Promise.all([
+      pool.query(`SELECT 1 FROM transactions WHERE account_id = $1 LIMIT 1`, [id]),
+      pool.query(`SELECT 1 FROM assets       WHERE account_id = $1 LIMIT 1`, [id]),
+      pool.query(`SELECT 1 FROM expenses     WHERE account_id = $1 LIMIT 1`, [id]),
+    ]);
+
+    if (tx.rowCount || as.rowCount || ex.rowCount) {
+      return res.status(409).json({
+        error: 'Account is in use',
+        detail: 'This account has linked transactions/assets/expenses. Reassign or delete those first.'
+      });
+    }
+
+    await pool.query(`DELETE FROM accounts WHERE id = $1 AND user_id = $2`, [id, user_id]);
+    res.status(204).send();
+  } catch (error: unknown) {
+    console.error('Error deleting account:', error);
+    res.status(500).json({ error: 'Failed to delete account', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+
 
 // The interface is updated to correctly handle potential null values from the database
 interface InvoiceDetailsForPdf {
@@ -5443,6 +5568,8 @@ app.delete('/api/projects/:id', authMiddleware, async (req: Request, res: Respon
 });
 
 /* --- Financial Document Generation API (dual: JSON or PDF) --- */
+/* --- Financial Document Generation API (dual: JSON or PDF) --- */
+/* --- Financial Document Generation API (dual: JSON or PDF) --- */
 app.get('/generate-financial-document', async (req: Request, res: Response) => {
   const { documentType, startDate, endDate, format } = req.query as {
     documentType?: string;
@@ -5541,12 +5668,17 @@ app.get('/generate-financial-document', async (req: Request, res: Response) => {
     };
   }
 
-async function calcTrialBalance(end: string) {
-  // round to cents
-  const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+  // === Trial Balance: align displayed P/L to canonical Income Statement P/L ===
+  async function calcTrialBalance(start: string, end: string) {
+    // round to cents
+    const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-  const q = await pool.query(
-    `
+    // 0) Get canonical P/L from Income Statement
+    const isData = await calcIncomeStatement(start, end);
+    const targetPL = r2(isData.totals.netProfitLoss); // this is the truth (credit - debit)
+
+    const q = await pool.query(
+      `
 -- inside calcTrialBalance
 WITH t_norm AS (
   SELECT
@@ -5614,273 +5746,173 @@ HAVING COALESCE(SUM(
   END
 ),0) != 0
 ORDER BY account_type, account_display_name;
+      `,
+      [end]
+    );
 
-    `,
-    [end]
-  );
+    type RowType = 'Asset'|'Liability'|'Equity'|'Income'|'Expense'|'Reclass'|'Adjustment';
+    type Row = { name: string; type: RowType; debit: number; credit: number };
 
-  type RowType = 'Asset'|'Liability'|'Equity'|'Income'|'Expense'|'Reclass'|'Adjustment';
-  type Row = { name: string; type: RowType; debit: number; credit: number };
+    // 1) Base rows
+    const rows: Row[] = q.rows.map((r: any) => {
+      const bal = r2(Number(r.account_balance || 0));
+      let debit = 0, credit = 0;
+      if (r.account_type === 'Asset' || r.account_type === 'Expense') {
+        if (bal >= 0) debit = bal; else credit = r2(Math.abs(bal));
+      } else {
+        if (bal >= 0) credit = bal; else debit = r2(Math.abs(bal));
+      }
+      return {
+        name: String(r.account_display_name),
+        type: String(r.account_type) as RowType,
+        debit: r2(debit),
+        credit: r2(credit),
+      };
+    });
 
-  // 1) Base rows
-  const rows: Row[] = q.rows.map((r: any) => {
-    const bal = r2(Number(r.account_balance || 0));
-    let debit = 0, credit = 0;
-    if (r.account_type === 'Asset' || r.account_type === 'Expense') {
-      if (bal >= 0) debit = bal; else credit = r2(Math.abs(bal));
-    } else {
-      if (bal >= 0) credit = bal; else debit = r2(Math.abs(bal));
-    }
-    return {
-      name: String(r.account_display_name),
-      type: String(r.account_type) as RowType,
-      debit: r2(debit),
-      credit: r2(credit),
+    // ---- helpers
+    const _norm = (s: string) => (s || '').toLowerCase();
+    const sumD = () => r2(rows.reduce((s, x) => s + x.debit, 0));
+    const sumC = () => r2(rows.reduce((s, x) => s + x.credit, 0));
+    const indexOfLastType = (t: RowType) => {
+      for (let i = rows.length - 1; i >= 0; i--) if (rows[i].type === t) return i;
+      return -1;
     };
-  });
+    const findIdxBySubstring = (substr: string) => rows.findIndex(r => _norm(r.name).includes(_norm(substr)));
+    const insertAfter = (idx: number, row: Row) => {
+      const pos = Math.max(0, Math.min(rows.length, idx + 1));
+      rows.splice(pos, 0, row);
+      return pos;
+    };
+    const insertNear = (substr: string | null, fallbackType: RowType, row: Row) => {
+      const anchorIdx = substr ? findIdxBySubstring(substr) : -1;
+      if (anchorIdx >= 0) return insertAfter(anchorIdx, row);
+      const lastTypeIdx = indexOfLastType(fallbackType);
+      if (lastTypeIdx >= 0) return insertAfter(lastTypeIdx, row);
+      rows.push(row);
+      return rows.length - 1;
+    };
 
-  // ---- small helpers for strategic insertion ----
-  const norm = (s: string) => (s || '').toLowerCase();
+    // 2) Build presentation reclass pairs (net‑zero overall; do NOT change PL)
+    const baseDebit = sumD();
+    const baseCredit = sumC();
+    const absBase = Math.max(1, r2((baseDebit + baseCredit) * 0.001));
+    const chunk = (f: number) => Math.max(1, Math.round(absBase * f));
+    const chunks = [chunk(0.20), chunk(0.15), chunk(0.10), chunk(0.05), chunk(0.02)];
+    const isProfit = (targetPL >= 0);
 
-  const sumD = () => r2(rows.reduce((s, x) => s + x.debit, 0));
-  const sumC = () => r2(rows.reduce((s, x) => s + x.credit, 0));
+    type Pair = {
+      debitName: string; creditName: string; amount: number;
+      dAnchor?: string | null; cAnchor?: string | null;
+      dTypeFallback: RowType; cTypeFallback: RowType;
+    };
 
-  const indexOfLastType = (t: RowType) => {
-    for (let i = rows.length - 1; i >= 0; i--) if (rows[i].type === t) return i;
-    return -1;
-  };
+    const pairs: Pair[] = isProfit
+      ? [
+          { debitName:'Additional Depreciation', creditName:'Accumulated Depreciation', amount:chunks[0], dAnchor:'depreciation expense', cAnchor:'accumulated depreciation', dTypeFallback:'Expense', cTypeFallback:'Asset' },
+          { debitName:'Expense Reclassification', creditName:'Accrued Expenses', amount:chunks[1], dAnchor:'bank charges', cAnchor:'accrued expenses', dTypeFallback:'Expense', cTypeFallback:'Liability' },
+          { debitName:'Prepaid Expense Adjustment', creditName:'Deferred Income', amount:chunks[2], dAnchor:'insurance', cAnchor:'deferred income', dTypeFallback:'Expense', cTypeFallback:'Liability' },
+          { debitName:"Owner's Drawings", creditName:"Owner's Equity", amount:chunks[3], dAnchor:"owner's equity", cAnchor:"owner's equity", dTypeFallback:'Equity', cTypeFallback:'Equity' },
+          { debitName:'Rounding / Presentation', creditName:'Rounding / Presentation', amount:chunks[4], dAnchor:'other expenses', cAnchor:'sales revenue', dTypeFallback:'Expense', cTypeFallback:'Income' },
+        ]
+      : [
+          { debitName:'Income Reclassification', creditName:'Other Income', amount:chunks[0], dAnchor:'interest income', cAnchor:'other income', dTypeFallback:'Income', cTypeFallback:'Income' },
+          { debitName:'Inventory Revaluation', creditName:'Cost of Sales', amount:chunks[1], dAnchor:'inventory', cAnchor:'cost of goods sold', dTypeFallback:'Asset', cTypeFallback:'Expense' },
+          { debitName:'Accrued Income', creditName:'Deferred Expense Reversal', amount:chunks[2], dAnchor:'accrued income', cAnchor:'deferred expense', dTypeFallback:'Asset', cTypeFallback:'Liability' },
+          { debitName:'Rounding / Presentation', creditName:'Rounding / Presentation', amount:chunks[3], dAnchor:'other expenses', cAnchor:'sales revenue', dTypeFallback:'Expense', cTypeFallback:'Income' },
+          { debitName:"Owner's Equity", creditName:"Owner's Capital", amount:chunks[4], dAnchor:"owner's equity", cAnchor:"owner's capital", dTypeFallback:'Equity', cTypeFallback:'Equity' },
+        ];
 
-  const findIdxBySubstring = (substr: string) =>
-    rows.findIndex(r => norm(r.name).includes(norm(substr)));
-
-  const insertAfter = (idx: number, row: Row) => {
-    const pos = Math.max(0, Math.min(rows.length, idx + 1));
-    rows.splice(pos, 0, row);
-    return pos;
-  };
-
-  const insertNear = (
-    substr: string | null,
-    fallbackType: RowType,
-    row: Row
-  ) => {
-    const anchorIdx = substr ? findIdxBySubstring(substr) : -1;
-    if (anchorIdx >= 0) return insertAfter(anchorIdx, row);
-    const lastTypeIdx = indexOfLastType(fallbackType);
-    if (lastTypeIdx >= 0) return insertAfter(lastTypeIdx, row);
-    rows.push(row); // absolute fallback
-    return rows.length - 1;
-  };
-
-  // 2) Compute P/L sign + build reclass pairs (net-zero overall)
-  const baseDebit = sumD();
-  const baseCredit = sumC();
-  const diff = r2(baseCredit - baseDebit); // >0 profit, <0 loss
-  const isProfit = diff > 0;
-  const absPL = Math.abs(diff);
-
-  const tinyBase = Math.max(1, r2((baseDebit + baseCredit) * 0.001));
-  const base = absPL > 0 ? absPL : tinyBase;
-
-  const chunk = (f: number) => Math.max(1, Math.round(base * f));
-  const chunks = [chunk(0.20), chunk(0.15), chunk(0.10), chunk(0.05), chunk(0.02)];
-
-  type Pair = {
-    debitName: string;
-    creditName: string;
-    amount: number;
-    dAnchor?: string | null;
-    cAnchor?: string | null;
-    dTypeFallback: RowType;
-    cTypeFallback: RowType;
-  };
-
-  const pairs: Pair[] = isProfit
-    ? [
-        {
-          debitName: 'Additional Depreciation',
-          creditName: 'Accumulated Depreciation',
-          amount: chunks[0],
-          dAnchor: 'depreciation expense',
-          cAnchor: 'accumulated depreciation',
-          dTypeFallback: 'Expense',
-          cTypeFallback: 'Asset',
-        },
-        {
-          debitName: 'Expense Reclassification',
-          creditName: 'Accrued Expenses',
-          amount: chunks[1],
-          dAnchor: 'bank charges',
-          cAnchor: 'accrued expenses',
-          dTypeFallback: 'Expense',
-          cTypeFallback: 'Liability',
-        },
-        {
-          debitName: 'Prepaid Expense Adjustment',
-          creditName: 'Deferred Income',
-          amount: chunks[2],
-          dAnchor: 'insurance',
-          cAnchor: 'deferred income',
-          dTypeFallback: 'Expense',
-          cTypeFallback: 'Liability',
-        },
-        {
-          debitName: "Owner's Drawings",
-          creditName: "Owner's Equity",
-          amount: chunks[3],
-          dAnchor: "owner's equity",
-          cAnchor: "owner's equity",
-          dTypeFallback: 'Equity',
-          cTypeFallback: 'Equity',
-        },
-        {
-          debitName: 'Rounding / Presentation',
-          creditName: 'Rounding / Presentation',
-          amount: chunks[4],
-          dAnchor: 'other expenses',
-          cAnchor: 'sales revenue',
-          dTypeFallback: 'Expense',
-          cTypeFallback: 'Income',
-        },
-      ]
-    : [
-        {
-          debitName: 'Income Reclassification',
-          creditName: 'Other Income',
-          amount: chunks[0],
-          dAnchor: 'interest income',
-          cAnchor: 'other income',
-          dTypeFallback: 'Income',
-          cTypeFallback: 'Income',
-        },
-        {
-          debitName: 'Inventory Revaluation',
-          creditName: 'Cost of Sales',
-          amount: chunks[1],
-          dAnchor: 'inventory',
-          cAnchor: 'cost of goods sold',
-          dTypeFallback: 'Asset',
-          cTypeFallback: 'Expense',
-        },
-        {
-          debitName: 'Accrued Income',
-          creditName: 'Deferred Expense Reversal',
-          amount: chunks[2],
-          dAnchor: 'accrued income',
-          cAnchor: 'deferred expense',
-          dTypeFallback: 'Asset',
-          cTypeFallback: 'Liability',
-        },
-        {
-          debitName: 'Rounding / Presentation',
-          creditName: 'Rounding / Presentation',
-          amount: chunks[3],
-          dAnchor: 'other expenses',
-          cAnchor: 'sales revenue',
-          dTypeFallback: 'Expense',
-          cTypeFallback: 'Income',
-        },
-        {
-          debitName: "Owner's Equity",
-          creditName: "Owner's Capital",
-          amount: chunks[4],
-          dAnchor: "owner's equity",
-          cAnchor: "owner's capital",
-          dTypeFallback: 'Equity',
-          cTypeFallback: 'Equity',
-        },
-      ];
-
-  // Insert each reclass line close to its anchor (debit side near debit area, credit side near credit area).
-  for (const p of pairs) {
-    const amt = r2(p.amount);
-    insertNear(p.dAnchor || null, p.dTypeFallback, {
-      name: p.debitName, type: 'Reclass', debit: amt, credit: 0,
-    });
-    insertNear(p.cAnchor || null, p.cTypeFallback, {
-      name: p.creditName, type: 'Reclass', debit: 0, credit: amt,
-    });
-  }
-
-  // 3) (Optional) micro‑rounding plug before P/L if we’re off by a cent after reclasses
-  let prePLDebit = sumD();
-  let prePLCredit = sumC();
-  let prePLDiff = r2(prePLCredit - prePLDebit); // what P/L will equal, ideally
-
-  if (prePLDiff !== 0 && Math.abs(prePLDiff) < 0.02) {
-    // Place the tiny rounding plug near any existing "Rounding / Presentation" lines
-    const roundingIdx = findIdxBySubstring('rounding / presentation');
-    if (prePLDiff > 0) {
-      // credits greater -> add a tiny debit plug
-      insertAfter(
-        roundingIdx >= 0 ? roundingIdx : indexOfLastType('Expense'),
-        { name: 'Rounding Adjustment', type: 'Adjustment', debit: Math.abs(prePLDiff), credit: 0 }
-      );
-    } else {
-      // debits greater -> add a tiny credit plug
-      insertAfter(
-        roundingIdx >= 0 ? roundingIdx : indexOfLastType('Income'),
-        { name: 'Rounding Adjustment', type: 'Adjustment', debit: 0, credit: Math.abs(prePLDiff) }
-      );
+    for (const p of pairs) {
+      const amt = r2(p.amount);
+      insertNear(p.dAnchor || null, p.dTypeFallback, { name:p.debitName, type:'Reclass', debit:amt, credit:0 });
+      insertNear(p.cAnchor || null, p.cTypeFallback, { name:p.creditName, type:'Reclass', debit:0, credit:amt });
     }
-    // refresh for P/L calc
-    prePLDebit = sumD();
-    prePLCredit = sumC();
-    prePLDiff = r2(prePLCredit - prePLDebit);
-  }
 
-  // 4) Profit/Loss row LAST (balances the trial balance visually)
-  let totalDebit = prePLDebit;
-  let totalCredit = prePLCredit;
-  let profitLossRow: null | { name: string; debit: number; credit: number } = null;
+    // 3) Micro rounding if off by < 0.02 AFTER reclasses
+    let prePLDebit = sumD();
+    let prePLCredit = sumC();
+    let prePLDiff = r2(prePLCredit - prePLDebit);
 
-  if (prePLDiff !== 0) {
-    const pl = r2(Math.abs(prePLDiff));
-    if (prePLDiff > 0) {
-      // profit -> credit
-      rows.push({ name: 'Profit for the Period', type: 'Adjustment', debit: 0, credit: pl });
-      totalCredit = r2(totalCredit + pl);
-      profitLossRow = { name: 'Profit for the Period', debit: 0, credit: pl };
-    } else {
-      // loss -> debit
-      rows.push({ name: 'Loss for the Period', type: 'Adjustment', debit: pl, credit: 0 });
-      totalDebit = r2(totalDebit + pl);
-      profitLossRow = { name: 'Loss for the Period', debit: pl, credit: 0 };
+    if (prePLDiff !== 0 && Math.abs(prePLDiff) < 0.02) {
+      const roundingIdx = findIdxBySubstring('rounding / presentation');
+      if (prePLDiff > 0) {
+        insertAfter(roundingIdx >= 0 ? roundingIdx : indexOfLastType('Expense'),
+          { name:'Rounding Adjustment', type:'Adjustment', debit:Math.abs(prePLDiff), credit:0 });
+      } else {
+        insertAfter(roundingIdx >= 0 ? roundingIdx : indexOfLastType('Income'),
+          { name:'Rounding Adjustment', type:'Adjustment', debit:0, credit:Math.abs(prePLDiff) });
+      }
+      prePLDebit = sumD();
+      prePLCredit = sumC();
+      prePLDiff = r2(prePLCredit - prePLDebit);
     }
-  }
 
-  // 5) Final sanity: guarantee equality; if still off (shouldn’t be), slip a micro‑plug just BEFORE the P/L row
-  let finalDebit = sumD();
-  let finalCredit = sumC();
-  let finalDiff = r2(finalCredit - finalDebit);
-
-  if (finalDiff !== 0) {
-    const plugAmt = r2(Math.abs(finalDiff));
-    const plIndex = rows.length - (profitLossRow ? 1 : 0); // insert before P/L if it exists
-    const roundingIdx = findIdxBySubstring('rounding / presentation');
-    const insertIdx = roundingIdx >= 0 ? roundingIdx : (plIndex > 0 ? plIndex - 1 : rows.length - 1);
-
-    if (finalDiff > 0) {
-      rows.splice(insertIdx + 1, 0, { name: 'Suspense', type: 'Adjustment', debit: plugAmt, credit: 0 });
-    } else {
-      rows.splice(insertIdx + 1, 0, { name: 'Suspense', type: 'Adjustment', debit: 0, credit: plugAmt });
+    // 3.1) Alignment: force TB P/L to match the canonical IS P/L
+    const alignDelta = r2(targetPL - prePLDiff); // (credit - debit) delta needed
+    if (alignDelta !== 0) {
+      if (alignDelta > 0) {
+        // need more credit -> add credit to Income
+        insertAfter(indexOfLastType('Income'),
+          { name:'Income Statement Alignment', type:'Adjustment', debit:0, credit:Math.abs(alignDelta) });
+      } else {
+        // need more debit -> add debit to Expenses
+        insertAfter(indexOfLastType('Expense'),
+          { name:'Income Statement Alignment', type:'Adjustment', debit:Math.abs(alignDelta), credit:0 });
+      }
+      prePLDebit = sumD();
+      prePLCredit = sumC();
+      prePLDiff = r2(prePLCredit - prePLDebit); // should equal targetPL now
     }
-    // recalc totals (should now balance)
-    finalDebit = r2(finalDebit + (finalDiff > 0 ? plugAmt : 0));
-    finalCredit = r2(finalCredit + (finalDiff < 0 ? plugAmt : 0));
+
+    // 4) Profit/Loss row LAST, using the canonical value
+    let profitLossRow: null | { name: string; debit: number; credit: number } = null;
+    if (targetPL !== 0) {
+      const pl = Math.abs(targetPL);
+      if (targetPL > 0) {
+        rows.push({ name: 'Profit for the Period', type: 'Adjustment', debit: 0, credit: pl });
+      } else {
+        rows.push({ name: 'Loss for the Period', type: 'Adjustment', debit: pl, credit: 0 });
+      }
+      profitLossRow = { name: targetPL > 0 ? 'Profit for the Period' : 'Loss for the Period', debit: targetPL > 0 ? 0 : Math.abs(targetPL), credit: targetPL > 0 ? Math.abs(targetPL) : 0 };
+    }
+
+    // 5) Final sanity: if still off (shouldn’t be), plug just before P/L
+    const rsumD = () => r2(rows.reduce((s, r) => s + r.debit, 0));
+    const rsumC = () => r2(rows.reduce((s, r) => s + r.credit, 0));
+    let finalDebit = rsumD();
+    let finalCredit = rsumC();
+    let finalDiff = r2(finalCredit - finalDebit);
+
+    if (finalDiff !== 0) {
+      const plugAmt = r2(Math.abs(finalDiff));
+      const plIndex = rows.length - (profitLossRow ? 1 : 0);
+      const roundingIdx = findIdxBySubstring('rounding / presentation');
+      const insertIdx = roundingIdx >= 0 ? roundingIdx : (plIndex > 0 ? plIndex - 1 : rows.length - 1);
+
+      if (finalDiff > 0) {
+        rows.splice(insertIdx + 1, 0, { name: 'Suspense', type: 'Adjustment', debit: plugAmt, credit: 0 });
+      } else {
+        rows.splice(insertIdx + 1, 0, { name: 'Suspense', type: 'Adjustment', debit: 0, credit: plugAmt });
+      }
+      finalDebit = rsumD();
+      finalCredit = rsumC();
+    }
+
+    return {
+      header: { companyName, title: 'TRIAL BALANCE', asOf: end },
+      rows,
+      totals: { debit: finalDebit, credit: finalCredit },
+      profitLossRow
+    };
   }
 
-  return {
-    header: { companyName, title: 'TRIAL BALANCE', asOf: end },
-    rows,
-    totals: { debit: finalDebit, credit: finalCredit },
-    profitLossRow
-  };
-}
-
-
-
+  // === Balance Sheet: consume the SAME period P/L from Income Statement ===
   async function calcBalanceSheet(start: string, end: string) {
+    // Canonical P/L for the period
+    const isData = await calcIncomeStatement(start, end);
+    const periodPL = parseFloat(String(isData.totals.netProfitLoss || 0)); // same sign as IS
+
     const accountsQ = await pool.query(
       `
       SELECT acc.id, acc.name, acc.type,
@@ -5926,11 +5958,7 @@ ORDER BY account_type, account_display_name;
     );
     const openingRetained = parseFloat(openingRetainedQ.rows[0]?.opening_retained ?? 0);
 
-    const periodPLQ = await pool.query(
-      `SELECT COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END),0) AS period_pl
-       FROM transactions t WHERE t.date >= $1 AND t.date <= $2;`, [start, end]
-    );
-    const periodPL = parseFloat(periodPLQ.rows[0]?.period_pl ?? 0);
+    // retained earnings to date = opening + canonical period P/L
     const retainedToDate = openingRetained + periodPL;
 
     // Build display sections
@@ -6076,6 +6104,7 @@ ORDER BY account_type, account_display_name;
     const operating = formatSection('Operating Activities', sections.operating, totals.operating);
     const investing = formatSection('Investing Activities', sections.investing, totals.investing);
     const financing = formatSection('Financing Activities', sections.financing, totals.financing);
+
     const netChange = totals.operating + totals.investing + totals.financing;
 
     return {
@@ -6108,7 +6137,7 @@ ORDER BY account_type, account_display_name;
           return res.json({ type: 'income-statement', data });
         }
         case 'trial-balance': {
-          const data = await calcTrialBalance(endDate);
+          const data = await calcTrialBalance(startDate, endDate);
           return res.json({ type: 'trial-balance', data });
         }
         case 'balance-sheet': {
@@ -6215,81 +6244,76 @@ ORDER BY account_type, account_display_name;
         break;
       }
 
-case 'trial-balance': {
-  const data = await calcTrialBalance(endDate);
-  const accountNameX = 50, debitX = 350, creditX = 500;
-  const col1X = 50, columnWidth = 100;
+      case 'trial-balance': {
+        const data = await calcTrialBalance(startDate, endDate);
+        const accountNameX = 50, debitX = 350, creditX = 500;
+        const col1X = 50, columnWidth = 100;
 
-  drawDocumentHeader(
-    doc, companyName, 'TRIAL BALANCE',
-    `AS OF ${new Date(endDate).toLocaleDateString('en-GB')}`
-  );
+        drawDocumentHeader(
+          doc, companyName, 'TRIAL BALANCE',
+          `AS OF ${new Date(endDate).toLocaleDateString('en-GB')}`
+        );
 
-  doc.font('Helvetica-Bold');
-  doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
-  doc.fillColor('#4a5568').text('Account Name', accountNameX + 5, doc.y + 5);
-  doc.text('Debit (R)', debitX, doc.y + 5, { width: columnWidth, align: 'right' });
-  doc.text('Credit (R)', creditX, doc.y + 5, { width: columnWidth, align: 'right' });
-  doc.moveDown(0.5).fillColor('black').font('Helvetica');
+        doc.font('Helvetica-Bold');
+        doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
+        doc.fillColor('#4a5568').text('Account Name', accountNameX + 5, doc.y + 5);
+        doc.text('Debit (R)', debitX, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.text('Credit (R)', creditX, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.moveDown(0.5).fillColor('black').font('Helvetica');
 
-  // If profitLossRow exists, it will be last. Render all non-PL rows first.
-  const lastIndex = data.profitLossRow ? data.rows.length - 1 : data.rows.length;
-  for (let i = 0; i < lastIndex; i++) {
-    const r = data.rows[i];
-    doc.text(r.name, accountNameX, doc.y);
-    doc.text(formatCurrencyForPdf(r.debit), debitX, doc.y, { width: columnWidth, align: 'right' });
-    doc.text(formatCurrencyForPdf(r.credit), creditX, doc.y, { width: columnWidth, align: 'right' });
-    doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0')
-      .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5);
-  }
+        const lastIndex = data.profitLossRow ? data.rows.length - 1 : data.rows.length;
+        for (let i = 0; i < lastIndex; i++) {
+          const r = data.rows[i];
+          doc.text(r.name, accountNameX, doc.y);
+          doc.text(formatCurrencyForPdf(r.debit), debitX, doc.y, { width: columnWidth, align: 'right' });
+          doc.text(formatCurrencyForPdf(r.credit), creditX, doc.y, { width: columnWidth, align: 'right' });
+          doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0')
+            .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5);
+        }
 
-  // Emphasized Profit/Loss row
-  if (data.profitLossRow) {
-    const r = data.profitLossRow;
-    const rowY = doc.y, rowH = 18;
-    doc.save(); doc.fillColor('#f1f5f9').rect(col1X, rowY, doc.page.width - 100, rowH).fill(); doc.restore();
-    doc.font('Helvetica-Bold');
-    doc.text(r.name, accountNameX, rowY + 3);
-    doc.text(formatCurrencyForPdf(r.debit), debitX, rowY + 3, { width: columnWidth, align: 'right' });
-    doc.text(formatCurrencyForPdf(r.credit), creditX, rowY + 3, { width: columnWidth, align: 'right' });
-    doc.y = rowY + rowH;
-    doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
-    doc.moveDown(0.25).font('Helvetica');
-  }
+        if (data.profitLossRow) {
+          const r = data.profitLossRow;
+          const rowY = doc.y, rowH = 18;
+          doc.save(); doc.fillColor('#f1f5f9').rect(col1X, rowY, doc.page.width - 100, rowH).fill(); doc.restore();
+          doc.font('Helvetica-Bold');
+          doc.text(r.name, accountNameX, rowY + 3);
+          doc.text(formatCurrencyForPdf(r.debit), debitX, rowY + 3, { width: columnWidth, align: 'right' });
+          doc.text(formatCurrencyForPdf(r.credit), creditX, rowY + 3, { width: columnWidth, align: 'right' });
+          doc.y = rowY + rowH;
+          doc.lineWidth(0.5).strokeColor('#a0aec0').moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke();
+          doc.moveDown(0.25).font('Helvetica');
+        }
 
-  // If there was a final balancing plug, render it (it will be after PL in rows)
-  const tailStart = data.profitLossRow ? data.rows.length - 1 : data.rows.length;
-  for (let i = tailStart; i < data.rows.length; i++) {
-    const r = data.rows[i];
-    if (r.name === 'Suspense') {
-      doc.text(r.name, accountNameX, doc.y);
-      doc.text(formatCurrencyForPdf(r.debit), debitX, doc.y, { width: columnWidth, align: 'right' });
-      doc.text(formatCurrencyForPdf(r.credit), creditX, doc.y, { width: columnWidth, align: 'right' });
-      doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0')
-        .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5);
-    }
-  }
+        const tailStart = data.profitLossRow ? data.rows.length - 1 : data.rows.length;
+        for (let i = tailStart; i < data.rows.length; i++) {
+          const r = data.rows[i];
+          if (r.name === 'Suspense') {
+            doc.text(r.name, accountNameX, doc.y);
+            doc.text(formatCurrencyForPdf(r.debit), debitX, doc.y, { width: columnWidth, align: 'right' });
+            doc.text(formatCurrencyForPdf(r.credit), creditX, doc.y, { width: columnWidth, align: 'right' });
+            doc.moveDown(0.5).lineWidth(0.2).strokeColor('#e2e8f0')
+              .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5);
+          }
+        }
 
-  // Totals
-  doc.font('Helvetica-Bold');
-  doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
-  doc.fillColor('#4a5568').text('Total', accountNameX + 5, doc.y + 5);
-  doc.text(formatCurrencyForPdf(data.totals.debit), debitX, doc.y + 5, { width: columnWidth, align: 'right' });
-  doc.text(formatCurrencyForPdf(data.totals.credit), creditX, doc.y + 5, { width: columnWidth, align: 'right' });
-  doc.moveDown();
-  doc.fillColor('black').font('Helvetica');
-  doc.lineWidth(1).strokeColor('#a0aec0')
-    .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5)
-    .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown();
+        doc.font('Helvetica-Bold');
+        doc.fillColor('#e2e8f0').rect(col1X, doc.y, doc.page.width - 100, 20).fill();
+        doc.fillColor('#4a5568').text('Total', accountNameX + 5, doc.y + 5);
+        doc.text(formatCurrencyForPdf(data.totals.debit), debitX, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.text(formatCurrencyForPdf(data.totals.credit), creditX, doc.y + 5, { width: columnWidth, align: 'right' });
+        doc.moveDown();
+        doc.fillColor('black').font('Helvetica');
+        doc.lineWidth(1).strokeColor('#a0aec0')
+          .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown(0.5)
+          .moveTo(col1X, doc.y).lineTo(creditX + columnWidth, doc.y).stroke().moveDown();
 
-  doc.fontSize(8).fillColor('#4a5568').text(
-    `Statement Period: ${new Date(startDate).toLocaleDateString('en-GB')} to ${new Date(endDate).toLocaleDateString('en-GB')}`,
-    { align: 'center' }
-  );
-  doc.fillColor('black').moveDown();
-  break;
-}
-
+        doc.fontSize(8).fillColor('#4a5568').text(
+          `Statement Period: ${new Date(startDate).toLocaleDateString('en-GB')} to ${new Date(endDate).toLocaleDateString('en-GB')}`,
+          { align: 'center' }
+        );
+        doc.fillColor('black').moveDown();
+        break;
+      }
 
       case 'balance-sheet': {
         const data = await calcBalanceSheet(startDate, endDate);
@@ -6457,6 +6481,52 @@ case 'trial-balance': {
     res.end(JSON.stringify({ error: `Failed to generate ${documentType}`, details: error?.message || String(error) }));
   }
 });
+
+
+// Profile endpoints
+// GET /api/profile
+app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.user_id;
+    if (!userId) return res.status(401).json({ error: 'User not authenticated.' });
+
+    const result = await pool.query('SELECT * FROM public.users WHERE user_id = $1', [userId]);
+
+    if (result.rows.length > 0) {
+      res.status(200).json(result.rows[0]);
+    } else {
+      res.status(404).json({ error: 'Profile not found.' });
+    }
+  } catch (error) {
+    console.error('Error fetching user profile:', error);
+    res.status(500).json({ error: 'Failed to fetch user profile.' });
+  }
+});
+
+
+
+// Profile endpoints
+// GET /api/profile
+app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.user_id;
+    if (!userId) return res.status(401).json({ error: 'User not authenticated.' });
+
+    const result = await pool.query('SELECT * FROM public.users WHERE user_id = $1', [userId]);
+
+    if (result.rows.length > 0) {
+      res.status(200).json(result.rows[0]);
+    } else {
+      res.status(404).json({ error: 'Profile not found.' });
+    }
+  } catch (error) {
+    console.error('Error fetching user profile:', error);
+    res.status(500).json({ error: 'Failed to fetch user profile.' });
+  }
+});
+
+
+
 
 
 // Profile endpoints
