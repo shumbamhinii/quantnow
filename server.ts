@@ -23,7 +23,7 @@ app.use(express.json());
 
 const pool = new Pool({
   connectionString:
-    "postgresql://qbeta_db:AWfyl8R0jJLUaZtwKtoOtzX3kfMXhZS8@dpg-d22i2sbe5dus739mklbg-a.oregon-postgres.render.com/qbeta_db",
+    "postgresql://postgres.phoaahdutroiujxiehze:Hunzamabhisvo@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres",
   ssl: {
     rejectUnauthorized: false,
   },
