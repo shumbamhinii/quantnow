@@ -5482,60 +5482,156 @@ const getStatusFromPercentage = (percentage: number): string => {
 /* --- Task Management API Endpoints --- */
 
 // POST /api/tasks - Create a new task
-app.post('/api/tasks', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const { title, description, priority, due_date, project_id, progress_percentage: clientProgress } = req.body;
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user (replaces dummyUserId)
+// POST /api/tasks
+app.post('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const ownerId = getOwnerId(req);
+    const {
+      title, description, status, priority, due_date,
+      progress_percentage, project_id, assignee_id
+    } = req.body;
 
-    if (!title) {
-        return res.status(400).json({ error: 'Task title is required.' });
+    // Optional validate: if assignee_id supplied, ensure it belongs to your company
+    if (assignee_id) {
+      const { rowCount } = await pool.query(
+        `SELECT 1 FROM public.users WHERE id = $1 AND (parent_user_id = $2 OR user_id = $2)`,
+        [assignee_id, ownerId]
+      );
+      if (rowCount === 0) {
+        return res.status(400).json({ error: 'Invalid assignee_id' });
+      }
     }
 
-    // Ensure progress_percentage is a number and clamp it between 0 and 100
-    const progress_percentage = typeof clientProgress === 'number' ? Math.max(0, Math.min(100, clientProgress)) : 0;
-    // Derive status from the provided progress_percentage
-    const status = getStatusFromPercentage(progress_percentage);
+    const insert = await pool.query(
+      `
+      INSERT INTO public.tasks
+        (user_id, title, description, status, priority, due_date,
+         progress_percentage, project_id, assignee_id)
+      VALUES
+        ($1, $2, $3, COALESCE($4,'To Do'), COALESCE($5,'Medium'), $6,
+         COALESCE($7,0), $8, $9)
+      RETURNING *
+      `,
+      [ownerId, title, description, status, priority, due_date,
+       progress_percentage, project_id || null, assignee_id || null]
+    );
 
-    try {
-        const result = await pool.query(
-            `INSERT INTO public.tasks (user_id, title, description, status, priority, due_date, progress_percentage, project_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) RETURNING *`,
-            [
-                user_id, // Use actual user_id
-                title,
-                description || null,
-                status, // Use derived status
-                priority || 'Medium',
-                due_date || null,
-                progress_percentage, // Use client's progress
-                project_id || null
-            ]
-        );
-        res.status(201).json(result.rows[0]);
-    } catch (error: unknown) {
-        console.error('Error creating task:', error);
-        res.status(500).json({ error: 'Failed to create task.', detail: error instanceof Error ? error.message : String(error) });
-    }
+    // Return with denormalized names
+    const { rows } = await pool.query(
+      `
+      SELECT
+        t.*,
+        p.name AS project_name,
+        u.name AS assignee_name
+      FROM public.tasks t
+      LEFT JOIN public.projects p ON p.id = t.project_id
+      LEFT JOIN public.users    u ON u.id = t.assignee_id
+      WHERE t.id = $1
+      `,
+      [insert.rows[0].id]
+    );
+
+    res.status(201).json(rows[0]);
+  } catch (e:any) {
+    console.error('create task error', e);
+    res.status(500).json({ error: 'Failed to create task' });
+  }
 });
 
-// GET /api/tasks - Fetch all tasks for the authenticated user, with project details
-app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user (replaces dummyUserId)
+// PUT /api/tasks/:id
+app.put('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const ownerId = getOwnerId(req);
+    const taskId = req.params.id;
+    const {
+      title, description, status, priority, due_date,
+      progress_percentage, project_id, assignee_id
+    } = req.body;
 
-    try {
-        const result = await pool.query(
-            `SELECT t.id, t.title, t.description, t.status, t.priority, t.due_date, t.progress_percentage, t.created_at, t.updated_at,
-                    t.project_id, p.name AS project_name, p.description AS project_description, p.deadline AS project_deadline,
-                    p.status AS project_status, p.assignee AS project_assignee, p.progress_percentage AS project_overall_progress
-             FROM public.tasks t
-             LEFT JOIN public.projects p ON t.project_id = p.id
-             WHERE t.user_id = $1 ORDER BY t.created_at DESC`, // Filter by actual user_id
-            [user_id]
-        );
-        res.json(result.rows);
-    } catch (error: unknown) {
-        console.error('Error fetching tasks:', error);
-        res.status(500).json({ error: 'Failed to fetch tasks.', detail: error instanceof Error ? error.message : String(error) });
+    // Make sure this task belongs to this owner
+    const { rowCount: exists } = await pool.query(
+      `SELECT 1 FROM public.tasks WHERE id = $1 AND user_id = $2`,
+      [taskId, ownerId]
+    );
+    if (!exists) return res.status(404).json({ error: 'Task not found' });
+
+    if (assignee_id) {
+      const { rowCount } = await pool.query(
+        `SELECT 1 FROM public.users WHERE id = $1 AND (parent_user_id = $2 OR user_id = $2)`,
+        [assignee_id, ownerId]
+      );
+      if (rowCount === 0) {
+        return res.status(400).json({ error: 'Invalid assignee_id' });
+      }
     }
+
+    await pool.query(
+      `
+      UPDATE public.tasks SET
+        title = COALESCE($3, title),
+        description = $4,
+        status = COALESCE($5, status),
+        priority = COALESCE($6, priority),
+        due_date = $7,
+        progress_percentage = COALESCE($8, progress_percentage),
+        project_id = $9,
+        assignee_id = $10,
+        updated_at = NOW()
+      WHERE id = $1 AND user_id = $2
+      `,
+      [
+        taskId, ownerId,
+        title, description, status, priority, due_date,
+        progress_percentage, project_id || null, assignee_id || null
+      ]
+    );
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        t.*,
+        p.name AS project_name,
+        u.name AS assignee_name
+      FROM public.tasks t
+      LEFT JOIN public.projects p ON p.id = t.project_id
+      LEFT JOIN public.users    u ON u.id = t.assignee_id
+      WHERE t.id = $1
+      `,
+      [taskId]
+    );
+
+    res.json(rows[0]);
+  } catch (e:any) {
+    console.error('update task error', e);
+    res.status(500).json({ error: 'Failed to update task' });
+  }
+});
+
+
+// GET /api/tasks - Fetch all tasks for the authenticated user, with project details
+// GET /api/tasks
+app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const ownerId = getOwnerId(req);
+    const { rows } = await pool.query(
+      `
+      SELECT
+        t.*,
+        p.name AS project_name,
+        u.name AS assignee_name
+      FROM public.tasks t
+      LEFT JOIN public.projects p ON p.id = t.project_id
+      LEFT JOIN public.users    u ON u.id = t.assignee_id
+      WHERE t.user_id = $1
+      ORDER BY t.created_at DESC
+      `,
+      [ownerId]
+    );
+    res.json(rows);
+  } catch (e:any) {
+    console.error('list tasks error', e);
+    res.status(500).json({ error: 'Failed to fetch tasks' });
+  }
 });
 
 // PUT /api/tasks/:id - Update an existing task
@@ -5600,6 +5696,36 @@ app.delete('/api/tasks/:id', authMiddleware, async (req: Request, res: Response)
         console.error('Error deleting task:', error);
         res.status(500).json({ error: 'Failed to delete task.', detail: error instanceof Error ? error.message : String(error) });
     }
+});
+
+// PATCH /api/tasks/:id/assign
+app.patch('/api/tasks/:id/assign', authMiddleware, async (req: Request, res: Response) => {
+  const ownerId = getOwnerId(req);
+  const { id } = req.params;
+  const { assignee_id } = req.body;
+
+  if (!assignee_id) return res.status(400).json({ error: 'assignee_id is required' });
+
+  // validate same as above then:
+  await pool.query(
+    `UPDATE public.tasks SET assignee_id = $3, updated_at = NOW()
+      WHERE id = $1 AND user_id = $2`,
+    [id, ownerId, assignee_id]
+  );
+  res.json({ ok: true });
+});
+
+// PATCH /api/tasks/:id/unassign
+app.patch('/api/tasks/:id/unassign', authMiddleware, async (req: Request, res: Response) => {
+  const ownerId = getOwnerId(req);
+  const { id } = req.params;
+
+  await pool.query(
+    `UPDATE public.tasks SET assignee_id = NULL, updated_at = NOW()
+      WHERE id = $1 AND user_id = $2`,
+    [id, ownerId]
+  );
+  res.json({ ok: true });
 });
 
 /* --- Project Management API Endpoints --- */
@@ -6934,6 +7060,27 @@ app.get('/api/projections/baseline-data', authMiddleware, async (req: Request, r
 // --- API Endpoints for User Management ---
 // NOTE: These endpoints have been updated to remove the 'position' column
 // and would require separate endpoints to manage user roles.
+// GET /api/users  -> list users for this owner/company
+// === helpers/auth.ts ===
+export const getOwnerId = (req: Request) =>
+  (req.user as any)?.parent_user_id || (req.user as any)?.user_id;
+
+app.get('/api/users', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const ownerId = getOwnerId(req);
+    const { rows } = await pool.query(
+      `SELECT id, name, email
+         FROM public.users
+        WHERE parent_user_id = $1 OR user_id = $1
+        ORDER BY name`,
+      [ownerId]
+    );
+    res.json(rows);
+  } catch (e:any) {
+    console.error('users list error', e);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
 
 // 1. GET /users - Fetch all users belonging to the authenticated user's organization with their roles
 app.get('/users', authMiddleware, async (req: Request, res: Response) => {

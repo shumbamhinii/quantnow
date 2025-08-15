@@ -3,7 +3,7 @@ import pool from '../db/index.js';
 
 export const getTransactions = async (req: Request, res: Response): Promise<void> => {
   try {
-    const result = await pool.query('SELECT * FROM transactions ORDER BY date DESC');
+    const result = await queryWithRetry('SELECT * FROM transactions ORDER BY date DESC');
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -20,7 +20,7 @@ export const createManualTransaction = async (req: Request, res: Response): Prom
       RETURNING *;
     `;
     const values = [type, amount, description, date, category, account_id || null];
-    const result = await pool.query(query, values);
+    const result = await queryWithRetry(query, values);
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
