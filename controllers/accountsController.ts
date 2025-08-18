@@ -3,7 +3,7 @@ import pool from '../db/index.js';
 
 export const getAccounts = async (req: Request, res: Response): Promise<void> => {
   try {
-    const result = await queryWithRetry('SELECT * FROM accounts ORDER BY id');
+    const result = await pool.query('SELECT * FROM accounts ORDER BY id');
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -20,7 +20,7 @@ export const createAccount = async (req: Request, res: Response): Promise<void> 
       RETURNING *;
     `;
     const values = [code, name, type, parent_account_id || null];
-    const result = await queryWithRetry(query, values);
+    const result = await pool.query(query, values);
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);

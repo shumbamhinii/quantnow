@@ -5479,198 +5479,348 @@ const getStatusFromPercentage = (percentage: number): string => {
     }
 };
 
+// After your pool + pool.query are defined
+// Helper function to recompute task progress based on mode
+// Helper function to recompute task progress based on mode
+// Place this after your pool definition
+// Helper function to recompute task progress based on mode
+// Place this after your pool definition
+async function recomputeTaskProgress(taskId: string) {
+    // Fetch progress mode + goal/current
+    const { rows: trows } = await pool.query(
+        `SELECT progress_mode, progress_goal, progress_current
+         FROM public.tasks WHERE id = $1`, [taskId]);
+    if (!trows[0]) return;
+
+    const { progress_mode, progress_goal, progress_current } = trows[0];
+
+    let pct = 0;
+
+    if (progress_mode === 'manual') {
+        // keep whatever is already in progress_percentage (don't override)
+        return;
+    }
+
+    if (progress_mode === 'target') { // Assuming 'target' is the correct mode name
+        const goal = Math.max(Number(progress_goal || 0), 0);
+        const cur = Math.max(Number(progress_current || 0), 0);
+        pct = goal > 0 ? Math.min(100, Math.round((cur / goal) * 100)) : 0;
+    }
+
+    if (progress_mode === 'steps') { // Assuming 'steps' is the correct mode name
+        const { rows: steps } = await pool.query(
+            `SELECT weight, is_done FROM public.task_steps WHERE task_id = $1`, [taskId]);
+        if (steps.length === 0) pct = 0;
+        else {
+            const hasWeights = steps.some(s => s.weight != null);
+            if (hasWeights) {
+                const totalW = steps.reduce((s, x) => s + Number(x.weight || 0), 0) || 0;
+                const doneW = steps.filter(x => x.is_done).reduce((s, x) => s + Number(x.weight || 0), 0);
+                pct = totalW > 0 ? Math.round((doneW / totalW) * 100) : 0;
+            } else {
+                const done = steps.filter(x => x.is_done).length;
+                pct = Math.round((done / steps.length) * 100);
+            }
+        }
+    }
+
+    // --- CRITICAL FIX: Ensure parameters are in the CORRECT ORDER ---
+    // The SQL string expects:
+    // $1 = progress_percentage (NUMERIC) --> We pass 'pct' (the calculated number)
+    // $2 = id (UUID)                   --> We pass 'taskId' (the UUID string)
+    await pool.query(
+        `UPDATE public.tasks SET progress_percentage = $1, updated_at = NOW() WHERE id = $2`,
+        [pct, taskId] // <-- [NUMERIC VALUE, UUID STRING] - THIS ORDER IS CRUCIAL
+    );
+}
 /* --- Task Management API Endpoints --- */
 
-// POST /api/tasks - Create a new task
-// POST /api/tasks
-app.post('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const ownerId = getOwnerId(req);
-    const {
-      title, description, status, priority, due_date,
-      progress_percentage, project_id, assignee_id
-    } = req.body;
-
-    // Optional validate: if assignee_id supplied, ensure it belongs to your company
-    if (assignee_id) {
-      const { rowCount } = await pool.query(
-        `SELECT 1 FROM public.users WHERE id = $1 AND (parent_user_id = $2 OR user_id = $2)`,
-        [assignee_id, ownerId]
-      );
-      if (rowCount === 0) {
-        return res.status(400).json({ error: 'Invalid assignee_id' });
-      }
-    }
-
-    const insert = await pool.query(
-      `
-      INSERT INTO public.tasks
-        (user_id, title, description, status, priority, due_date,
-         progress_percentage, project_id, assignee_id)
-      VALUES
-        ($1, $2, $3, COALESCE($4,'To Do'), COALESCE($5,'Medium'), $6,
-         COALESCE($7,0), $8, $9)
-      RETURNING *
-      `,
-      [ownerId, title, description, status, priority, due_date,
-       progress_percentage, project_id || null, assignee_id || null]
-    );
-
-    // Return with denormalized names
-    const { rows } = await pool.query(
-      `
-      SELECT
-        t.*,
-        p.name AS project_name,
-        u.name AS assignee_name
-      FROM public.tasks t
-      LEFT JOIN public.projects p ON p.id = t.project_id
-      LEFT JOIN public.users    u ON u.id = t.assignee_id
-      WHERE t.id = $1
-      `,
-      [insert.rows[0].id]
-    );
-
-    res.status(201).json(rows[0]);
-  } catch (e:any) {
-    console.error('create task error', e);
-    res.status(500).json({ error: 'Failed to create task' });
-  }
-});
-
-// PUT /api/tasks/:id
-app.put('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const ownerId = getOwnerId(req);
-    const taskId = req.params.id;
-    const {
-      title, description, status, priority, due_date,
-      progress_percentage, project_id, assignee_id
-    } = req.body;
-
-    // Make sure this task belongs to this owner
-    const { rowCount: exists } = await pool.query(
-      `SELECT 1 FROM public.tasks WHERE id = $1 AND user_id = $2`,
-      [taskId, ownerId]
-    );
-    if (!exists) return res.status(404).json({ error: 'Task not found' });
-
-    if (assignee_id) {
-      const { rowCount } = await pool.query(
-        `SELECT 1 FROM public.users WHERE id = $1 AND (parent_user_id = $2 OR user_id = $2)`,
-        [assignee_id, ownerId]
-      );
-      if (rowCount === 0) {
-        return res.status(400).json({ error: 'Invalid assignee_id' });
-      }
-    }
-
-    await pool.query(
-      `
-      UPDATE public.tasks SET
-        title = COALESCE($3, title),
-        description = $4,
-        status = COALESCE($5, status),
-        priority = COALESCE($6, priority),
-        due_date = $7,
-        progress_percentage = COALESCE($8, progress_percentage),
-        project_id = $9,
-        assignee_id = $10,
-        updated_at = NOW()
-      WHERE id = $1 AND user_id = $2
-      `,
-      [
-        taskId, ownerId,
-        title, description, status, priority, due_date,
-        progress_percentage, project_id || null, assignee_id || null
-      ]
-    );
-
-    const { rows } = await pool.query(
-      `
-      SELECT
-        t.*,
-        p.name AS project_name,
-        u.name AS assignee_name
-      FROM public.tasks t
-      LEFT JOIN public.projects p ON p.id = t.project_id
-      LEFT JOIN public.users    u ON u.id = t.assignee_id
-      WHERE t.id = $1
-      `,
-      [taskId]
-    );
-
-    res.json(rows[0]);
-  } catch (e:any) {
-    console.error('update task error', e);
-    res.status(500).json({ error: 'Failed to update task' });
-  }
-});
-
-
-// GET /api/tasks - Fetch all tasks for the authenticated user, with project details
-// GET /api/tasks
+// GET /api/tasks - Fetch all tasks for the authenticated user, with project details and steps
 app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const ownerId = getOwnerId(req);
-    const { rows } = await pool.query(
-      `
-      SELECT
-        t.*,
-        p.name AS project_name,
-        u.name AS assignee_name
-      FROM public.tasks t
-      LEFT JOIN public.projects p ON p.id = t.project_id
-      LEFT JOIN public.users    u ON u.id = t.assignee_id
-      WHERE t.user_id = $1
-      ORDER BY t.created_at DESC
-      `,
-      [ownerId]
-    );
-    res.json(rows);
-  } catch (e:any) {
-    console.error('list tasks error', e);
-    res.status(500).json({ error: 'Failed to fetch tasks' });
-  }
+    try {
+        const user_id = req.user!.parent_user_id; // Use your existing pattern
+        const { rows } = await pool.query(
+            `
+            SELECT
+                t.*,
+                p.name AS project_name,
+                u.name AS assignee_name,
+                COALESCE(
+                json_agg(
+                    json_build_object(
+                    'id', s.id,
+                    'title', s.title,
+                    'weight', s.weight,
+                    'is_done', s.is_done,
+                    'position', s.position
+                    )
+                    ORDER BY s.position ASC
+                ) FILTER (WHERE s.id IS NOT NULL),
+                '[]'::json
+                ) AS steps
+            FROM public.tasks t
+            LEFT JOIN public.projects p ON p.id = t.project_id
+            LEFT JOIN public.users    u ON u.id = t.assignee_id
+            LEFT JOIN LATERAL (
+                SELECT s.id, s.title, s.weight, s.is_done, s.position
+                FROM public.task_steps s
+                WHERE s.task_id = t.id
+                ORDER BY s.position ASC
+            ) s ON TRUE
+            WHERE t.user_id = $1
+            GROUP BY t.id, p.name, u.name
+            ORDER BY t.created_at DESC
+            `,
+            [user_id]
+        );
+        res.json(rows);
+    } catch (e: any) {
+        console.error('list tasks error', e);
+        res.status(500).json({ error: 'Failed to fetch tasks' });
+    }
+});
+
+// POST /api/tasks - Create a new task
+app.post('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
+    try {
+        const user_id = req.user!.parent_user_id; // Use your existing pattern
+        const {
+            title, description, status, priority, due_date,
+            progress_percentage, project_id, assignee_id,
+            // New fields for target/step tracking
+            progress_mode, progress_goal, progress_current
+        } = req.body;
+
+        // Optional validate: if assignee_id supplied, ensure it belongs to your company
+        if (assignee_id) {
+            const { rowCount } = await pool.query(
+                `SELECT 1 FROM public.users WHERE id = $1 AND (parent_user_id = $2 OR user_id = $2)`,
+                [assignee_id, user_id]
+            );
+            if (rowCount === 0) {
+                return res.status(400).json({ error: 'Invalid assignee_id' });
+            }
+        }
+
+        const insert = await pool.query(
+            `
+            INSERT INTO public.tasks
+                (user_id, title, description, status, priority, due_date,
+                progress_percentage, project_id, assignee_id,
+                progress_mode, progress_goal, progress_current) -- Include new fields
+            VALUES
+                ($1, $2, $3, COALESCE($4,'To Do'), COALESCE($5,'Medium'), $6,
+                COALESCE($7,0), $8, $9, $10, $11, $12) -- Include new field values
+            RETURNING *
+            `,
+            [user_id, title, description, status, priority, due_date,
+                progress_percentage, project_id || null, assignee_id || null,
+                progress_mode || 'manual', progress_goal || null, progress_current || 0] // Default values for new fields
+        );
+
+        // Return with denormalized names and steps
+        const { rows } = await pool.query(
+            `
+            SELECT
+                t.*,
+                p.name AS project_name,
+                u.name AS assignee_name,
+                COALESCE(
+                json_agg(
+                    json_build_object(
+                    'id', s.id,
+                    'title', s.title,
+                    'weight', s.weight,
+                    'is_done', s.is_done,
+                    'position', s.position
+                    )
+                    ORDER BY s.position ASC
+                ) FILTER (WHERE s.id IS NOT NULL),
+                '[]'::json
+                ) AS steps
+            FROM public.tasks t
+            LEFT JOIN public.projects p ON p.id = t.project_id
+            LEFT JOIN public.users    u ON u.id = t.assignee_id
+            LEFT JOIN public.task_steps s ON s.task_id = t.id
+            WHERE t.id = $1
+            GROUP BY t.id, p.name, u.name
+            `,
+            [insert.rows[0].id]
+        );
+
+        res.status(201).json(rows[0]);
+    } catch (e: any) {
+        console.error('create task error', e);
+        res.status(500).json({ error: 'Failed to create task' });
+    }
 });
 
 // PUT /api/tasks/:id - Update an existing task
-app.put('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const { id } = req.params;
-    const { title, description, priority, due_date, project_id, progress_percentage: clientProgress } = req.body;
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user (replaces dummyUserId)
+// Consolidated and corrected version
+app.put('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => {
+    const taskId = req.params.id;
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
+
+    const {
+        title, description, priority, due_date, project_id, assignee_id,
+        // Allow direct update of progress_percentage or mode-specific fields
+        progress_percentage: clientProgress,
+        progress_mode, progress_goal, progress_current,
+        status: clientStatus // Allow client to explicitly set status if needed
+    } = req.body;
 
     if (!title) {
         return res.status(400).json({ error: 'Task title is required.' });
     }
 
-    // Ensure progress_percentage is a number and clamp it between 0 and 100
-    const progress_percentage = typeof clientProgress === 'number' ? Math.max(0, Math.min(100, clientProgress)) : 0;
-    // Derive status from the provided progress_percentage
-    const status = getStatusFromPercentage(progress_percentage);
-
     try {
-        const result = await pool.query(
-            `UPDATE public.tasks
-             SET title = $1, description = $2, status = $3, priority = $4, due_date = $5, progress_percentage = $6, project_id = $7, updated_at = NOW()
-             WHERE id = $8 AND user_id = $9 RETURNING *`, // Filter by actual user_id
-            [
-                title,
-                description || null,
-                status, // Use derived status
-                priority || 'Medium',
-                due_date || null,
-                progress_percentage, // Use client's progress
-                project_id || null,
-                id,
-                user_id // Use actual user_id
-            ]
+        // Make sure this task belongs to this user
+        const { rowCount: exists } = await pool.query(
+            `SELECT 1 FROM public.tasks WHERE id = $1 AND user_id = $2`,
+            [taskId, user_id]
+        );
+        if (!exists) return res.status(404).json({ error: 'Task not found or unauthorized.' });
+
+        // Validate assignee_id if provided
+        if (assignee_id) {
+            const { rowCount } = await pool.query(
+                `SELECT 1 FROM public.users WHERE id = $1 AND (parent_user_id = $2 OR user_id = $2)`,
+                [assignee_id, user_id]
+            );
+            if (rowCount === 0) {
+                return res.status(400).json({ error: 'Invalid assignee_id' });
+            }
+        }
+
+        // Determine status and progress
+        let finalStatus = clientStatus;
+        let finalProgress = typeof clientProgress === 'number' ? Math.max(0, Math.min(100, clientProgress)) : undefined;
+
+        // If progress_percentage is explicitly set, derive status from it
+        if (finalProgress !== undefined && !finalStatus) {
+            finalStatus = getStatusFromPercentage(finalProgress);
+        }
+
+        // Build dynamic update query
+        const updateFields = [];
+        const updateValues = [];
+        let paramIndex = 1;
+
+        if (title !== undefined) {
+            updateFields.push(`title = $${paramIndex}`);
+            updateValues.push(title);
+            paramIndex++;
+        }
+        if (description !== undefined) {
+            updateFields.push(`description = $${paramIndex}`);
+            updateValues.push(description);
+            paramIndex++;
+        }
+        if (finalStatus !== undefined) {
+            updateFields.push(`status = $${paramIndex}`);
+            updateValues.push(finalStatus);
+            paramIndex++;
+        }
+        if (priority !== undefined) {
+            updateFields.push(`priority = $${paramIndex}`);
+            updateValues.push(priority);
+            paramIndex++;
+        }
+        if (due_date !== undefined) {
+            updateFields.push(`due_date = $${paramIndex}`);
+            updateValues.push(due_date);
+            paramIndex++;
+        }
+        if (finalProgress !== undefined) {
+            updateFields.push(`progress_percentage = $${paramIndex}`);
+            updateValues.push(finalProgress);
+            paramIndex++;
+        }
+        if (progress_mode !== undefined) {
+            updateFields.push(`progress_mode = $${paramIndex}`);
+            updateValues.push(progress_mode);
+            paramIndex++;
+        }
+        if (progress_goal !== undefined) {
+            updateFields.push(`progress_goal = $${paramIndex}`);
+            updateValues.push(progress_goal);
+            paramIndex++;
+        }
+        if (progress_current !== undefined) {
+            updateFields.push(`progress_current = $${paramIndex}`);
+            updateValues.push(progress_current);
+            paramIndex++;
+        }
+        if (project_id !== undefined) {
+            updateFields.push(`project_id = $${paramIndex}`);
+            updateValues.push(project_id);
+            paramIndex++;
+        }
+        if (assignee_id !== undefined) {
+            updateFields.push(`assignee_id = $${paramIndex}`);
+            updateValues.push(assignee_id);
+            paramIndex++;
+        }
+
+        // Always update the timestamp
+        updateFields.push(`updated_at = NOW()`);
+        
+        updateValues.push(taskId, user_id); // For WHERE clause
+
+        if (updateFields.length > 1) { // Only if there are fields to update besides timestamp
+            const updateQuery = `
+                UPDATE public.tasks SET
+                    ${updateFields.join(', ')}
+                WHERE id = $${paramIndex - 1} AND user_id = $${paramIndex}
+                RETURNING *`;
+            
+            await pool.query(updateQuery, updateValues);
+        }
+
+        // If mode-specific fields were updated, recalculate progress
+        // Only recompute if mode is not manual, or if goal/current/mode changed
+        if (progress_mode !== undefined || progress_goal !== undefined || progress_current !== undefined) {
+             await recomputeTaskProgress(taskId);
+        } else if (finalProgress !== undefined && progress_mode === 'manual') {
+            // If manual mode and progress was explicitly set, no need to recompute
+        } else if (progress_mode === 'manual') {
+             // Explicitly manual mode, no action needed
+        } else {
+            // Recompute for other modes if no specific fields were changed but status/progress was
+            await recomputeTaskProgress(taskId);
+        }
+
+        // Fetch and return the updated task with steps
+        const { rows } = await pool.query(
+            `
+            SELECT
+                t.*,
+                p.name AS project_name,
+                u.name AS assignee_name,
+                COALESCE(
+                json_agg(
+                    json_build_object(
+                    'id', s.id,
+                    'title', s.title,
+                    'weight', s.weight,
+                    'is_done', s.is_done,
+                    'position', s.position
+                    )
+                    ORDER BY s.position ASC
+                ) FILTER (WHERE s.id IS NOT NULL),
+                '[]'::json
+                ) AS steps
+            FROM public.tasks t
+            LEFT JOIN public.projects p ON p.id = t.project_id
+            LEFT JOIN public.users    u ON u.id = t.assignee_id
+            LEFT JOIN public.task_steps s ON s.task_id = t.id
+            WHERE t.id = $1
+            GROUP BY t.id, p.name, u.name
+            `,
+            [taskId]
         );
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Task not found or unauthorized.' });
-        }
-        res.json(result.rows[0]);
+        res.json(rows[0]);
     } catch (error: unknown) {
         console.error('Error updating task:', error);
         res.status(500).json({ error: 'Failed to update task.', detail: error instanceof Error ? error.message : String(error) });
@@ -5678,14 +5828,14 @@ app.put('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) =>
 });
 
 // DELETE /api/tasks/:id - Delete a task
-app.delete('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const { id } = req.params;
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user (replaces dummyUserId)
+app.delete('/api/tasks/:id', authMiddleware, async (req: Request, res: Response) => {
+    const taskId = req.params.id;
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
 
     try {
         const result = await pool.query(
-            `DELETE FROM public.tasks WHERE id = $1 AND user_id = $2 RETURNING id`, // Filter by actual user_id
-            [id, user_id]
+            `DELETE FROM public.tasks WHERE id = $1 AND user_id = $2 RETURNING id`,
+            [taskId, user_id]
         );
 
         if (result.rows.length === 0) {
@@ -5700,34 +5850,414 @@ app.delete('/api/tasks/:id', authMiddleware, async (req: Request, res: Response)
 
 // PATCH /api/tasks/:id/assign
 app.patch('/api/tasks/:id/assign', authMiddleware, async (req: Request, res: Response) => {
-  const ownerId = getOwnerId(req);
-  const { id } = req.params;
-  const { assignee_id } = req.body;
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
+    const taskId = req.params.id;
+    const { assignee_id } = req.body;
 
-  if (!assignee_id) return res.status(400).json({ error: 'assignee_id is required' });
+    if (!assignee_id) return res.status(400).json({ error: 'assignee_id is required' });
 
-  // validate same as above then:
-  await pool.query(
-    `UPDATE public.tasks SET assignee_id = $3, updated_at = NOW()
-      WHERE id = $1 AND user_id = $2`,
-    [id, ownerId, assignee_id]
-  );
-  res.json({ ok: true });
+    // Validate assignee_id
+    const { rowCount } = await pool.query(
+        `SELECT 1 FROM public.users WHERE id = $1 AND (parent_user_id = $2 OR user_id = $2)`,
+        [assignee_id, user_id]
+    );
+    if (rowCount === 0) {
+        return res.status(400).json({ error: 'Invalid assignee_id' });
+    }
+
+    await pool.query(
+        `UPDATE public.tasks SET assignee_id = $3, updated_at = NOW()
+         WHERE id = $1 AND user_id = $2`,
+        [taskId, user_id, assignee_id]
+    );
+    res.json({ ok: true });
 });
 
 // PATCH /api/tasks/:id/unassign
 app.patch('/api/tasks/:id/unassign', authMiddleware, async (req: Request, res: Response) => {
-  const ownerId = getOwnerId(req);
-  const { id } = req.params;
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
+    const taskId = req.params.id;
 
-  await pool.query(
-    `UPDATE public.tasks SET assignee_id = NULL, updated_at = NOW()
-      WHERE id = $1 AND user_id = $2`,
-    [id, ownerId]
-  );
-  res.json({ ok: true });
+    await pool.query(
+        `UPDATE public.tasks SET assignee_id = NULL, updated_at = NOW()
+         WHERE id = $1 AND user_id = $2`,
+        [taskId, user_id]
+    );
+    res.json({ ok: true });
 });
 
+// POST /api/tasks/:id/progress/increment (for target mode)
+app.post('/api/tasks/:id/progress/increment', authMiddleware, async (req, res) => {
+    const taskId = req.params.id;
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
+
+    try {
+        // Ensure task belongs to user
+        const taskCheck = await pool.query(
+            `SELECT 1 FROM public.tasks WHERE id = $1 AND user_id = $2`,
+            [taskId, user_id]
+        );
+        if (taskCheck.rowCount === 0) {
+             return res.status(404).json({ error: 'Task not found or unauthorized.' });
+        }
+
+        // Increment current progress
+        await pool.query(`
+            UPDATE public.tasks
+            SET progress_current = LEAST(COALESCE(progress_goal, 2147483647),
+                                         COALESCE(progress_current, 0) + 1),
+                updated_at = NOW()
+            WHERE id = $1`,
+            [taskId]
+        );
+        
+        // Recalculate progress percentage based on mode
+        await recomputeTaskProgress(taskId);
+
+        // Fetch and return the updated task
+        const { rows } = await pool.query(
+            `
+            SELECT
+                t.*,
+                p.name AS project_name,
+                u.name AS assignee_name,
+                COALESCE(
+                json_agg(
+                    json_build_object(
+                    'id', s.id,
+                    'title', s.title,
+                    'weight', s.weight,
+                    'is_done', s.is_done,
+                    'position', s.position
+                    )
+                    ORDER BY s.position ASC
+                ) FILTER (WHERE s.id IS NOT NULL),
+                '[]'::json
+                ) AS steps
+            FROM public.tasks t
+            LEFT JOIN public.projects p ON p.id = t.project_id
+            LEFT JOIN public.users    u ON u.id = t.assignee_id
+            LEFT JOIN public.task_steps s ON s.task_id = t.id
+            WHERE t.id = $1
+            GROUP BY t.id, p.name, u.name
+            `,
+            [taskId]
+        );
+
+        res.json(rows[0]);
+    } catch (error: unknown) {
+        console.error('Error incrementing task progress:', error);
+        res.status(500).json({ error: 'Failed to increment task progress.', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// PUT /api/tasks/:id/progress - Dedicated endpoint for updating progress/targets/steps
+// PUT /api/tasks/:id/progress - Dedicated endpoint for updating progress/targets/steps
+app.put('/api/tasks/:id/progress', authMiddleware, async (req, res) => {
+    const taskId = req.params.id;
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
+    const {
+        progress_mode,
+        progress_goal,
+        progress_current,
+        steps // Array of step updates/creates
+    } = req.body;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Ensure task belongs to user
+        const taskCheck = await client.query(
+            `SELECT progress_mode FROM public.tasks WHERE id = $1 AND user_id = $2`,
+            [taskId, user_id]
+        );
+        if (taskCheck.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Task not found or unauthorized.' });
+        }
+        const currentTaskMode = taskCheck.rows[0].progress_mode;
+
+        // --- UPDATE TASK PROGRESS FIELDS ---
+        const updateFields = [];
+        const updateValues = [];
+        let paramIndex = 1; // Start parameter indexing
+
+        if (progress_mode !== undefined) {
+            updateFields.push(`progress_mode = $${paramIndex}`);
+            updateValues.push(progress_mode);
+            paramIndex++;
+        }
+
+        if (progress_goal !== undefined) {
+            updateFields.push(`progress_goal = $${paramIndex}`);
+            updateValues.push(progress_goal);
+            paramIndex++;
+        }
+
+        if (progress_current !== undefined) {
+            updateFields.push(`progress_current = $${paramIndex}`);
+            updateValues.push(progress_current);
+            paramIndex++;
+        }
+
+        // Calculate and set progress_percentage if in 'target' mode
+        let calculatedProgress: number | null = null;
+        const newMode = progress_mode !== undefined ? progress_mode : currentTaskMode;
+        if (newMode === 'target' && progress_goal !== undefined) {
+            const goal = Math.max(Number(progress_goal || 0), 0);
+            const currentVal = Math.max(Number(progress_current !== undefined ? progress_current : (taskCheck.rows[0].progress_current || 0)), 0);
+            calculatedProgress = goal > 0 ? Math.min(100, Math.round((currentVal / goal) * 100)) : 0;
+            updateFields.push(`progress_percentage = $${paramIndex}`);
+            updateValues.push(calculatedProgress); // Push the NUMBER first
+            paramIndex++;
+        }
+
+        // Always update the timestamp
+        updateFields.push('updated_at = NOW()');
+
+        // --- CRITICAL: Push UUIDs LAST and use placeholders correctly ---
+        // Add placeholders for WHERE clause parameters
+        const whereIdPlaceholder = `$${paramIndex}`;
+        const whereUserIdPlaceholder = `$${paramIndex + 1}`;
+        // Push UUID values LAST into the array
+        updateValues.push(taskId, user_id);
+
+        // If there are fields to update (beyond just updated_at), run the query
+        if (updateFields.length > 1) {
+            const updateQuery = `
+                UPDATE public.tasks SET
+                    ${updateFields.join(', ')}
+                WHERE id = ${whereIdPlaceholder} AND user_id = ${whereUserIdPlaceholder}`;
+
+            await client.query(updateQuery, updateValues);
+        }
+        // --- END UPDATE TASK ---
+
+        // --- HANDLE STEPS ---
+        // Handle steps if provided
+        if (steps && Array.isArray(steps)) {
+            for (const step of steps) {
+                if (step.id) {
+                    // Update existing step
+                    await client.query(`
+                        UPDATE public.task_steps SET
+                            title = COALESCE($1, title),
+                            weight = COALESCE($2, weight),
+                            is_done = COALESCE($3, is_done),
+                            position = COALESCE($4, position)
+                        WHERE id = $5 AND task_id = $6`,
+                        [step.title, step.weight, step.is_done, step.position, step.id, taskId]
+                    );
+                } else {
+                    // Create new step
+                    await client.query(`
+                        INSERT INTO public.task_steps (task_id, title, weight, is_done, position)
+                        VALUES ($1, $2, $3, $4, $5)`,
+                        [taskId, step.title, step.weight || 1, step.is_done || false, step.position || 0]
+                    );
+                }
+            }
+        }
+
+        // If in 'steps' mode, recalculate progress based on steps
+        if (newMode === 'steps') {
+            const stepResult = await client.query(
+                'SELECT weight, is_done FROM public.task_steps WHERE task_id = $1',
+                [taskId]
+            );
+
+            const stepsData = stepResult.rows;
+            if (stepsData.length > 0) {
+                const totalWeight = stepsData.reduce((sum, step) => sum + (step.weight || 0), 0);
+                const completedWeight = stepsData
+                    .filter(step => step.is_done)
+                    .reduce((sum, step) => sum + (step.weight || 0), 0);
+
+                const stepProgress = totalWeight > 0
+                    ? Math.round((completedWeight / totalWeight) * 100)
+                    : 0;
+
+                // --- CORRECTED: Parameter order for steps mode update ---
+                await client.query(
+                    'UPDATE public.tasks SET progress_percentage = $1, updated_at = NOW() WHERE id = $2',
+                    [stepProgress, taskId] // [NUMBER, UUID] - Correct order
+                );
+                // --- END CORRECTED ---
+            } else {
+                 // If no steps, progress is 0
+                 await client.query(
+                    'UPDATE public.tasks SET progress_percentage = $1, updated_at = NOW() WHERE id = $2',
+                    [0, taskId]
+                );
+            }
+        }
+        // --- END HANDLE STEPS ---
+
+        await client.query('COMMIT');
+
+        // Return updated task with steps
+        const { rows } = await pool.query(
+            `
+            SELECT
+                t.*,
+                p.name AS project_name,
+                u.name AS assignee_name,
+                COALESCE(
+                json_agg(
+                    json_build_object(
+                    'id', s.id,
+                    'title', s.title,
+                    'weight', s.weight,
+                    'is_done', s.is_done,
+                    'position', s.position
+                    )
+                    ORDER BY s.position ASC
+                ) FILTER (WHERE s.id IS NOT NULL),
+                '[]'::json
+                ) AS steps
+            FROM public.tasks t
+            LEFT JOIN public.projects p ON p.id = t.project_id
+            LEFT JOIN public.users    u ON u.id = t.assignee_id
+            LEFT JOIN public.task_steps s ON s.task_id = t.id
+            WHERE t.id = $1
+            GROUP BY t.id, p.name, u.name`,
+            [taskId]
+        );
+
+        res.json(rows[0]);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error updating task progress:', error);
+        // Provide a more specific error message if it's the type mismatch we've been fixing
+        if (error instanceof Error && error.message.includes('progress_percentage') && error.message.includes('uuid')) {
+             res.status(500).json({ error: 'Failed to update task progress due to a data type mismatch. Please check server logs.' });
+        } else {
+             res.status(500).json({ error: 'Failed to update task progress' });
+        }
+    } finally {
+        client.release();
+    }
+});
+
+// --- Task Steps API Endpoints ---
+
+// POST /api/tasks/:taskId/steps - Create a new step for a task
+app.post('/api/tasks/:taskId/steps', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
+    const { taskId } = req.params;
+    const { title, weight, is_done, position } = req.body;
+
+    if (!title) {
+        return res.status(400).json({ error: 'Step title is required.' });
+    }
+
+    try {
+        // Verify task belongs to user
+        const taskCheck = await pool.query(
+            'SELECT 1 FROM public.tasks WHERE id = $1 AND user_id = $2',
+            [taskId, user_id]
+        );
+
+        if (taskCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Task not found or unauthorized' });
+        }
+
+        const result = await pool.query(`
+            INSERT INTO public.task_steps (task_id, title, weight, is_done, position)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *`,
+            [taskId, title, weight || 1, is_done || false, position || 0]
+        );
+
+        // Recalculate task progress if task is in 'steps' mode
+        await recomputeTaskProgress(taskId);
+
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Error creating step:', error);
+        res.status(500).json({ error: 'Failed to create step' });
+    }
+});
+
+// PUT /api/steps/:stepId - Update a step
+app.put('/api/steps/:stepId', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
+    const { stepId } = req.params;
+    const { title, weight, is_done, position } = req.body;
+
+    try {
+        // Verify step belongs to user's task
+        const stepCheck = await pool.query(`
+            SELECT 1 FROM public.task_steps ts
+            JOIN public.tasks t ON ts.task_id = t.id
+            WHERE ts.id = $1 AND t.user_id = $2`,
+            [stepId, user_id]
+        );
+
+        if (stepCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Step not found or unauthorized' });
+        }
+
+        const result = await pool.query(`
+            UPDATE public.task_steps SET
+                title = COALESCE($1, title),
+                weight = COALESCE($2, weight),
+                is_done = COALESCE($3, is_done),
+                position = COALESCE($4, position)
+            WHERE id = $5
+            RETURNING *`,
+            [title, weight, is_done, position, stepId]
+        );
+
+        // Get task_id for progress recalculation
+        const taskResult = await pool.query(
+            'SELECT task_id FROM public.task_steps WHERE id = $1',
+            [stepId]
+        );
+
+        if (taskResult.rows.length > 0) {
+            await recomputeTaskProgress(taskResult.rows[0].task_id);
+        }
+
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Error updating step:', error);
+        res.status(500).json({ error: 'Failed to update step' });
+    }
+});
+
+// DELETE /api/steps/:stepId - Delete a step
+app.delete('/api/steps/:stepId', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id; // Use your existing pattern
+    const { stepId } = req.params;
+
+    try {
+        // Verify step belongs to user's task and get task_id
+        const stepCheck = await pool.query(`
+            SELECT ts.task_id FROM public.task_steps ts
+            JOIN public.tasks t ON ts.task_id = t.id
+            WHERE ts.id = $1 AND t.user_id = $2`,
+            [stepId, user_id]
+        );
+
+        if (stepCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Step not found or unauthorized' });
+        }
+
+        const taskId = stepCheck.rows[0].task_id;
+
+        await pool.query('DELETE FROM public.task_steps WHERE id = $1', [stepId]);
+
+        // Recalculate task progress
+        await recomputeTaskProgress(taskId);
+
+        res.json({ message: 'Step deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting step:', error);
+        res.status(500).json({ error: 'Failed to delete step' });
+    }
+});
 /* --- Project Management API Endpoints --- */
 
 // POST /api/projects - Create a new project
