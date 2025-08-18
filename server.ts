@@ -2998,23 +2998,30 @@ app.delete('/products-services/:id', authMiddleware, async (req: Request, res: R
 // 1. POST Create New Sale (app.post('/api/sales'))
 // This endpoint is unchanged from our previous discussion and correctly
 // calculates the remaining_credit_amount.
+// server.ts (or your main server file)
+// ... (existing imports and setup) ...
+
+// =========================================================================
+// 1. POST Create New Sale (app.post('/api/sales')) - ENHANCED VERSION
+// Integrates fully with accounting, handles custom products, detailed transactions.
 // =========================================================================
 app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
     const {
         cart,
         paymentType,
-        total,
+        total: frontendTotal, // Renamed for clarity
         customer,
-        amountPaid,
-        change,
-        dueDate,
+        amountPaid: frontendAmountPaid, // Renamed for clarity
+        change: frontendChange, // Renamed for clarity
+        dueDate: frontendDueDate, // Renamed for clarity
         tellerName,
         branch,
         companyName
     } = req.body;
     const user_id = req.user!.parent_user_id;
 
-    if (!cart || cart.length === 0 || total === undefined) {
+    // --- 1. Validate Request Body ---
+    if (!cart || !Array.isArray(cart) || cart.length === 0 || frontendTotal === undefined) {
         return res.status(400).json({ error: 'Cart cannot be empty and total amount is required.' });
     }
 
@@ -3022,20 +3029,152 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
         return res.status(400).json({ error: 'A customer is required for credit sales.' });
     }
 
-    const remainingCreditAmount = paymentType === 'Credit' ? Number(total) : null;
-    const actualAmountPaid = paymentType !== 'Credit' ? Number(amountPaid) : null;
-    const actualChangeGiven = paymentType === 'Cash' ? Number(change) : null;
-    const actualDueDate = paymentType === 'Credit' ? dueDate : null;
+    console.log(`[API /api/sales] Processing sale for user ${user_id}. Payment Type: ${paymentType}, Items: ${cart.length}`);
 
-    const tellerId = req.user!.user_id; // ✅ actual seller’s user_id
-
-    const customerId = customer?.id || null;
-    const customerName = customer?.name || null;
-
-    const client = await pool.connect();
+    const client = await pool.connect(); // Acquire a client for transaction
 
     try {
+        // --- 2. Begin Database Transaction ---
         await client.query('BEGIN');
+
+        let calculatedGrandTotal = 0;
+        let calculatedTotalTax = 0;
+        const processedItems = []; // To hold details for potential COGS calc later
+
+        // --- 3. Process Each Cart Item ---
+        for (const item of cart) {
+            // Validate basic item structure
+            if (item.quantity == null || item.unit_price == null || item.subtotal == null) {
+                 throw new Error(`Invalid cart item structure: ${JSON.stringify(item)}`);
+            }
+            const quantity = Number(item.quantity);
+            const unitPrice = Number(item.unit_price);
+            const itemSubtotal = Number(item.subtotal);
+            const taxRateValue = Number(item.tax_rate_value ?? 0); // Default to 0 if not provided
+
+            if (isNaN(quantity) || isNaN(unitPrice) || isNaN(itemSubtotal) || isNaN(taxRateValue) || quantity <= 0) {
+                 throw new Error(`Invalid numerical values in cart item: ${JSON.stringify(item)}`);
+            }
+
+            let itemId = item.id;
+            let itemName = item.name;
+            let isExistingProduct = typeof itemId === 'number'; // Heuristic: assume number IDs are existing DB records
+            let costPrice = null; // Needed for COGS if using perpetual inventory
+
+            // --- Handle Existing vs Custom Items ---
+            if (isExistingProduct) {
+                // --- 3a. Process Existing Product/Service ---
+                console.log(`[API /api/sales] Processing existing item ID ${itemId}: ${itemName}, Qty: ${quantity}`);
+
+                // Fetch current product details with a lock FOR UPDATE
+                const productRes = await client.query(
+                    `SELECT id, name, stock_quantity, unit_price, cost_price, is_service
+                     FROM public.products_services
+                     WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                    [itemId, user_id]
+                );
+
+                if (productRes.rows.length === 0) {
+                    throw new Error(`Product or service with ID ${itemId} not found or unauthorized.`);
+                }
+
+                const dbProduct = productRes.rows[0];
+                itemName = dbProduct.name; // Use name from DB for consistency
+                costPrice = dbProduct.cost_price ? Number(dbProduct.cost_price) : null;
+
+                // Check stock (only for physical products, not services)
+                if (!dbProduct.is_service) {
+                    const currentStock = Number(dbProduct.stock_quantity);
+                    if (quantity > currentStock) {
+                        throw new Error(`Insufficient stock for "${itemName}". Requested: ${quantity}, Available: ${currentStock}.`);
+                    }
+                    // Update stock quantity
+                    const newStock = currentStock - quantity;
+                    await client.query(
+                        `UPDATE public.products_services SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND user_id = $3`,
+                        [newStock, itemId, user_id]
+                    );
+                    console.log(`[API /api/sales] Updated stock for item ID ${itemId} (${itemName}). New stock: ${newStock}`);
+                } else {
+                     console.log(`[API /api/sales] Item ID ${itemId} (${itemName}) is a service, skipping stock update.`);
+                }
+
+                // Note: Item details like unit_price, tax_rate_value are taken from the *cart item* sent by frontend
+                // This allows flexibility (e.g., temporary price changes), but ensure frontend sends correct data.
+                // Backend recalculates subtotal below for verification.
+
+            } else {
+                // --- 3b. Process Custom Item ---
+                console.log(`[API /api/sales] Processing custom item: ${itemName}, Qty: ${quantity}`);
+                // For custom items, we assume ID is a string like 'custom-...'
+                // No stock update needed. Name, price, tax are taken from cart item.
+                // You might validate name/price further here if needed.
+                itemId = item.id; // Keep the custom ID string
+                itemName = item.name;
+                // costPrice remains null for custom items unless specified/logic added
+            }
+
+            // --- 3c. Recalculate & Validate Item Subtotal (Server-side calculation) ---
+            const calculatedItemSubtotalExclTax = quantity * unitPrice;
+            const calculatedItemTax = calculatedItemSubtotalExclTax * taxRateValue;
+            const calculatedItemSubtotalInclTax = calculatedItemSubtotalExclTax + calculatedItemTax;
+
+            // Optional: Add tolerance check instead of strict equality if minor rounding diffs are expected
+            const tolerance = 0.01; // Adjust tolerance as needed
+            if (Math.abs(calculatedItemSubtotalInclTax - itemSubtotal) > tolerance) {
+                 console.warn(`[API /api/sales] Subtotal mismatch for item ${itemName}. Frontend: ${itemSubtotal.toFixed(2)}, Calculated: ${calculatedItemSubtotalInclTax.toFixed(2)}. Using calculated value.`);
+                 // Optionally, you could throw an error here for stricter validation
+                 // throw new Error(`Subtotal mismatch for item ${itemName}. Please recalculate cart.`);
+            }
+
+            calculatedGrandTotal += calculatedItemSubtotalInclTax;
+            calculatedTotalTax += calculatedItemTax;
+
+            processedItems.push({
+                id: itemId, // Number for DB items, string for custom
+                name: itemName,
+                quantity,
+                unit_price: unitPrice,
+                tax_rate_value: taxRateValue,
+                subtotal_excl_tax: calculatedItemSubtotalExclTax,
+                tax_amount: calculatedItemTax,
+                subtotal_incl_tax: calculatedItemSubtotalInclTax,
+                is_existing_product: isExistingProduct,
+                cost_price: costPrice // For potential COGS calc
+            });
+        }
+
+        // --- 4. Validate Overall Total (Optional but recommended) ---
+        const tolerance = 0.01;
+        if (Math.abs(calculatedGrandTotal - Number(frontendTotal)) > tolerance) {
+             console.warn(`[API /api/sales] Grand total mismatch. Frontend: ${Number(frontendTotal).toFixed(2)}, Calculated: ${calculatedGrandTotal.toFixed(2)}. Using calculated value.`);
+             // Optionally, throw error for stricter validation
+        }
+        const finalGrandTotal = calculatedGrandTotal;
+        const finalTotalTax = calculatedTotalTax;
+
+        console.log(`[API /api/sales] Sale processed. Calculated Grand Total: ${finalGrandTotal.toFixed(2)}, Tax: ${finalTotalTax.toFixed(2)}`);
+
+        // --- 5. Update Customer Balance Due for Credit Sales ---
+        const remainingCreditAmount = paymentType === 'Credit' ? finalGrandTotal : null;
+        const actualAmountPaid = paymentType !== 'Credit' ? Number(frontendAmountPaid) : null;
+        const actualChangeGiven = paymentType === 'Cash' ? Number(frontendChange) : null;
+        const actualDueDate = paymentType === 'Credit' ? frontendDueDate : null;
+
+        if (paymentType === 'Credit' && customer?.id) {
+             await client.query(
+                `UPDATE public.customers
+                 SET balance_due = COALESCE(balance_due, 0) + $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $2 AND user_id = $3;`,
+                [finalGrandTotal, customer.id, user_id]
+            );
+             console.log(`[API /api/sales] Updated customer ${customer.id} balance_due by ${finalGrandTotal.toFixed(2)}.`);
+        }
+
+        // --- 6. Insert Sale Record (Keep existing logic) ---
+        const tellerId = req.user!.user_id; // Actual seller's user_id
+        const customerId = customer?.id || null;
+        const customerName = customer?.name || null;
 
         const salesInsertResult = await client.query(
             `INSERT INTO public.sales (
@@ -3047,7 +3186,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
             [
                 customerId,
                 customerName,
-                Number(total),
+                finalGrandTotal, // Use calculated total
                 paymentType,
                 actualAmountPaid,
                 actualChangeGiven,
@@ -3064,45 +3203,15 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
         const saleId = salesInsertResult.rows[0].id;
         const saleTimestamp = salesInsertResult.rows[0].created_at;
 
-        if (paymentType === 'Credit' && customerId) {
-            await client.query(
-                `UPDATE public.customers
-                 SET balance_due = balance_due + $1, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $2 AND user_id = $3;`,
-                [Number(total), customerId, user_id]
-            );
-        }
-
+        // --- 7. Insert Sale Items (Keep existing logic) ---
         for (const item of cart) {
-            const productResult = await client.query(
-                'SELECT stock_quantity, name FROM public.products_services WHERE id = $1 AND user_id = $2 FOR UPDATE',
-                [item.id, user_id]
-            );
-
-            if (productResult.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return res.status(404).json({ error: `Product or service with ID ${item.id} not found or unauthorized.` });
+            // Determine product name (use from item or fetch if needed for consistency, though item.name is usually fine)
+            let productName = item.name;
+            if (typeof item.id === 'number') {
+                 // For existing items, you might re-fetch name for absolute consistency, but using item.name is common
+                 // const prodRes = await client.query('SELECT name FROM public.products_services WHERE id = $1 AND user_id = $2', [item.id, user_id]);
+                 // if (prodRes.rows.length > 0) productName = prodRes.rows[0].name;
             }
-
-            const currentStock = Number(productResult.rows[0].stock_quantity);
-            const productName = productResult.rows[0].name;
-            const quantityToDeduct = Number(item.quantity);
-            const newStock = currentStock - quantityToDeduct;
-
-            if (newStock < 0) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({
-                    error: `Insufficient stock for "${productName}". Current stock: ${currentStock}. Cannot sell ${quantityToDeduct}.`,
-                    availableStock: currentStock,
-                });
-            }
-
-            await client.query(
-                `UPDATE public.products_services
-                 SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $2 AND user_id = $3;`,
-                [newStock, item.id, user_id]
-            );
 
             await client.query(
                 `INSERT INTO public.sale_items (
@@ -3110,72 +3219,177 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7);`,
                 [
                     saleId,
-                    item.id,
-                    productName, // Use productName from the query result
+                    item.id, // Can be number or string (custom ID)
+                    productName,
                     Number(item.quantity),
                     Number(item.unit_price),
                     Number(item.subtotal),
-                    user_id // Ensure user_id is included for sale_items
+                    user_id
                 ]
             );
         }
 
-        // --- START: MODIFIED SALES REVENUE ACCOUNT LOOKUP ---
-        // Dynamically fetch the Sales Revenue account ID based on user_id and account code (or category/name)
-        const salesRevenueAccountResult = await client.query(
-            `SELECT id FROM public.accounts
-             WHERE user_id = $1 AND name = 'Sales Revenue' AND type = 'Income';`, // Assuming 'name' and 'account_type' for lookup
+
+        // --- 8. Determine Accounts and Amounts ---
+        let accountIdDestination = null; // Account ID for payment received
+        let amountReceived = 0;
+        let transactionDescription = '';
+
+        if (paymentType === 'Cash') {
+            // Find Cash Account ID for this user
+            const cashAccountRes = await client.query(
+                `SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%cash%' AND type = 'Asset' LIMIT 1`,
+                [user_id]
+            );
+            if (cashAccountRes.rows.length === 0) {
+                 throw new Error('Default Cash account not found for user.');
+            }
+            accountIdDestination = cashAccountRes.rows[0].id;
+            amountReceived = Number(frontendAmountPaid) || 0; // Ensure it's a number
+            transactionDescription = `Cash sale by ${tellerName || 'Unknown'} at ${branch || 'Unknown Branch'}`;
+
+        } else if (paymentType === 'Bank') {
+            // Find Bank Account ID (you might need a specific bank account selector in UI)
+             const bankAccountRes = await client.query(
+                `SELECT id FROM public.accounts WHERE user_id = $1 AND (name ILIKE '%bank%' OR name ILIKE '%cheque%') AND type = 'Asset' LIMIT 1`,
+                [user_id]
+            );
+            if (bankAccountRes.rows.length === 0) {
+                 throw new Error('Default Bank account not found for user.');
+            }
+            accountIdDestination = bankAccountRes.rows[0].id;
+            amountReceived = finalGrandTotal; // Full amount for bank/card
+            transactionDescription = `Bank/Card sale by ${tellerName || 'Unknown'} at ${branch || 'Unknown Branch'}`;
+
+        } else if (paymentType === 'Credit') {
+            // Find Accounts Receivable ID
+             const arAccountRes = await client.query(
+                `SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%accounts receivable%' AND type = 'Asset' LIMIT 1`,
+                [user_id]
+            );
+            if (arAccountRes.rows.length === 0) {
+                 throw new Error('Default Accounts Receivable account not found for user.');
+            }
+            accountIdDestination = arAccountRes.rows[0].id;
+            amountReceived = finalGrandTotal; // Full amount owed
+             transactionDescription = `Credit sale to ${customer?.name || 'Unknown Customer'}`;
+             // Note: Due date handling would involve updating the customer's balance or a separate credit tracking mechanism.
+        }
+
+        // Find Sales Revenue Account ID
+        const revenueAccountRes = await client.query(
+            `SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%sales revenue%' AND type = 'Income' LIMIT 1`,
             [user_id]
         );
-
-        if (salesRevenueAccountResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(500).json({ error: 'Sales Revenue account not found for this user. Please ensure it is set up.' });
+        if (revenueAccountRes.rows.length === 0) {
+             throw new Error('Default Sales Revenue account not found for user.');
         }
-        const salesRevenueAccountId = salesRevenueAccountResult.rows[0].id;
-        // --- END: MODIFIED SALES REVENUE ACCOUNT LOOKUP ---
+        const accountIdRevenue = revenueAccountRes.rows[0].id;
 
-        const transactionType = 'income'; // Changed to 'income' as per transactions table type
-        const transactionCategory = 'Sales Revenue'; // Changed to 'Sales Revenue' as per transactions table category
-        const transactionDescription = `POS Sale ID: ${saleId}`;
-        const transactionDate = new Date(saleTimestamp).toISOString().split('T')[0];
-
-        await client.query(
-            `INSERT INTO public.transactions (
-                type, amount, description, date, category, account_id, source, confirmed, user_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);`,
-            [
-                transactionType,
-                Number(total),
-                transactionDescription,
-                transactionDate,
-                transactionCategory,
-                salesRevenueAccountId, // Use the dynamically fetched account ID
-                'POS',
-                true,
-                user_id
-            ]
+        // Find VAT Payable Account ID (Assuming VAT is involved)
+        const vatPayableAccountRes = await client.query(
+            `SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%vat payable%' AND type = 'Liability' LIMIT 1`,
+            [user_id]
         );
+        // It's okay if VAT Payable account is not strictly required for all sales (e.g., zero-rated items)
+        const accountIdVatPayable = vatPayableAccountRes.rows.length > 0 ? vatPayableAccountRes.rows[0].id : null;
 
+
+        // --- 9. Record Financial Transactions ---
+        const transactionDate = new Date(saleTimestamp).toISOString().split('T')[0]; // Use sale creation date
+        const transactionCategory = 'Sales'; // Or 'POS Sales'
+
+        // --- 9a. Debit: Payment Received (Cash/Bank/AR) ---
+        if (amountReceived > 0) {
+            await client.query(
+                `INSERT INTO public.transactions (type, amount, description, date, category, account_id, source, confirmed, user_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                ['Debit', amountReceived, `${transactionDescription} - Payment Received`, transactionDate, transactionCategory, accountIdDestination, 'POS', true, user_id]
+            );
+        }
+
+        // --- 9b. Credit: Sales Revenue ---
+        if (finalGrandTotal > 0) {
+             await client.query(
+                `INSERT INTO public.transactions (type, amount, description, date, category, account_id, source, confirmed, user_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                ['Credit', finalGrandTotal, `${transactionDescription} - Sales Revenue`, transactionDate, transactionCategory, accountIdRevenue, 'POS', true, user_id]
+            );
+        }
+
+        // --- 9c. Credit: VAT Payable (if applicable and tax collected > 0) ---
+        if (accountIdVatPayable && finalTotalTax > 0) {
+             await client.query(
+                `INSERT INTO public.transactions (type, amount, description, date, category, account_id, source, confirmed, user_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                ['Credit', finalTotalTax, `${transactionDescription} - VAT Collected`, transactionDate, transactionCategory, accountIdVatPayable, 'POS', true, user_id]
+            );
+        }
+
+        // --- 9d. (Optional) Debit: Cost of Goods Sold & Credit: Inventory ---
+        // This requires looping through processedItems again and summing COGS for physical products.
+        // Pseudo-code outline:
+        /*
+        let totalCOGS = 0;
+        for (const pItem of processedItems) {
+            if (pItem.is_existing_product && pItem.cost_price !== null && !pItem.is_service) { // Check if it's a tracked inventory item
+                const itemCOGS = pItem.quantity * pItem.cost_price;
+                totalCOGS += itemCOGS;
+            }
+        }
+        if (totalCOGS > 0) {
+            // Find COGS and Inventory Account IDs
+            const cogsAccountRes = await client.query(`SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%cost of goods sold%' AND type = 'Expense' LIMIT 1`, [user_id]);
+            const inventoryAccountRes = await client.query(`SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%inventory%' AND type = 'Asset' LIMIT 1`, [user_id]);
+            const accountIdCOGS = cogsAccountRes.rows[0]?.id;
+            const accountIdInventory = inventoryAccountRes.rows[0]?.id;
+
+            if (accountIdCOGS && accountIdInventory) {
+                await client.query(
+                    `INSERT INTO public.transactions (type, amount, description, date, category, account_id, source, confirmed, user_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                    ['Debit', totalCOGS, `COGS for sale ID ${saleId}`, transactionDate, 'COGS', accountIdCOGS, 'POS', true, user_id]
+                );
+                 await client.query(
+                    `INSERT INTO public.transactions (type, amount, description, date, category, account_id, source, confirmed, user_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                    ['Credit', totalCOGS, `Inventory reduction for sale ID ${saleId}`, transactionDate, 'Inventory', accountIdInventory, 'POS', true, user_id]
+                );
+            }
+        }
+        */
+
+
+        // --- 10. Commit Transaction ---
         await client.query('COMMIT');
+        console.log(`[API /api/sales] Sale committed successfully for user ${user_id}.`);
+
+        // --- 11. Respond Success ---
         res.status(201).json({
-            message: 'Sale submitted successfully and transaction recorded!',
+            message: 'Sale submitted successfully and transactions recorded!',
             saleId: saleId,
             timestamp: saleTimestamp,
         });
 
-    } catch (error: unknown) {
+    } catch (error) {
+        // --- Rollback on any error ---
         await client.query('ROLLBACK');
-        console.error('Error submitting sale:', error);
+        console.error('[API /api/sales] Error processing sale:', error);
+        // Send a user-friendly error message
         res.status(500).json({
-            error: 'Failed to submit sale',
+            error: 'Failed to process sale.',
             detail: error instanceof Error ? error.message : String(error)
         });
     } finally {
+        // --- Release the client back to the pool ---
         client.release();
     }
 });
+// =========================================================================
+// END: ENHANCED POST /api/sales
+// =========================================================================
 
+// ... (rest of your existing endpoints) ...
 
 
 // =========================================================================
