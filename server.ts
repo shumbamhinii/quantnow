@@ -29,9 +29,10 @@ const supabase = createClient(supabaseUrl!, supabaseKey!);
 const pool = new Pool({
   connectionString:
     "postgresql://postgres.phoaahdutroiujxiehze:Hunzamabhisvo@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres",
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  max: 5, // keep small, 3–5 is plenty
+  idleTimeoutMillis: 30000,
+  //connectionTimeoutMillis: 5000,
+  ssl: { rejectUnauthorized: false },
 });
 
 pool.connect((err, client, release) => {
@@ -475,7 +476,8 @@ interface CreateUpdateCustomerBody {
     email?: string;
     phone?: string;
     address?: string;
-    vatNumber?: string; // Maps to tax_id
+    vatNumber?: string;
+    customFields?: string; // Maps to tax_id
 }
 
 // Helper function to map database customer object to frontend customer object
@@ -2814,14 +2816,21 @@ app.get('/api/customers/search', authMiddleware, async (req: Request, res: Respo
 });
 
 // GET Single Customer by ID
-app.get('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+app.get('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => {
     const { id } = req.params;
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id;
+
     try {
-        const result = await pool.query<CustomerDB>('SELECT id, name, contact_person, email, phone, address, tax_id, total_invoiced FROM public.customers WHERE id = $1 AND user_id = $2', [id, user_id]); // ADDED user_id filter
+        // Add the custom_fields column to the SELECT statement
+        const result = await pool.query<CustomerDB>(
+            'SELECT id, name, contact_person, email, phone, address, tax_id, custom_fields, total_invoiced FROM public.customers WHERE id = $1 AND user_id = $2',
+            [id, user_id]
+        );
+
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Customer not found or unauthorized' });
         }
+        // mapCustomerToFrontend will need to be updated to handle the new customFields column
         res.json(mapCustomerToFrontend(result.rows[0]));
     } catch (error: unknown) {
         console.error('Error fetching customer by ID:', error);
@@ -2830,46 +2839,67 @@ app.get('/api/customers/:id', authMiddleware, async (req: Request, res: Response
 });
 
 // POST Create Customer
-app.post('/api/customers', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const { name, contactPerson, email, phone, address, vatNumber }: CreateUpdateCustomerBody = req.body;
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user
+app.post('/api/customers', authMiddleware, async (req: Request, res: Response) => {
+    // Destructure customFields from the request body
+    const { name, contactPerson, email, phone, address, vatNumber, customFields }: CreateUpdateCustomerBody = req.body;
+    const user_id = req.user!.parent_user_id;
 
-    if (!name) { // Name is NOT NULL in DB
+    if (!name) {
         return res.status(400).json({ error: 'Customer name is required' });
     }
 
     try {
         const result = await pool.query<CustomerDB>(
-            `INSERT INTO public.customers (name, contact_person, email, phone, address, tax_id, total_invoiced, user_id)
-             VALUES ($1, $2, $3, $4, $5, $6, 0.00, $7) RETURNING id, name, contact_person, email, phone, address, tax_id, total_invoiced`, // ADDED user_id
-            [name, contactPerson || null, email || null, phone || null, address || null, vatNumber || null, user_id]
+            `INSERT INTO public.customers (name, contact_person, email, phone, address, tax_id, custom_fields, user_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            [
+                name,
+                contactPerson || null,
+                email || null,
+                phone || null,
+                address || null,
+                vatNumber || null,
+                // Add the customFields JSON data to the query parameters
+                customFields || null,
+                user_id
+            ]
         );
+        // The return type of this function needs to be a valid CustomerDB
         res.status(201).json(mapCustomerToFrontend(result.rows[0]));
-    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
+    } catch (error: unknown) {
         console.error('Error adding customer:', error);
-        if (error instanceof Error && 'code' in error && error.code === '23505') { // Unique violation (e.g., duplicate email)
-            return res.status(409).json({ error: 'A customer with this email or VAT number already exists.' });
-        }
         res.status(500).json({ error: 'Failed to add customer', detail: error instanceof Error ? error.message : String(error) });
     }
 });
 
 // PUT Update Customer
-app.put('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+app.put('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => {
     const { id } = req.params;
-    const { name, contactPerson, email, phone, address, vatNumber }: CreateUpdateCustomerBody = req.body;
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user
+    // Destructure customFields from the request body
+    const { name, contactPerson, email, phone, address, vatNumber, customFields }: CreateUpdateCustomerBody = req.body;
+    const user_id = req.user!.parent_user_id;
 
-    if (!name) { // Name is required for update
+    if (!name) {
         return res.status(400).json({ error: 'Customer name is required for update.' });
     }
 
     try {
         const result = await pool.query<CustomerDB>(
             `UPDATE public.customers
-             SET name = $1, contact_person = $2, email = $3, phone = $4, address = $5, tax_id = $6, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $7 AND user_id = $8 RETURNING id, name, contact_person, email, phone, address, tax_id, total_invoiced`, // ADDED user_id filter
-            [name, contactPerson || null, email || null, phone || null, address || null, vatNumber || null, id, user_id]
+            SET name = $1, contact_person = $2, email = $3, phone = $4, address = $5, tax_id = $6, custom_fields = $7, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $8 AND user_id = $9 RETURNING *`, // Returning all fields
+            [
+                name,
+                contactPerson || null,
+                email || null,
+                phone || null,
+                address || null,
+                vatNumber || null,
+                // Add the customFields JSON data to the query parameters
+                customFields || null,
+                id,
+                user_id
+            ]
         );
 
         if (result.rows.length === 0) {
@@ -2878,9 +2908,6 @@ app.put('/api/customers/:id', authMiddleware, async (req: Request, res: Response
         res.json(mapCustomerToFrontend(result.rows[0]));
     } catch (error: unknown) {
         console.error(`Error updating customer with ID ${id}:`, error);
-        if (error instanceof Error && 'code' in error && error.code === '23505') {
-            return res.status(409).json({ error: 'A customer with this email or VAT number already exists.' });
-        }
         res.status(500).json({ error: 'Failed to update customer', detail: error instanceof Error ? error.message : String(error) });
     }
 });
@@ -5576,132 +5603,360 @@ const getCurrentAndPreviousDateRanges = () => {
 
 
 // GET Client Count with Change
-app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user
+// GET Clients Stats
+app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
+    // const user_id = req.user!.parent_user_id; // user_id is not directly used for client table if it doesn't exist
+    const { startDate, endDate } = req.query;
+
     try {
-        const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+        let dateFilter = '';
+        // No user_id parameter for clients table
+        const queryParams: (string | number)[] = []; 
+        let paramIndex = 1; // Start index from 1 since user_id is not the first param
 
-        const currentResult = await pool.query(
-            'SELECT COUNT(id) AS count FROM public.customers WHERE created_at >= $1 AND created_at <= $2 AND user_id = $3', // ADDED user_id filter
-            [currentStart, currentEnd, user_id]
-        );
-        const previousResult = await pool.query(
-            'SELECT COUNT(id) AS count FROM public.customers WHERE created_at >= $1 AND created_at < $2 AND user_id = $3', // ADDED user_id filter
-            [previousStart, previousEnd, user_id]
-        );
+        if (startDate) {
+            dateFilter += ` WHERE created_at >= $${paramIndex++}`; // Use WHERE if first filter
+            queryParams.push(startDate as string);
+        }
+        if (endDate) {
+            dateFilter += startDate ? ` AND created_at <= $${paramIndex++}` : ` WHERE created_at <= $${paramIndex++}`; // Use AND if startDate already used WHERE
+            queryParams.push(endDate as string);
+        }
 
-        const currentCount = parseInt(currentResult.rows[0].count, 10);
-        const previousCount = parseInt(previousResult.rows[0].count, 10);
+        // Fetch current count
+        const currentResult = await pool.query(`
+            SELECT COUNT(id) AS count
+            FROM public.clients
+            ${dateFilter};
+        `, queryParams); // Pass the dynamically built queryParams
+        const currentCount = parseInt(currentResult.rows[0]?.count || 0, 10);
+
+        let previousStartDate: string | null = null;
+        let previousEndDate: string | null = null;
+
+        if (startDate && endDate) {
+            const start = new Date(startDate as string);
+            const end = new Date(endDate as string);
+            const durationMs = end.getTime() - start.getTime();
+
+            const prevEnd = new Date(start.getTime() - 1);
+            const prevStart = new Date(prevEnd.getTime() - durationMs);
+
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        } else if (endDate) {
+            const end = new Date(endDate as string);
+            const prevEnd = new Date(end.getTime() - 1);
+            const prevStart = new Date(prevEnd.getTime() - (30 * 24 * 60 * 60 * 1000));
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        } else if (startDate) {
+            const start = new Date(startDate as string);
+            const prevStart = new Date(start.getTime() - (30 * 24 * 60 * 60 * 1000));
+            const prevEnd = new Date(start.getTime() - 1);
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        }
+
+        let previousDateFilter = '';
+        const previousQueryParams: (string | number)[] = []; // No user_id for previous query either
+        let prevParamIndex = 1;
+
+        if (previousStartDate) {
+            previousDateFilter += ` WHERE created_at >= $${prevParamIndex++}`;
+            previousQueryParams.push(previousStartDate);
+        }
+        if (previousEndDate) {
+            previousDateFilter += previousStartDate ? ` AND created_at <= $${prevParamIndex++}` : ` WHERE created_at <= $${prevParamIndex++}`;
+            previousQueryParams.push(previousEndDate);
+        }
+        
+        const previousResult = await pool.query(`
+            SELECT COUNT(id) AS count
+            FROM public.clients
+            ${previousDateFilter};
+        `, previousQueryParams);
+        const previousCount = parseInt(previousResult.rows[0]?.count || 0, 10);
 
         const { changePercentage, changeType } = calculateChange(currentCount, previousCount);
 
         res.json({
             count: currentCount,
             previousCount: previousCount,
-            changePercentage: changePercentage,
-            changeType: changeType
+            changePercentage,
+            changeType,
         });
-    } catch (error: unknown) { // Changed 'err' to 'error: unknown'
-        console.error('Error fetching client count:', error);
-        res.status(500).json({ error: 'Failed to fetch client count', detail: error instanceof Error ? error.message : String(error) });
+
+    } catch (error: unknown) {
+        console.error('Error fetching client stats:', error);
+        res.status(500).json({ error: 'Failed to fetch client stats', detail: error instanceof Error ? error.message : String(error) });
     }
 });
-// GET Quotes Count with Change
-// GET Quotes Count with Change
+
+// GET Quotes Stats
 app.get('/api/stats/quotes', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id;
+    const { startDate, endDate } = req.query;
+
     try {
-        const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+        let dateFilter = '';
+        const queryParams: (string | number)[] = [user_id];
+        let paramIndex = 2;
 
-        const currentResult = await pool.query(
-            'SELECT COUNT(id) AS count FROM public.quotations WHERE created_at >= $1 AND created_at <= $2 AND user_id = $3', // ADDED user_id filter
-            [currentStart, currentEnd, user_id]
-        );
-        const previousResult = await pool.query(
-            'SELECT COUNT(id) AS count FROM public.quotations WHERE created_at >= $1 AND created_at < $2 AND user_id = $3', // ADDED user_id filter
-            [previousStart, previousEnd, user_id]
-        );
+        if (startDate) {
+            dateFilter += ` AND created_at >= $${paramIndex++}`;
+            queryParams.push(startDate as string);
+        }
+        if (endDate) {
+            dateFilter += ` AND created_at <= $${paramIndex++}`;
+            queryParams.push(endDate as string);
+        }
 
-        const currentCount = parseInt(currentResult.rows[0].count, 10);
-        const previousCount = parseInt(previousResult.rows[0].count, 10);
+        const currentResult = await pool.query(`
+            SELECT COUNT(id) AS count
+            FROM public.quotations
+            WHERE user_id = $1 ${dateFilter};
+        `, queryParams);
+        const currentCount = parseInt(currentResult.rows[0]?.count || 0, 10);
+
+        let previousStartDate: string | null = null;
+        let previousEndDate: string | null = null;
+
+        if (startDate && endDate) {
+            const start = new Date(startDate as string);
+            const end = new Date(endDate as string);
+            const durationMs = end.getTime() - start.getTime();
+
+            const prevEnd = new Date(start.getTime() - 1);
+            const prevStart = new Date(prevEnd.getTime() - durationMs);
+
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        } else if (endDate) {
+            const end = new Date(endDate as string);
+            const prevEnd = new Date(end.getTime() - 1);
+            const prevStart = new Date(prevEnd.getTime() - (30 * 24 * 60 * 60 * 1000));
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        } else if (startDate) {
+            const start = new Date(startDate as string);
+            const prevStart = new Date(start.getTime() - (30 * 24 * 60 * 60 * 1000));
+            const prevEnd = new Date(start.getTime() - 1);
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        }
+
+        let previousDateFilter = '';
+        const previousQueryParams: (string | number)[] = [user_id];
+        let prevParamIndex = 2;
+
+        if (previousStartDate) {
+            previousDateFilter += ` AND created_at >= $${prevParamIndex++}`;
+            previousQueryParams.push(previousStartDate);
+        }
+        if (previousEndDate) {
+            previousDateFilter += ` AND created_at <= $${prevParamIndex++}`;
+            previousQueryParams.push(previousEndDate);
+        }
+
+        const previousResult = await pool.query(`
+            SELECT COUNT(id) AS count
+            FROM public.quotations
+            WHERE user_id = $1 ${previousDateFilter};
+        `, previousQueryParams);
+        const previousCount = parseInt(previousResult.rows[0]?.count || 0, 10);
 
         const { changePercentage, changeType } = calculateChange(currentCount, previousCount);
 
         res.json({
             count: currentCount,
             previousCount: previousCount,
-            changePercentage: changePercentage,
-            changeType: changeType
+            changePercentage,
+            changeType,
         });
+
     } catch (error: unknown) {
-        console.error('Error fetching quote count:', error);
-        res.status(500).json({ error: 'Failed to fetch quote count', detail: error instanceof Error ? error.message : String(error) });
+        console.error('Error fetching quotes stats:', error);
+        res.status(500).json({ error: 'Failed to fetch quotes stats', detail: error instanceof Error ? error.message : String(error) });
     }
 });
 
-// GET Invoices Count with Change
+// GET Invoices Stats
 app.get('/api/stats/invoices', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id;
+    const { startDate, endDate } = req.query;
+
     try {
-        const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+        let dateFilter = '';
+        const queryParams: (string | number)[] = [user_id];
+        let paramIndex = 2;
 
-        const currentResult = await pool.query(
-            'SELECT COUNT(id) AS count FROM public.invoices WHERE created_at >= $1 AND created_at <= $2 AND user_id = $3', // ADDED user_id filter
-            [currentStart, currentEnd, user_id]
-        );
-        const previousResult = await pool.query(
-            'SELECT COUNT(id) AS count FROM public.invoices WHERE created_at >= $1 AND created_at < $2 AND user_id = $3', // ADDED user_id filter
-            [previousStart, previousEnd, user_id]
-        );
+        if (startDate) {
+            dateFilter += ` AND created_at >= $${paramIndex++}`;
+            queryParams.push(startDate as string);
+        }
+        if (endDate) {
+            dateFilter += ` AND created_at <= $${paramIndex++}`;
+            queryParams.push(endDate as string);
+        }
 
-        const currentCount = parseInt(currentResult.rows[0].count, 10);
-        const previousCount = parseInt(previousResult.rows[0].count, 10);
+        const currentResult = await pool.query(`
+            SELECT COUNT(id) AS count
+            FROM public.invoices
+            WHERE user_id = $1 ${dateFilter};
+        `, queryParams);
+        const currentCount = parseInt(currentResult.rows[0]?.count || 0, 10);
+
+        let previousStartDate: string | null = null;
+        let previousEndDate: string | null = null;
+
+        if (startDate && endDate) {
+            const start = new Date(startDate as string);
+            const end = new Date(endDate as string);
+            const durationMs = end.getTime() - start.getTime();
+
+            const prevEnd = new Date(start.getTime() - 1);
+            const prevStart = new Date(prevEnd.getTime() - durationMs);
+
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        } else if (endDate) {
+            const end = new Date(endDate as string);
+            const prevEnd = new Date(end.getTime() - 1);
+            const prevStart = new Date(prevEnd.getTime() - (30 * 24 * 60 * 60 * 1000));
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        } else if (startDate) {
+            const start = new Date(startDate as string);
+            const prevStart = new Date(start.getTime() - (30 * 24 * 60 * 60 * 1000));
+            const prevEnd = new Date(start.getTime() - 1);
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        }
+
+        let previousDateFilter = '';
+        const previousQueryParams: (string | number)[] = [user_id];
+        let prevParamIndex = 2;
+
+        if (previousStartDate) {
+            previousDateFilter += ` AND created_at >= $${prevParamIndex++}`;
+            previousQueryParams.push(previousStartDate);
+        }
+        if (previousEndDate) {
+            previousDateFilter += ` AND created_at <= $${prevParamIndex++}`;
+            previousQueryParams.push(previousEndDate);
+        }
+
+        const previousResult = await pool.query(`
+            SELECT COUNT(id) AS count
+            FROM public.invoices
+            WHERE user_id = $1 ${previousDateFilter};
+        `, previousQueryParams);
+        const previousCount = parseInt(previousResult.rows[0]?.count || 0, 10);
 
         const { changePercentage, changeType } = calculateChange(currentCount, previousCount);
 
         res.json({
             count: currentCount,
             previousCount: previousCount,
-            changePercentage: changePercentage,
-            changeType: changeType
+            changePercentage,
+            changeType,
         });
+
     } catch (error: unknown) {
-        console.error('Error fetching invoice count:', error);
-        res.status(500).json({ error: 'Failed to fetch invoice count', detail: error instanceof Error ? error.message : String(error) });
+        console.error('Error fetching invoices stats:', error);
+        res.status(500).json({ error: 'Failed to fetch invoices stats', detail: error instanceof Error ? error.message : String(error) });
     }
 });
 
-// GET Total Invoice Value with Change
+// GET Invoice Value Stats
 app.get('/api/stats/invoice-value', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user
+    const user_id = req.user!.parent_user_id;
+    const { startDate, endDate } = req.query;
+
     try {
-        const { currentStart, currentEnd, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+        let dateFilter = '';
+        const queryParams: (string | number)[] = [user_id];
+        let paramIndex = 2;
 
-        const currentResult = await pool.query(
-            'SELECT COALESCE(SUM(total_amount), 0) AS value FROM public.invoices WHERE created_at >= $1 AND created_at <= $2 AND user_id = $3', // ADDED user_id filter
-            [currentStart, currentEnd, user_id]
-        );
-        const previousResult = await pool.query(
-            'SELECT COALESCE(SUM(total_amount), 0) AS value FROM public.invoices WHERE created_at >= $1 AND created_at < $2 AND user_id = $3', // ADDED user_id filter
-            [previousStart, previousEnd, user_id]
-        );
+        if (startDate) {
+            dateFilter += ` AND created_at >= $${paramIndex++}`;
+            queryParams.push(startDate as string);
+        }
+        if (endDate) {
+            dateFilter += ` AND created_at <= $${paramIndex++}`;
+            queryParams.push(endDate as string);
+        }
 
-        const currentValue = parseFloat(currentResult.rows[0].value);
-        const previousValue = parseFloat(previousResult.rows[0].value);
+        const currentResult = await pool.query(`
+            SELECT COALESCE(SUM(total_amount), 0) AS value
+            FROM public.invoices
+            WHERE user_id = $1 ${dateFilter};
+        `, queryParams);
+        const currentValue = parseFloat(currentResult.rows[0]?.value || 0);
+
+        let previousStartDate: string | null = null;
+        let previousEndDate: string | null = null;
+
+        if (startDate && endDate) {
+            const start = new Date(startDate as string);
+            const end = new Date(endDate as string);
+            const durationMs = end.getTime() - start.getTime();
+
+            const prevEnd = new Date(start.getTime() - 1);
+            const prevStart = new Date(prevEnd.getTime() - durationMs);
+
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        } else if (endDate) {
+            const end = new Date(endDate as string);
+            const prevEnd = new Date(end.getTime() - 1);
+            const prevStart = new Date(prevEnd.getTime() - (30 * 24 * 60 * 60 * 1000));
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        } else if (startDate) {
+            const start = new Date(startDate as string);
+            const prevStart = new Date(start.getTime() - (30 * 24 * 60 * 60 * 1000));
+            const prevEnd = new Date(start.getTime() - 1);
+            previousStartDate = prevStart.toISOString().split('T')[0];
+            previousEndDate = prevEnd.toISOString().split('T')[0];
+        }
+
+        let previousDateFilter = '';
+        const previousQueryParams: (string | number)[] = [user_id];
+        let prevParamIndex = 2;
+
+        if (previousStartDate) {
+            previousDateFilter += ` AND created_at >= $${prevParamIndex++}`;
+            previousQueryParams.push(previousStartDate);
+        }
+        if (previousEndDate) {
+            previousDateFilter += ` AND created_at <= $${prevParamIndex++}`;
+            previousQueryParams.push(previousEndDate);
+        }
+
+        const previousResult = await pool.query(`
+            SELECT COALESCE(SUM(total_amount), 0) AS value
+            FROM public.invoices
+            WHERE user_id = $1 ${previousDateFilter};
+        `, previousQueryParams);
+        const previousValue = parseFloat(previousResult.rows[0]?.value || 0);
 
         const { changePercentage, changeType } = calculateChange(currentValue, previousValue);
 
         res.json({
             value: currentValue,
             previousValue: previousValue,
-            changePercentage: changePercentage,
-            changeType: changeType
+            changePercentage,
+            changeType,
         });
+
     } catch (error: unknown) {
-        console.error('Error fetching total invoice value:', error);
-        res.status(500).json({ error: 'Failed to fetch total invoice value', detail: error instanceof Error ? error.message : String(error) });
+        console.error('Error fetching invoice value stats:', error);
+        res.status(500).json({ error: 'Failed to fetch invoice value stats', detail: error instanceof Error ? error.message : String(error) });
     }
 });
+
 // STAT APIs
 // Helper to format month to YYYY-MM
 const formatMonth = (date: Date) => {
@@ -5709,42 +5964,71 @@ const formatMonth = (date: Date) => {
 };
 
 // GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
+// GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
 app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: Response) => {
     const user_id = req.user!.parent_user_id; // Get user_id from req.user
+    const { startDate, endDate } = req.query; // Extract startDate and endDate from query parameters
+
     try {
-        // Fetch invoice revenue by month
-        // Using 'created_at' for consistency across transaction tables
+        let invoiceDateFilter = '';
+        let expenseDateFilter = '';
+        const queryParams: (string | number)[] = [user_id]; // Initialize parameters with user_id
+        let paramIndex = 2; // Start index for additional parameters
+
+        // Construct date filter for invoices
+        if (startDate) {
+            invoiceDateFilter += ` AND created_at >= $${paramIndex++}`;
+            queryParams.push(startDate as string);
+        }
+        if (endDate) {
+            invoiceDateFilter += ` AND created_at <= $${paramIndex++}`;
+            queryParams.push(endDate as string);
+        }
+
+        // Reset paramIndex for expenses query if necessary, or just continue
+        // For simplicity and clarity, we'll re-calculate paramIndex based on queryParams length
+        const expenseQueryParams: (string | number)[] = [user_id];
+        let expenseParamIndex = 2;
+
+        // Construct date filter for expenses
+        if (startDate) {
+            expenseDateFilter += ` AND date >= $${expenseParamIndex++}`; // Assuming 'date' column for expenses
+            expenseQueryParams.push(startDate as string);
+        }
+        if (endDate) {
+            expenseDateFilter += ` AND date <= $${expenseParamIndex++}`; // Assuming 'date' column for expenses
+            expenseQueryParams.push(endDate as string);
+        }
+
+
+        // Fetch invoice revenue by month with date filtering
         const invoicesResult = await pool.query(`
             SELECT
                 TO_CHAR(created_at, 'YYYY-MM') AS month,
                 COALESCE(SUM(total_amount), 0) AS revenue
             FROM public.invoices
-            WHERE user_id = $1 -- ADDED user_id filter
+            WHERE user_id = $1 ${invoiceDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, [user_id]);
+        `, queryParams); // Pass the dynamically built queryParams
 
-        // Fetch expenses by month (assuming an 'expenses' table with 'amount' and a date column)
-        // IMPORTANT: Verify the column name for date in your 'public.expenses' table.
-        // It is currently assumed to be 'date'. If it's different (e.g., 'created_at'), please change it.
+        // Fetch expenses by month with date filtering
         const expensesResult = await pool.query(`
             SELECT
                 TO_CHAR(date, 'YYYY-MM') AS month,
                 COALESCE(SUM(amount), 0) AS expenses
-            FROM public.transactions /* Changed to transactions table for expense data */
-            WHERE type = 'expense' AND user_id = $1 -- ADDED user_id filter
+            FROM public.transactions
+            WHERE type = 'expense' AND user_id = $1 ${expenseDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, [user_id]);
+        `, expenseQueryParams); // Pass the dynamically built expenseQueryParams
 
         const revenueMap = new Map<string, { revenue: number, expenses: number }>();
 
-        // Populate revenue and initialize expenses
         invoicesResult.rows.forEach(row => {
             revenueMap.set(row.month, { revenue: parseFloat(row.revenue), expenses: 0 });
         });
 
-        // Add expenses to the map
         expensesResult.rows.forEach(row => {
             if (revenueMap.has(row.month)) {
                 const existing = revenueMap.get(row.month)!;
@@ -5754,7 +6038,6 @@ app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: R
             }
         });
 
-        // Consolidate and calculate profit
         const monthlyData: { month: string; profit: number; expenses: number; revenue: number }[] = [];
         const sortedMonths = Array.from(revenueMap.keys()).sort();
 
@@ -5764,7 +6047,7 @@ app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: R
             monthlyData.push({
                 month,
                 profit: parseFloat(profit.toFixed(2)),
-                expenses: parseFloat(data.expenses.toFixed(2)), // Ensure expenses are positive for display
+                expenses: parseFloat(data.expenses.toFixed(2)),
                 revenue: parseFloat(data.revenue.toFixed(2))
             });
         });
@@ -5776,49 +6059,86 @@ app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: R
     }
 });
 
+
+
 // GET Transaction Volume Data (Quotes, Invoices, Purchases by Month)
 app.get('/api/charts/transaction-volume', authMiddleware, async (req: Request, res: Response) => {
     const user_id = req.user!.parent_user_id; // Get user_id from req.user
+    const { startDate, endDate } = req.query; // Extract startDate and endDate from query parameters
+
     try {
-        // Fetch quotes count by month
-        // Using 'created_at' as per your provided schema for consistency
+        let quotesDateFilter = '';
+        let invoicesDateFilter = '';
+        let purchasesDateFilter = '';
+
+        const quotesQueryParams: (string | number)[] = [user_id];
+        let quotesParamIndex = 2;
+        if (startDate) {
+            quotesDateFilter += ` AND created_at >= $${quotesParamIndex++}`;
+            quotesQueryParams.push(startDate as string);
+        }
+        if (endDate) {
+            quotesDateFilter += ` AND created_at <= $${quotesParamIndex++}`;
+            quotesQueryParams.push(endDate as string);
+        }
+
+        const invoicesQueryParams: (string | number)[] = [user_id];
+        let invoicesParamIndex = 2;
+        if (startDate) {
+            invoicesDateFilter += ` AND created_at >= $${invoicesParamIndex++}`;
+            invoicesQueryParams.push(startDate as string);
+        }
+        if (endDate) {
+            invoicesDateFilter += ` AND created_at <= $${invoicesParamIndex++}`;
+            invoicesQueryParams.push(endDate as string);
+        }
+
+        const purchasesQueryParams: (string | number)[] = [user_id];
+        let purchasesParamIndex = 2;
+        if (startDate) {
+            purchasesDateFilter += ` AND created_at >= $${purchasesParamIndex++}`;
+            purchasesQueryParams.push(startDate as string);
+        }
+        if (endDate) {
+            purchasesDateFilter += ` AND created_at <= $${purchasesParamIndex++}`;
+            purchasesQueryParams.push(endDate as string);
+        }
+
+        // Fetch quotes count by month with date filtering
         const quotesResult = await pool.query(`
             SELECT
                 TO_CHAR(created_at, 'YYYY-MM') AS month,
                 COUNT(id) AS count
             FROM public.quotations
-            WHERE user_id = $1 -- ADDED user_id filter
+            WHERE user_id = $1 ${quotesDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, [user_id]);
+        `, quotesQueryParams);
 
-        // Fetch invoices count by month
-        // Using 'created_at' as per your provided schema for consistency
+        // Fetch invoices count by month with date filtering
         const invoicesResult = await pool.query(`
             SELECT
                 TO_CHAR(created_at, 'YYYY-MM') AS month,
                 COUNT(id) AS count
             FROM public.invoices
-            WHERE user_id = $1 -- ADDED user_id filter
+            WHERE user_id = $1 ${invoicesDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, [user_id]);
+        `, invoicesQueryParams);
 
-        // Fetch purchases count by month
-        // Using 'created_at' as per your provided schema for consistency
+        // Fetch purchases count by month with date filtering
         const purchasesResult = await pool.query(`
             SELECT
                 TO_CHAR(created_at, 'YYYY-MM') AS month,
                 COUNT(id) AS count
             FROM public.purchases
-            WHERE user_id = $1 -- ADDED user_id filter
+            WHERE user_id = $1 ${purchasesDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, [user_id]);
+        `, purchasesQueryParams);
 
         const monthlyMap = new Map<string, { quotes: number; invoices: number; purchases: number }>();
 
-        // Populate map with all months and initialize counts
         quotesResult.rows.forEach(row => {
             monthlyMap.set(row.month, { quotes: parseInt(row.count, 10), invoices: 0, purchases: 0 });
         });
@@ -5837,7 +6157,6 @@ app.get('/api/charts/transaction-volume', authMiddleware, async (req: Request, r
             }
         });
 
-        // Sort months and convert to array
         const sortedMonths = Array.from(monthlyMap.keys()).sort();
         const monthlyData: { month: string; quotes: number; invoices: number; purchases: number }[] = [];
 
@@ -5856,6 +6175,7 @@ app.get('/api/charts/transaction-volume', authMiddleware, async (req: Request, r
         res.status(500).json({ error: 'Failed to fetch transaction volume data', detail: error instanceof Error ? error.message : String(error) });
     }
 });
+
 
 // Upload endpoint
 app.post('/documents', authMiddleware, upload.single('file'), async (req: Request, res: Response) => { // ADDED authMiddleware
@@ -8669,6 +8989,86 @@ app.get('/api/reconciliation/short-days', authMiddleware, async (req, res) => {
   }
 });
 
+// NEW ENDPOINT: GET Sales, Expenses, and Other Categories for Sunburst Chart
+app.get('/api/charts/sales-expenses-sunburst', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    const { startDate, endDate } = req.query;
+
+    try {
+        let dateFilter = '';
+        const queryParams: (string | number)[] = [user_id];
+        let paramIndex = 2;
+
+        if (startDate) {
+            dateFilter += ` AND created_at >= $${paramIndex++}`;
+            queryParams.push(startDate as string);
+        }
+        if (endDate) {
+            dateFilter += ` AND created_at <= $${paramIndex++}`;
+            queryParams.push(endDate as string);
+        }
+
+        // Fetch Sales (from invoices)
+        const salesResult = await pool.query(`
+            SELECT COALESCE(SUM(total_amount), 0) AS total_sales
+            FROM public.invoices
+            WHERE user_id = $1 ${dateFilter};
+        `, queryParams);
+        const totalSales = parseFloat(salesResult.rows[0]?.total_sales || 0);
+
+        // Fetch Expenses (from transactions table with type 'expense')
+        const expensesResult = await pool.query(`
+            SELECT COALESCE(SUM(amount), 0) AS total_expenses
+            FROM public.transactions
+            WHERE type = 'expense' AND user_id = $1 ${dateFilter};
+        `, queryParams); // Re-use queryParams if created_at is same column, otherwise adjust paramIndex
+        const totalExpenses = parseFloat(expensesResult.rows[0]?.total_expenses || 0);
+
+        // Placeholder for "What What" or "Other Income/Categories"
+        // This query needs to be adapted to your actual database schema
+        // For demonstration, let's assume 'other_income' table or a specific 'type' in transactions
+        // Example: Fetching 'other_income' from a transactions table
+        const otherIncomeResult = await pool.query(`
+            SELECT COALESCE(SUM(amount), 0) AS other_value
+            FROM public.transactions
+            WHERE type = 'other_income' AND user_id = $1 ${dateFilter};
+        `, queryParams);
+        const otherValue = parseFloat(otherIncomeResult.rows[0]?.other_value || 0);
+
+        // Construct Sunburst Data
+        const sunburstData = [
+            // Top level node
+            { id: 'total', name: 'Financial Overview', value: totalSales + totalExpenses + otherValue },
+
+            // Second level: Main Categories
+            { id: 'sales', parent: 'total', name: 'Sales', value: totalSales, color: '#4CAF50' }, // Green for Sales
+            { id: 'expenses', parent: 'total', name: 'Expenses', value: totalExpenses, color: '#F44336' }, // Red for Expenses
+            { id: 'other', parent: 'total', name: 'Other', value: otherValue, color: '#FFC107' }, // Amber for Other
+
+            // Example of third level (you'll need to expand this based on your sub-categories)
+            // Sales Sub-categories (Example)
+            { id: 'product-sales', parent: 'sales', name: 'Product Sales', value: totalSales * 0.7 },
+            { id: 'service-sales', parent: 'sales', name: 'Service Sales', value: totalSales * 0.3 },
+
+            // Expenses Sub-categories (Example - assuming you have expense categories)
+            // You would fetch these from your 'transactions' table with more specific types or categories
+            { id: 'rent-exp', parent: 'expenses', name: 'Rent', value: totalExpenses * 0.3 },
+            { id: 'salaries-exp', parent: 'expenses', name: 'Salaries', value: totalExpenses * 0.4 },
+            { id: 'utilities-exp', parent: 'expenses', name: 'Utilities', value: totalExpenses * 0.2 },
+            { id: 'misc-exp', parent: 'expenses', name: 'Miscellaneous', value: totalExpenses * 0.1 },
+
+            // Other Sub-categories (Example)
+            { id: 'interest-inc', parent: 'other', name: 'Interest Income', value: otherValue * 0.6 },
+            { id: 'misc-inc', parent: 'other', name: 'Other Income', value: otherValue * 0.4 }
+        ];
+
+        res.json(sunburstData);
+
+    } catch (error: unknown) {
+        console.error('Error fetching sunburst data:', error);
+        res.status(500).json({ error: 'Failed to fetch sunburst data', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
 
 
 
