@@ -9,6 +9,7 @@ import nodemailer from 'nodemailer';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
+import { createClient } from '@supabase/supabase-js';
 
 import express, { Request, Response, NextFunction } from 'express';
 
@@ -20,6 +21,10 @@ app.use(cors({
   origin: '*',
 }));
 app.use(express.json());
+
+const supabaseUrl = "https://phoaahdutroiujxiehze.supabase.co";
+const supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBob2FhaGR1dHJvaXVqeGllaHplIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTE3MjU1MSwiZXhwIjoyMDcwNzQ4NTUxfQ.XbnwOjhIil3O9NEmfhXSiORC8jdEOYx4fxQR8AtHKD0";
+const supabase = createClient(supabaseUrl!, supabaseKey!);
 
 const pool = new Pool({
   connectionString:
@@ -161,10 +166,194 @@ async function sendEmail(options: EmailOptions) {
 
 
 
-const upload = multer({ storage: multer.memoryStorage() }); // Use memory storage for file uploads
 
-/* --- Type Definitions (Minimal, but necessary for ts-node) --- */
-/* Placing them here ensures they are available before the routes use them */
+
+// File upload setup
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Corrected code for your upload route
+
+// Corrected upload-document endpoint to save file type
+app.post('/upload-document', authMiddleware, upload.single('document'), async (req: Request, res: Response) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded.' });
+  }
+
+  const user_id = req.user!.user_id;
+  const bucketName = 'user-documents';
+  const uniqueFileName = `${user_id}/${Date.now()}_${req.file.originalname}`;
+  
+  try {
+    const { data, error: uploadError } = await supabase.storage
+      .from(bucketName)
+      .upload(uniqueFileName, req.file.buffer, {
+        cacheControl: '3600',
+        upsert: true,
+        contentType: req.file.mimetype,
+        duplex: 'half'
+      });
+
+    if (uploadError) {
+      console.error('Supabase upload error:', uploadError);
+      return res.status(500).json({ error: 'Failed to upload document.' });
+    }
+
+    // Insert the document record, including the file type
+    await pool.query(
+      `INSERT INTO user_documents (user_id, original_name, file_path, type) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (file_path) DO NOTHING;`,
+      [user_id, req.file.originalname, data!.path, req.file.mimetype]
+    );
+
+    res.status(201).json({ message: 'Document uploaded successfully!', filePath: data!.path });
+  } catch (error) {
+    console.error('Unexpected error:', error);
+    if (uniqueFileName) {
+      await supabase.storage.from(bucketName).remove([uniqueFileName]);
+    }
+    res.status(500).json({ error: 'An unexpected error occurred while processing the document.' });
+  }
+});
+
+// Update GET /documents endpoint to return the type
+app.get('/documents', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.user_id;
+
+    try {
+      const { rows } = await pool.query(
+        // Include 'type' in the SELECT statement
+        `SELECT id, original_name, file_path, type, upload_date FROM user_documents WHERE user_id = $1 ORDER BY upload_date DESC`,
+        [user_id]
+      );
+
+      res.status(200).json(rows);
+    } catch (error) {
+      console.error('Error fetching documents:', error);
+      res.status(500).json({ error: 'Failed to fetch documents.' });
+    }
+});
+// Corrected DELETE /documents/:id endpoint
+// Corrected DELETE /documents/:id endpoint
+app.delete('/documents/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user_id = req.user!.user_id;
+  const bucketName = 'user-documents'; // Your bucket name
+
+  try {
+    // Start a transaction to ensure both DB and storage operations succeed or fail together
+    await pool.query('BEGIN');
+
+    // 1. Get the file path first to delete it from storage
+    const { rows } = await pool.query(
+      `SELECT file_path FROM user_documents WHERE id = $1 AND user_id = $2`,
+      [id, user_id]
+    );
+
+    if (rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'Document not found or unauthorized.' });
+    }
+
+    const filePath = rows[0].file_path;
+
+    // 2. Delete the document record from the database
+    const { rowCount } = await pool.query(
+      `DELETE FROM user_documents WHERE id = $1 AND user_id = $2`,
+      [id, user_id]
+    );
+
+    if (rowCount === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'Document not found or unauthorized.' });
+    }
+
+    // 3. Delete the file from Supabase Storage
+    const { error: storageError } = await supabase.storage.from(bucketName).remove([filePath]);
+    if (storageError) {
+      // If storage deletion fails, roll back the DB transaction
+      await pool.query('ROLLBACK');
+      console.error('Supabase storage deletion error:', storageError);
+      return res.status(500).json({ error: 'Failed to delete file from storage. Database was not affected.' });
+    }
+
+    // Commit the transaction
+    await pool.query('COMMIT');
+    res.status(204).send(); // 204 No Content for successful deletion
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    console.error('Error deleting document:', error);
+    res.status(500).json({ error: 'Failed to delete document. Operation rolled back.' });
+  }
+});
+
+// The correct GET /documents/:id/download endpoint (already correct)
+// The correct GET /documents/:id/download endpoint (already correct)
+app.get('/documents/:id/download', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user_id = req.user!.user_id;
+  const bucketName = 'user-documents';
+
+  // REMOVED: supabase.auth.setAuth(token); // Not needed with service_role key
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT file_path, original_name FROM user_documents WHERE id = $1 AND user_id = $2`,
+      [id, user_id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Document not found or unauthorized.' });
+    }
+
+    const { file_path, original_name } = rows[0];
+
+    const { data, error } = await supabase.storage
+      .from(bucketName)
+      .createSignedUrl(file_path, 3600); // URL valid for 1 hour
+
+    if (error) {
+      console.error('Error creating signed URL:', error);
+      return res.status(500).json({ error: 'Failed to generate download link.' });
+    }
+
+    res.redirect(data.signedUrl);
+  } catch (error) {
+    console.error('Error during document download:', error);
+    res.status(500).json({ error: 'Failed to process download request.' });
+  }
+});
+// Add this endpoint to your server.ts file
+// The correct GET /documents endpoint (already correct)
+
+
+// Add this new endpoint to your server.ts file
+app.patch('/documents/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { original_name, type } = req.body;
+  const user_id = req.user!.user_id;
+
+  if (!original_name || !type) {
+    return res.status(400).json({ error: 'Original name and type are required.' });
+  }
+
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE user_documents
+       SET original_name = $1, type = $2
+       WHERE id = $3 AND user_id = $4`,
+      [original_name, type, id, user_id]
+    );
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Document not found or unauthorized.' });
+    }
+
+    res.status(200).json({ message: 'Document updated successfully.' });
+  } catch (error) {
+    console.error('Error updating document:', error);
+    res.status(500).json({ error: 'Failed to update document.' });
+  }
+});
 
 interface SupplierDB { // Represents how data comes from the DB (public.suppliers table)
     id: number;
@@ -7714,103 +7903,85 @@ async function queryDb<T>(queryText: string, params: any[]): Promise<T[]> {
 }
 // Helper for the new endpoint to calculate baseline data
 async function calculateBaselineData(userId: string) {
-  // Define the start date as 12 months ago
-  const twelveMonthsAgo = new Date();
-  twelveMonthsAgo.setFullYear(twelveMonthsAgo.getFullYear() - 1);
+  // Define the start date as 12 months ago
+  const twelveMonthsAgo = new Date();
+  twelveMonthsAgo.setFullYear(twelveMonthsAgo.getFullYear() - 1);
 
-  // Calculate Total Sales
-  const salesQuery = `
-    SELECT COALESCE(SUM(total_amount), 0) AS total_sales
-    FROM public.sales
-    WHERE user_id = $1 AND created_at >= $2;
-  `;
-  const salesResult = await queryDb<{ total_sales: number }>(salesQuery, [userId, twelveMonthsAgo.toISOString()]);
-  const totalSales = Number(salesResult[0]?.total_sales || 0);
+  // Calculate Total Sales (Income)
+  const salesQuery = `
+    SELECT COALESCE(SUM(amount), 0) AS total_sales
+    FROM public.transactions
+    WHERE user_id = $1 AND type = 'income' AND date >= $2;
+  `;
+  const salesResult = await queryDb<{ total_sales: number }>(salesQuery, [userId, twelveMonthsAgo.toISOString()]);
+  const totalSales = Number(salesResult[0]?.total_sales || 0);
 
-  // Calculate Total Costs (from purchases)
-  const purchasesQuery = `
-    SELECT COALESCE(SUM(total_amount), 0) AS total_costs
-    FROM public.purchases
-    WHERE user_id = $1 AND created_at >= $2;
-  `;
-  const purchasesResult = await queryDb<{ total_costs: number }>(purchasesQuery, [userId, twelveMonthsAgo.toISOString()]);
-  const totalCosts = Number(purchasesResult[0]?.total_costs || 0);
+  // Calculate Total Expenses
+  const expensesQuery = `
+    SELECT COALESCE(SUM(amount), 0) AS total_expenses
+    FROM public.transactions
+    WHERE user_id = $1 AND type = 'expense' AND date >= $2 AND category != 'Cost of Goods';
+  `;
+  const expensesResult = await queryDb<{ total_expenses: number }>(expensesQuery, [userId, twelveMonthsAgo.toISOString()]);
+  const totalExpenses = Number(expensesResult[0]?.total_expenses || 0);
+  
+  // Calculate Total Costs (assuming a specific category for Cost of Goods)
+  const cogsQuery = `
+    SELECT COALESCE(SUM(amount), 0) AS total_cogs
+    FROM public.transactions
+    WHERE user_id = $1 AND type = 'expense' AND category = 'Cost of Goods' AND date >= $2;
+  `;
+  const cogsResult = await queryDb<{ total_cogs: number }>(cogsQuery, [userId, twelveMonthsAgo.toISOString()]);
+  const totalCogs = Number(cogsResult[0]?.total_cogs || 0);
 
-  // Calculate Total Expenses (from expenses and transactions tables)
-  const expensesQuery = `
-    SELECT COALESCE(SUM(amount), 0) AS total_expenses
-    FROM public.expenses
-    WHERE user_id = $1 AND date >= $2;
-  `;
-  const expensesResult = await queryDb<{ total_expenses: number }>(expensesQuery, [userId, twelveMonthsAgo.toISOString()]);
-  const expensesTotal = Number(expensesResult[0]?.total_expenses || 0);
-  
-  // Transactions marked as expenses. Assuming a transaction type exists for expenses.
-  const transactionsQuery = `
-    SELECT COALESCE(SUM(amount), 0) AS total_transaction_expenses
-    FROM public.transactions
-    WHERE user_id = $1 AND date >= $2 AND type = 'Expense';
-  `;
-  const transactionsResult = await queryDb<{ total_transaction_expenses: number }>(transactionsQuery, [userId, twelveMonthsAgo.toISOString()]);
-  const transactionsExpensesTotal = Number(transactionsResult[0]?.total_transaction_expenses || 0);
-  
-  // Combine all expense sources
-  const totalExpenses = expensesTotal + transactionsExpensesTotal;
-
-  // The final baseline data object
-  return {
-    sales: totalSales,
-    costOfGoods: totalCosts,
-    grossProfit: totalSales - totalCosts,
-    totalExpenses: totalExpenses,
-    netProfit: (totalSales - totalCosts) - totalExpenses,
-  };
+  // The final baseline data object
+  return {
+    sales: totalSales,
+    costOfGoods: totalCogs,
+    grossProfit: totalSales - totalCogs,
+    totalExpenses: totalExpenses,
+    netProfit: (totalSales - totalCogs) - totalExpenses,
+  };
 }
 
 // --- START: UPDATED ENDPOINT FOR PROJECTIONS ---
 // This endpoint now correctly calculates and returns baseline financial data.
 app.get('/api/projections/baseline-data', authMiddleware, async (req: Request, res: Response) => {
-  const userId = req.user?.user_id;
+  const companyId = req.user?.parent_user_id || req.user?.user_id;
 
-  if (!userId) {
-    return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
+  if (!companyId) {
+    return res.status(401).json({ error: 'Unauthorized: Company ID (parent_user_id or user_id) not found.' });
   }
 
   try {
-    // Determine the baseline period (e.g., last 30 days)
-    const baselineStartDate = new Date();
-    baselineStartDate.setDate(baselineStartDate.getDate() - 30);
-    const baselineEndDate = new Date();
-
-    // 1. Calculate total sales
-    // Corrected column name from `sale_date` to `due_date`
+    // 1. Calculate total sales from all-time transactions (type 'income')
     const salesQuery = `
-      SELECT SUM(total_amount) as total_sales
-      FROM public.sales
-      WHERE user_id = $1 AND due_date BETWEEN $2 AND $3;
+      SELECT COALESCE(SUM(amount), 0) as total_sales
+      FROM public.transactions
+      WHERE user_id = $1 AND type = 'income';
     `;
-    const salesResult = await pool.query(salesQuery, [userId, baselineStartDate, baselineEndDate]);
+    const salesResult = await pool.query(salesQuery, [companyId]);
     const totalSales = parseFloat(salesResult.rows[0]?.total_sales) || 0;
 
-    // 2. Calculate total cost of goods sold (COGS)
-    // Corrected column name from `s.sale_date` to `s.due_date`
+    // 2. Calculate total cost of goods sold (COGS) from sale_items and products_services
     const cogsQuery = `
-      SELECT SUM(si.quantity * p.cost_price) as total_cogs
+      SELECT COALESCE(SUM(si.quantity * ps.cost_price), 0) as total_cogs
       FROM public.sale_items si
       JOIN public.sales s ON si.sale_id = s.id
-      JOIN public.products_services p ON si.product_id = p.id
-      WHERE s.user_id = $1 AND s.due_date BETWEEN $2 AND $3;
+      JOIN public.products_services ps ON si.product_id = ps.id
+      WHERE s.user_id = $1; -- Filter by the companyId associated with the sale
     `;
-    const cogsResult = await pool.query(cogsQuery, [userId, baselineStartDate, baselineEndDate]);
+    const cogsResult = await pool.query(cogsQuery, [companyId]);
     const totalCogs = parseFloat(cogsResult.rows[0]?.total_cogs) || 0;
 
-    // 3. Calculate total expenses
+    // 3. Calculate total expenses from all-time transactions (type 'expense', excluding COGS)
+    // Note: If you want to refine expenses further, ensure 'Cost of Goods' transactions are not double-counted here.
     const expensesQuery = `
-      SELECT SUM(amount) as total_expenses
-      FROM public.expenses
-      WHERE user_id = $1 AND date BETWEEN $2 AND $3;
+      SELECT COALESCE(SUM(amount), 0) as total_expenses
+      FROM public.transactions
+      WHERE user_id = $1 AND type = 'expense' AND category != 'Cost of Goods';
     `;
-    const expensesResult = await pool.query(expensesQuery, [userId, baselineStartDate, baselineEndDate]);
+    const expensesResult = await pool.query(expensesQuery, [companyId]);
     const totalExpenses = parseFloat(expensesResult.rows[0]?.total_expenses) || 0;
 
     // Construct the response object with the calculated values
@@ -7827,7 +7998,6 @@ app.get('/api/projections/baseline-data', authMiddleware, async (req: Request, r
     res.status(500).json({ error: 'Failed to fetch financial baseline data.' });
   }
 });
-
 
 
 // --- API Endpoints for User Management ---
