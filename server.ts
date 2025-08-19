@@ -1407,6 +1407,35 @@ function formatCurrency(amount: number | string | null | undefined, currency?: s
   return `${symbol}${val.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+// ADD THE NEW DELETE ENDPOINT HERE
+app.delete('/transactions/:id', authMiddleware, async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  // Prefer company scoping, fallback to user_id
+  const user_id = (req.user!.parent_user_id || req.user!.user_id)!;
+
+  try {
+    const query = `
+      DELETE FROM transactions
+      WHERE id = $1 AND user_id = $2
+      RETURNING id; 
+    `;
+    const result = await pool.query(query, [id, user_id]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Transaction not found or unauthorized' });
+    }
+
+    res.status(204).send(); // 204 No Content is standard for a successful DELETE
+  } catch (error: unknown) {
+    console.error('Error deleting transaction:', error);
+    res.status(500).json({
+      error: 'Failed to delete transaction',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
 
 /* --- Accounts API --- */
 app.get('/accounts', authMiddleware, async (req: Request, res: Response) => {
