@@ -2815,25 +2815,231 @@ app.get('/api/customers/search', authMiddleware, async (req: Request, res: Respo
     }
 });
 
+
+// --- NEW ENDPOINT: Get Customers with Aggregated Sales Metrics for Clustering ---
+// GET /api/customers/cluster-data
+app.get('/api/customers/cluster-data', authMiddleware, async (req: Request, res: Response) => {
+  // Use parent_user_id for company-level data access, fallback to user_id
+  const user_id = req.user!.parent_user_id || req.user!.user_id;
+
+  if (!user_id) {
+    return res.status(400).json({ error: 'User ID is missing.' });
+  }
+
+  try {
+    console.log(`[API /api/customers/cluster-data] Fetching clustered customer data for user_id: ${user_id}`);
+
+    // --- Query Explanation ---
+    // This query joins the customers table with an aggregation of sales data.
+    // For each customer, it calculates:
+    // - total_invoiced: Sum of all their sale total_amounts.
+    // - number_of_purchases: Count of distinct sales records for them.
+    // - average_order_value: total_invoiced / number_of_purchases (handled in JS for division by zero).
+    // It uses a LEFT JOIN to include customers with zero sales.
+    const result = await pool.query(`
+      SELECT
+        c.id AS customer_db_id, -- Original DB ID
+        c.name,
+        c.email,
+        c.phone,
+        c.address,
+        c.tax_id,
+        
+        COALESCE(sales_summary.total_invoiced, 0) AS total_invoiced,
+        COALESCE(sales_summary.number_of_purchases, 0) AS number_of_purchases
+        -- average_order_value will be calculated in JS to avoid division by zero
+      FROM public.customers c
+      LEFT JOIN (
+        SELECT
+          s.customer_id,
+          SUM(s.total_amount) AS total_invoiced,
+          COUNT(s.id) AS number_of_purchases
+          -- AVG(s.total_amount) could also be used, but manual calc is clearer
+        FROM public.sales s
+        WHERE s.user_id = $1
+        GROUP BY s.customer_id
+      ) AS sales_summary ON c.id = sales_summary.customer_id
+      WHERE c.user_id = $1
+      ORDER BY c.name;
+    `, [user_id]);
+
+    // --- Process Results ---
+    const customersWithMetrics = result.rows.map(row => {
+      const totalInvoiced = parseFloat(row.total_invoiced) || 0;
+      const numberOfPurchases = parseInt(row.number_of_purchases, 10) || 0;
+      const averageOrderValue = numberOfPurchases > 0 ? totalInvoiced / numberOfPurchases : 0;
+
+      // Parse custom_fields if it exists on your customers table
+      let parsedCustomFields = [];
+      // if (row.custom_fields) {
+      //   try {
+      //     parsedCustomFields = JSON.parse(row.custom_fields);
+      //   } catch (e) {
+      //     console.error("Error parsing custom fields for customer", row.customer_db_id, e);
+      //   }
+      // }
+
+      return {
+        id: row.customer_db_id.toString(), // Convert DB ID to string for frontend consistency
+        name: row.name,
+        email: row.email,
+        phone: row.phone,
+        address: row.address,
+        vatNumber: row.tax_id, // Map tax_id to vatNumber
+        status: row.status || 'Active',
+        totalInvoiced: parseFloat(totalInvoiced.toFixed(2)), // Ensure 2 decimals
+        numberOfPurchases, // Integer
+        averageOrderValue: parseFloat(averageOrderValue.toFixed(2)), // Ensure 2 decimals
+        // customFields: parsedCustomFields // Uncomment if using custom fields
+      };
+    });
+
+    console.log(`[API /api/customers/cluster-data] Successfully fetched data for ${customersWithMetrics.length} customers.`);
+    res.status(200).json(customersWithMetrics);
+  } catch (err: any) {
+    console.error('[API /api/customers/cluster-data] Error fetching clustered customer data:', err);
+    res.status(500).json({ error: 'Failed to fetch clustered customer data.', details: err.message });
+  }
+});
+// --- END NEW ENDPOINT ---
+
+// --- NEW ENDPOINT: Get Detailed Purchase History for a Single Customer ---
+// GET /api/customers/:customerId/purchase-history
+app.get('/api/customers/:customerId/purchase-history', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id || req.user!.user_id;
+    const { customerId } = req.params;
+
+    if (!user_id) {
+        return res.status(400).json({ error: 'User ID is missing.' });
+    }
+
+    if (!customerId) {
+        return res.status(400).json({ error: 'Customer ID is required.' });
+    }
+
+    // Validate if customerId is a number (assuming DB ID is an integer)
+    const customerIdInt = parseInt(customerId, 10);
+    if (isNaN(customerIdInt)) {
+        return res.status(400).json({ error: 'Invalid Customer ID format.' });
+    }
+
+    try {
+        console.log(`[API /api/customers/:customerId/purchase-history] Fetching history for customer ${customerIdInt}, user_id: ${user_id}`);
+
+        // Fetch all sales for the customer
+        const salesResult = await pool.query(`
+            SELECT
+                s.id AS sale_id,
+                s.total_amount,
+                s.payment_type,
+                s.amount_paid,
+                s.change_given,
+                s.credit_amount,
+                s.due_date,
+                s.created_at AS sale_date,
+                s.remaining_credit_amount
+            FROM public.sales s
+            WHERE s.user_id = $1 AND s.customer_id = $2
+            ORDER BY s.created_at DESC;
+        `, [user_id, customerIdInt]);
+
+        const salesWithItems = await Promise.all(salesResult.rows.map(async (saleRow) => {
+            // Fetch items for each sale
+            const itemsResult = await pool.query(`
+                SELECT
+                    si.id AS item_id,
+                    si.product_id,
+                    si.product_name,
+                    si.quantity,
+                    si.unit_price_at_sale,
+                    si.subtotal
+                FROM public.sale_items si
+                WHERE si.sale_id = $1 AND si.user_id = $2;
+            `, [saleRow.sale_id, user_id]);
+
+            return {
+                id: saleRow.sale_id,
+                totalAmount: parseFloat(saleRow.total_amount) || 0,
+                paymentType: saleRow.payment_type,
+                amountPaid: parseFloat(saleRow.amount_paid) || null,
+                changeGiven: parseFloat(saleRow.change_given) || null,
+                creditAmount: parseFloat(saleRow.credit_amount) || null,
+                dueDate: saleRow.due_date ? new Date(saleRow.due_date).toISOString().split('T')[0] : null,
+                saleDate: saleRow.sale_date ? new Date(saleRow.sale_date).toISOString() : null,
+                remainingCreditAmount: parseFloat(saleRow.remaining_credit_amount) || null,
+                items: itemsResult.rows.map(itemRow => ({
+                    id: itemRow.item_id,
+                    productId: itemRow.product_id,
+                    productName: itemRow.product_name,
+                    quantity: itemRow.quantity,
+                    unitPriceAtSale: parseFloat(itemRow.unit_price_at_sale) || 0,
+                    subtotal: parseFloat(itemRow.subtotal) || 0,
+                }))
+            };
+        }));
+
+        console.log(`[API /api/customers/:customerId/purchase-history] Successfully fetched history for customer ${customerIdInt}.`);
+        res.status(200).json(salesWithItems);
+
+    } catch (err: any) {
+        console.error(`[API /api/customers/:customerId/purchase-history] Error fetching history for customer ${customerId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch customer purchase history.', details: err.message });
+    }
+});
+// --- END NEW ENDPOINT ---
 // GET Single Customer by ID
+// Ensure this route is defined AFTER the /api/customers/cluster-data route
 app.get('/api/customers/:id', authMiddleware, async (req: Request, res: Response) => {
     const { id } = req.params;
     const user_id = req.user!.parent_user_id;
 
+    // --- ADD VALIDATION FOR ID ---
+    const customerIdInt = parseInt(id, 10);
+    if (isNaN(customerIdInt)) {
+        console.error(`[API /api/customers/:id] Invalid Customer ID provided: ${id}`);
+        return res.status(400).json({ error: 'Invalid Customer ID format.' });
+    }
+    // --- END ADD VALIDATION ---
+
     try {
-        // Add the custom_fields column to the SELECT statement
+        console.log(`[API /api/customers/:id] Fetching customer ${customerIdInt} for user_id: ${user_id}`);
+
+        // --- UPDATE QUERY TO FETCH CORE CUSTOMER DATA ---
+        // Note: This query fetches core customer details.
+        // If you need aggregated sales data (like total_invoiced) for the single customer view,
+        // you would need to join with sales or use a subquery, similar to the cluster-data endpoint.
+        // For now, we fetch core data. Adjust if needed.
         const result = await pool.query<CustomerDB>(
-            'SELECT id, name, contact_person, email, phone, address, tax_id, custom_fields, total_invoiced FROM public.customers WHERE id = $1 AND user_id = $2',
-            [id, user_id]
+            `SELECT
+                c.id,
+                c.name,
+                c.contact_person,
+                c.email,
+                c.phone,
+                c.address,
+                c.tax_id,
+                c.custom_fields,
+                COALESCE(SUM(s.total_amount), 0) AS total_invoiced -- Example: Aggregate total invoiced
+            FROM public.customers c
+            LEFT JOIN public.sales s ON c.id = s.customer_id AND s.user_id = c.user_id -- Join sales for aggregation
+            WHERE c.id = $1 AND c.user_id = $2
+            GROUP BY c.id, c.name, c.contact_person, c.email, c.phone, c.address, c.tax_id, c.custom_fields`,
+            [customerIdInt, user_id] // Use the validated integer ID
         );
+        // --- END UPDATE QUERY ---
 
         if (result.rows.length === 0) {
+            console.log(`[API /api/customers/:id] Customer ${customerIdInt} not found for user_id: ${user_id}`);
             return res.status(404).json({ error: 'Customer not found or unauthorized' });
         }
-        // mapCustomerToFrontend will need to be updated to handle the new customFields column
-        res.json(mapCustomerToFrontend(result.rows[0]));
+
+        // Assuming mapCustomerToFrontend can handle the structure returned by the query
+        // Make sure mapCustomerToFrontend is defined elsewhere in your codebase
+        const customerData = mapCustomerToFrontend(result.rows[0]);
+        console.log(`[API /api/customers/:id] Successfully fetched customer ${customerIdInt}.`);
+        res.json(customerData);
     } catch (error: unknown) {
-        console.error('Error fetching customer by ID:', error);
+        console.error(`[API /api/customers/:id] Error fetching customer ${id}:`, error);
         res.status(500).json({ error: 'Failed to fetch customer', detail: error instanceof Error ? error.message : String(error) });
     }
 });
@@ -3250,6 +3456,9 @@ app.delete('/products-services/:id', authMiddleware, async (req: Request, res: R
 // 1. POST Create New Sale (app.post('/api/sales')) - ENHANCED VERSION
 // Integrates fully with accounting, handles custom products, detailed transactions.
 // =========================================================================
+// Assuming other imports and setup (pool, authMiddleware, etc.) are present
+// ...
+
 app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
     const {
         cart,
@@ -3290,7 +3499,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
         for (const item of cart) {
             // Validate basic item structure
             if (item.quantity == null || item.unit_price == null || item.subtotal == null) {
-                 throw new Error(`Invalid cart item structure: ${JSON.stringify(item)}`);
+                throw new Error(`Invalid cart item structure: ${JSON.stringify(item)}`);
             }
             const quantity = Number(item.quantity);
             const unitPrice = Number(item.unit_price);
@@ -3298,7 +3507,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
             const taxRateValue = Number(item.tax_rate_value ?? 0); // Default to 0 if not provided
 
             if (isNaN(quantity) || isNaN(unitPrice) || isNaN(itemSubtotal) || isNaN(taxRateValue) || quantity <= 0) {
-                 throw new Error(`Invalid numerical values in cart item: ${JSON.stringify(item)}`);
+                throw new Error(`Invalid numerical values in cart item: ${JSON.stringify(item)}`);
             }
 
             let itemId = item.id;
@@ -3330,18 +3539,24 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
                 // Check stock (only for physical products, not services)
                 if (!dbProduct.is_service) {
                     const currentStock = Number(dbProduct.stock_quantity);
-                    if (quantity > currentStock) {
-                        throw new Error(`Insufficient stock for "${itemName}". Requested: ${quantity}, Available: ${currentStock}.`);
-                    }
-                    // Update stock quantity
+                    // *** MODIFICATION START ***
+                    // Removed the strict stock check that throws an error.
+                    // Now, allow sales even if stock goes negative.
+                    // A warning is logged instead.
                     const newStock = currentStock - quantity;
+
                     await client.query(
                         `UPDATE public.products_services SET stock_quantity = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND user_id = $3`,
                         [newStock, itemId, user_id]
                     );
                     console.log(`[API /api/sales] Updated stock for item ID ${itemId} (${itemName}). New stock: ${newStock}`);
+
+                    if (newStock < 0) {
+                        console.warn(`[API /api/sales] Warning: Item ID ${itemId} (${itemName}) went into negative stock. New stock: ${newStock}`);
+                    }
+                    // *** MODIFICATION END ***
                 } else {
-                     console.log(`[API /api/sales] Item ID ${itemId} (${itemName}) is a service, skipping stock update.`);
+                    console.log(`[API /api/sales] Item ID ${itemId} (${itemName}) is a service, skipping stock update.`);
                 }
 
                 // Note: Item details like unit_price, tax_rate_value are taken from the *cart item* sent by frontend
@@ -3367,9 +3582,9 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
             // Optional: Add tolerance check instead of strict equality if minor rounding diffs are expected
             const tolerance = 0.01; // Adjust tolerance as needed
             if (Math.abs(calculatedItemSubtotalInclTax - itemSubtotal) > tolerance) {
-                 console.warn(`[API /api/sales] Subtotal mismatch for item ${itemName}. Frontend: ${itemSubtotal.toFixed(2)}, Calculated: ${calculatedItemSubtotalInclTax.toFixed(2)}. Using calculated value.`);
-                 // Optionally, you could throw an error here for stricter validation
-                 // throw new Error(`Subtotal mismatch for item ${itemName}. Please recalculate cart.`);
+                console.warn(`[API /api/sales] Subtotal mismatch for item ${itemName}. Frontend: ${itemSubtotal.toFixed(2)}, Calculated: ${calculatedItemSubtotalInclTax.toFixed(2)}. Using calculated value.`);
+                // Optionally, you could throw an error here for stricter validation
+                // throw new Error(`Subtotal mismatch for item ${itemName}. Please recalculate cart.`);
             }
 
             calculatedGrandTotal += calculatedItemSubtotalInclTax;
@@ -3392,8 +3607,8 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
         // --- 4. Validate Overall Total (Optional but recommended) ---
         const tolerance = 0.01;
         if (Math.abs(calculatedGrandTotal - Number(frontendTotal)) > tolerance) {
-             console.warn(`[API /api/sales] Grand total mismatch. Frontend: ${Number(frontendTotal).toFixed(2)}, Calculated: ${calculatedGrandTotal.toFixed(2)}. Using calculated value.`);
-             // Optionally, throw error for stricter validation
+            console.warn(`[API /api/sales] Grand total mismatch. Frontend: ${Number(frontendTotal).toFixed(2)}, Calculated: ${calculatedGrandTotal.toFixed(2)}. Using calculated value.`);
+            // Optionally, throw error for stricter validation
         }
         const finalGrandTotal = calculatedGrandTotal;
         const finalTotalTax = calculatedTotalTax;
@@ -3407,13 +3622,13 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
         const actualDueDate = paymentType === 'Credit' ? frontendDueDate : null;
 
         if (paymentType === 'Credit' && customer?.id) {
-             await client.query(
+            await client.query(
                 `UPDATE public.customers
                  SET balance_due = COALESCE(balance_due, 0) + $1, updated_at = CURRENT_TIMESTAMP
                  WHERE id = $2 AND user_id = $3;`,
                 [finalGrandTotal, customer.id, user_id]
             );
-             console.log(`[API /api/sales] Updated customer ${customer.id} balance_due by ${finalGrandTotal.toFixed(2)}.`);
+            console.log(`[API /api/sales] Updated customer ${customer.id} balance_due by ${finalGrandTotal.toFixed(2)}.`);
         }
 
         // --- 6. Insert Sale Record (Keep existing logic) ---
@@ -3453,9 +3668,9 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
             // Determine product name (use from item or fetch if needed for consistency, though item.name is usually fine)
             let productName = item.name;
             if (typeof item.id === 'number') {
-                 // For existing items, you might re-fetch name for absolute consistency, but using item.name is common
-                 // const prodRes = await client.query('SELECT name FROM public.products_services WHERE id = $1 AND user_id = $2', [item.id, user_id]);
-                 // if (prodRes.rows.length > 0) productName = prodRes.rows[0].name;
+                // For existing items, you might re-fetch name for absolute consistency, but using item.name is common
+                // const prodRes = await client.query('SELECT name FROM public.products_services WHERE id = $1 AND user_id = $2', [item.id, user_id]);
+                // if (prodRes.rows.length > 0) productName = prodRes.rows[0].name;
             }
 
             await client.query(
@@ -3487,7 +3702,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
                 [user_id]
             );
             if (cashAccountRes.rows.length === 0) {
-                 throw new Error('Default Cash account not found for user.');
+                throw new Error('Default Cash account not found for user.');
             }
             accountIdDestination = cashAccountRes.rows[0].id;
             amountReceived = Number(frontendAmountPaid) || 0; // Ensure it's a number
@@ -3495,12 +3710,12 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
 
         } else if (paymentType === 'Bank') {
             // Find Bank Account ID (you might need a specific bank account selector in UI)
-             const bankAccountRes = await client.query(
+            const bankAccountRes = await client.query(
                 `SELECT id FROM public.accounts WHERE user_id = $1 AND (name ILIKE '%bank%' OR name ILIKE '%cheque%') AND type = 'Asset' LIMIT 1`,
                 [user_id]
             );
             if (bankAccountRes.rows.length === 0) {
-                 throw new Error('Default Bank account not found for user.');
+                throw new Error('Default Bank account not found for user.');
             }
             accountIdDestination = bankAccountRes.rows[0].id;
             amountReceived = finalGrandTotal; // Full amount for bank/card
@@ -3508,17 +3723,17 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
 
         } else if (paymentType === 'Credit') {
             // Find Accounts Receivable ID
-             const arAccountRes = await client.query(
+            const arAccountRes = await client.query(
                 `SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%accounts receivable%' AND type = 'Asset' LIMIT 1`,
                 [user_id]
             );
             if (arAccountRes.rows.length === 0) {
-                 throw new Error('Default Accounts Receivable account not found for user.');
+                throw new Error('Default Accounts Receivable account not found for user.');
             }
             accountIdDestination = arAccountRes.rows[0].id;
             amountReceived = finalGrandTotal; // Full amount owed
-             transactionDescription = `Credit sale to ${customer?.name || 'Unknown Customer'}`;
-             // Note: Due date handling would involve updating the customer's balance or a separate credit tracking mechanism.
+            transactionDescription = `Credit sale to ${customer?.name || 'Unknown Customer'}`;
+            // Note: Due date handling would involve updating the customer's balance or a separate credit tracking mechanism.
         }
 
         // Find Sales Revenue Account ID
@@ -3527,7 +3742,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
             [user_id]
         );
         if (revenueAccountRes.rows.length === 0) {
-             throw new Error('Default Sales Revenue account not found for user.');
+            throw new Error('Default Sales Revenue account not found for user.');
         }
         const accountIdRevenue = revenueAccountRes.rows[0].id;
 
@@ -3555,7 +3770,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
 
         // --- 9b. Credit: Sales Revenue ---
         if (finalGrandTotal > 0) {
-             await client.query(
+            await client.query(
                 `INSERT INTO public.transactions (type, amount, description, date, category, account_id, source, confirmed, user_id)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
                 ['Credit', finalGrandTotal, `${transactionDescription} - Sales Revenue`, transactionDate, transactionCategory, accountIdRevenue, 'POS', true, user_id]
@@ -3564,7 +3779,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
 
         // --- 9c. Credit: VAT Payable (if applicable and tax collected > 0) ---
         if (accountIdVatPayable && finalTotalTax > 0) {
-             await client.query(
+            await client.query(
                 `INSERT INTO public.transactions (type, amount, description, date, category, account_id, source, confirmed, user_id)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
                 ['Credit', finalTotalTax, `${transactionDescription} - VAT Collected`, transactionDate, transactionCategory, accountIdVatPayable, 'POS', true, user_id]
@@ -3595,7 +3810,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
                     ['Debit', totalCOGS, `COGS for sale ID ${saleId}`, transactionDate, 'COGS', accountIdCOGS, 'POS', true, user_id]
                 );
-                 await client.query(
+                await client.query(
                     `INSERT INTO public.transactions (type, amount, description, date, category, account_id, source, confirmed, user_id)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
                     ['Credit', totalCOGS, `Inventory reduction for sale ID ${saleId}`, transactionDate, 'Inventory', accountIdInventory, 'POS', true, user_id]
@@ -3709,7 +3924,7 @@ app.get('/api/sales/customer/:customerId/credit-history', authMiddleware, async 
             ORDER BY s.created_at DESC;`,
             [user_id, customerId]
         );
-        
+
         // --- FIX: Explicitly parse numeric values before sending to the client ---
         const creditHistory = result.rows.map(row => ({
             ...row,
@@ -3779,7 +3994,6 @@ app.post('/api/credit-payments', authMiddleware, async (req: Request, res: Respo
         client.release();
     }
 });
-
 
 // =========================================================================
 // 3. GET Sales Data for Dashboard (app.get('/api/dashboard/sales')) - Your existing code
@@ -9069,6 +9283,8 @@ app.get('/api/charts/sales-expenses-sunburst', authMiddleware, async (req: Reque
         res.status(500).json({ error: 'Failed to fetch sunburst data', detail: error instanceof Error ? error.message : String(error) });
     }
 });
+
+// In your main server file (e.g., server.ts or routes/customers.ts)
 
 
 
