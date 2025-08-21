@@ -510,56 +510,238 @@ const mapCustomerToFrontend = (customer: CustomerDB): CustomerFrontend => ({
 
 // Assuming 'app', 'pool', 'authMiddleware', 'bcrypt', 'uuidv4', 'Request', 'Response' are defined elsewhere
 
+// In your backend (e.g., server.ts or routes/auth.ts)
+
+// --- Add these imports at the top if not already present ---
+// import bcrypt from 'bcryptjs';
+// import { v4 as uuidv4 } from 'uuid';
+// import jwt from 'jsonwebtoken';
+// --- End imports ---
+
+// --- Registration Endpoint (Updated for Extended Frontend Form AND Default Accounts) ---
 app.post('/register', async (req: Request, res: Response) => {
-  const { name, email, password } = req.body;
+  // --- Destructure ALL fields expected from the enhanced frontend form ---
+  const {
+    name, // Combined First Name + Last Name (Primary name field for users table)
+    email,
+    password,
+    // --- Extended Registration Fields from Request Body ---
+    surname, // Received but combined into 'name' field
+    company, // Maps directly to 'company' column
+    position, // Maps directly to 'position' column
+    phone, // Maps directly to 'phone' column (optional)
+    address, // Maps directly to 'address' column
+    city, // Maps directly to 'city' column
+    province, // Maps directly to 'province' column
+    country, // Maps directly to 'country' column
+    postal_code, // Maps directly to 'postal_code' column
+    registrationType, // Received but NOT stored (unless you add a column)
+    companySize, // Received but NOT stored (unless you add a column)
+    gender, // Received but NOT stored (unless you add a column)
+    // --- End Extended Registration Fields ---
+  } = req.body;
 
-  if (!name || !email || !password)
-    return res.status(400).json({ error: 'Missing name, email, or password' });
+  console.log(`[AUTH] Registration attempt received for email: ${email}`);
 
-  const user_id = uuidv4();
-  const password_hash = await bcrypt.hash(password, 10);
-  const defaultRole = 'admin'; // or 'ceo' depending on your system
+  // --- Enhanced Server-Side Validation ---
+  // Check for presence of core required fields for registration and profile
+  if (!name || !email || !password || !company || !position ||
+      !address || !city || !province || !country || !postal_code) {
+    console.warn(`[AUTH] Registration failed for ${email}: Missing required fields.`);
+    return res.status(400).json({
+      error: 'Registration failed. Please provide all required information (marked with *).',
+      // Optionally, you could list the specific missing fields for better UX
+      // missingFields: [...] 
+    });
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+     console.warn(`[AUTH] Registration failed for ${email}: Invalid email format.`);
+     return res.status(400).json({ error: 'Please enter a valid email address.' });
+  }
+
+  // Validate password strength (basic example: min length)
+  if (password.length < 6) {
+     console.warn(`[AUTH] Registration failed for ${email}: Password too short.`);
+     return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+  }
+  // --- End Enhanced Server-Side Validation ---
 
   try {
-    await pool.query('BEGIN'); // Start a database transaction
+    // --- Check for Existing User ---
+    const existingUserResult = await pool.query(
+      'SELECT id FROM public.users WHERE email = $1',
+      [email]
+    );
+    if (existingUserResult.rows.length > 0) {
+      console.warn(`[AUTH] Registration failed for ${email}: Email already exists.`);
+      return res.status(409).json({ error: 'An account with this email address already exists.' });
+    }
+    // --- End Check for Existing User ---
 
-    // Step 1: Insert user into `users` table
-    await pool.query(`
-      INSERT INTO public.users (name, email, user_id, password_hash, role)
-      VALUES ($1, $2, $3, $4, $5)
-    `, [name, email, user_id, password_hash, defaultRole]);
+    // --- Hash Password ---
+    const saltRounds = 10; // Standard value for bcrypt
+    const password_hash = await bcrypt.hash(password, saltRounds);
+    console.log(`[AUTH] Password hashed successfully for ${email}.`);
+    // --- End Hash Password ---
 
-    // Step 2: Insert default role into `user_roles` table
-    await pool.query(`
-      INSERT INTO public.user_roles (user_id, role)
-      VALUES ($1, $2)
-    `, [user_id, defaultRole]);
+    // --- Generate Unique User ID ---
+    const newUserId = uuidv4(); // Generate a unique UUID for the new user
+    console.log(`[AUTH] Generated new user ID: ${newUserId} for ${email}.`);
+    // --- End Generate Unique User ID ---
 
-    // Step 3: Insert default 'Sales Revenue' account into `accounts` table for the new user
-    // Corrected 'account_type' to 'type' as per your public.accounts definition
-    await pool.query(`
-      INSERT INTO public.accounts (name, type, category, code, user_id)
-      VALUES ($1, $2, $3, $4, $5)
-    `, ['Sales Revenue', 'Income', 'Sales Revenue', '4000', user_id]);
+    // --- BEGIN DATABASE TRANSACTION ---
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      console.log(`[AUTH] Database transaction started for ${email}.`);
 
-    // You can add more default accounts here if needed, following the same pattern:
-    // For example, a 'Cost of Goods Sold' account with code '5000'
-    /*
-    await pool.query(`
-      INSERT INTO public.accounts (name, type, category, code, user_id)
-      VALUES ($1, $2, $3, $4, $5)
-    `, ['Cost of Goods Sold', 'Expense', 'Cost of Goods Sold', '5000', user_id]);
-    */
+      // --- Step 1: Insert New User into Database (WITH Extended Profile Fields) ---
+      // Note: 'registrationType', 'companySize', 'gender' are received but not inserted here
+      // unless you add corresponding columns to the `public.users` table.
+      const insertUserResult = await client.query(
+        `INSERT INTO public.users (
+           user_id, -- UUID string
+           name, -- Combined first & last name from frontend
+           email,
+           password_hash,
+           company, -- From frontend
+           position, -- From frontend
+           phone, -- From frontend (optional)
+           address, -- From frontend
+           city, -- From frontend
+           province, -- From frontend
+           country, -- From frontend
+           postal_code, -- From frontend
+           role -- Assign initial role (e.g., 'admin')
+           -- Add new columns here if you create them, e.g.,
+           -- registration_type, company_size, gender
+         ) VALUES (
+           $1, $2, $3, $4,
+           $5, $6, $7, $8, $9, $10, $11, $12,
+           $13
+           -- Add corresponding values here if you add new columns, e.g.,
+           -- $14, $15, $16
+         ) RETURNING id, user_id, name, email, role`,
+         // Values array matching placeholders ($1, $2, ...)
+        [
+          newUserId, name, email, password_hash,
+          company, position, phone || null, address, city, province, country, postal_code,
+          'admin' // Assign 'admin' role to the registering user
+          // Add values for new columns here if you add them, e.g.,
+          // registrationType || null, companySize || null, gender || null
+        ]
+      );
+      const newUser = insertUserResult.rows[0]; // Get the inserted user data
+      console.log(`[AUTH] New user inserted successfully: ID ${newUser.id}, user_id ${newUser.user_id}`);
+      // --- End Step 1: Insert New User ---
 
-    await pool.query('COMMIT'); // Commit the transaction if all steps succeed
+      // --- Step 2: Insert Default Role into `user_roles` table ---
+      // This maintains consistency with the original logic if you use user_roles elsewhere.
+      await client.query(`
+        INSERT INTO public.user_roles (user_id, role)
+        VALUES ($1, $2)
+      `, [newUserId, 'admin']); // Use the same role assigned in Step 1
+      console.log(`[AUTH] Default 'admin' role inserted for user_id: ${newUserId}.`);
+      // --- End Step 2: Insert Default Role ---
 
-    res.status(201).json({ message: 'User registered and default accounts created successfully' });
-  } catch (error) {
-    await pool.query('ROLLBACK'); // Rollback the transaction if any error occurs
-    console.error('Registration error:', error);
-    res.status(500).json({ error: 'Registration failed' });
+      // --- Step 3: Insert Default 'Sales Revenue' Account into `accounts` table ---
+      // This is the crucial part that was missing in the previous update.
+      await client.query(`
+        INSERT INTO public.accounts (name, type, category, code, user_id)
+        VALUES ($1, $2, $3, $4, $5)
+      `, ['Sales Revenue', 'Income', 'Sales Revenue', '4000', newUserId]);
+      console.log(`[AUTH] Default 'Sales Revenue' account created for user_id: ${newUserId}.`);
+      // --- End Step 3: Insert Default Account ---
+
+      // --- Optional: Insert Additional Default Accounts ---
+      // You can add more default accounts here if needed, following the same pattern:
+      // For example, a 'Cost of Goods Sold' account with code '5000'
+      /*
+      await client.query(`
+        INSERT INTO public.accounts (name, type, category, code, user_id)
+        VALUES ($1, $2, $3, $4, $5)
+      `, ['Cost of Goods Sold', 'Expense', 'Cost of Goods Sold', '5000', newUserId]);
+      console.log(`[AUTH] Default 'Cost of Goods Sold' account created for user_id: ${newUserId}.`);
+      */
+      // --- End Optional: Insert Additional Default Accounts ---
+
+      // --- COMMIT DATABASE TRANSACTION ---
+      await client.query('COMMIT');
+      console.log(`[AUTH] Database transaction committed successfully for ${email}.`);
+      // --- End COMMIT DATABASE TRANSACTION ---
+
+      // --- Generate JWT Token ---
+      // Ensure JWT_SECRET is defined in your environment variables (.env file)
+      const JWT_SECRET = process.env.JWT_SECRET;
+      if (!JWT_SECRET) {
+          console.error("[AUTH] JWT_SECRET is not defined in environment variables.");
+          // Even if token generation fails, we can still report success to the user
+          // and let them log in manually. Or, return a 500.
+          // For now, proceed without token in response but log the error.
+          // return res.status(500).json({ error: 'Internal server error during registration.' });
+      }
+      let token = null;
+      if (JWT_SECRET) {
+          token = jwt.sign(
+            { user_id: newUser.user_id, email: newUser.email }, // Payload
+            JWT_SECRET, // Secret key
+            { expiresIn: '24h' } // Options
+          );
+          console.log(`[AUTH] JWT token generated for user_id: ${newUser.user_id}`);
+      }
+      // --- End Generate JWT Token ---
+
+      // --- Respond with Success (Including Token) ---
+      console.log(`[AUTH] User registered successfully: ${newUser.name} (${newUser.email})`);
+      res.status(201).json({
+        message: '🎉 Registration successful! Welcome to QxAnalytix. Default accounts created.',
+        user: {
+          user_id: newUser.user_id,
+          name: newUser.name,
+          email: newUser.email,
+          // role: newUser.role // Include role if needed immediately
+          // Include other non-sensitive user details if needed
+        },
+        // Include the token only if it was successfully generated
+        ...(token && { token: token })
+      });
+      // --- End Respond with Success ---
+
+    } catch (transactionErr: any) {
+      // --- HANDLE TRANSACTION ERRORS ---
+      await client.query('ROLLBACK');
+      console.error(`[AUTH] Database transaction rolled back for ${email} due to:`, transactionErr);
+      throw transactionErr; // Re-throw to be caught by the outer catch block
+      // --- END HANDLE TRANSACTION ERRORS ---
+    } finally {
+      // --- ALWAYS RELEASE CLIENT ---
+      client.release();
+      console.log(`[AUTH] Database client released for ${email}.`);
+      // --- END ALWAYS RELEASE CLIENT ---
+    }
+    // --- END DATABASE TRANSACTION BLOCK ---
+  } catch (err: any) {
+    // --- Handle Outer Errors (including transaction errors) ---
+    console.error('[AUTH] Registration error:', err);
+    // Differentiate between database errors and others if needed
+    // Example: Unique violation on email (though checked above, race condition possible)
+    if (err.code === '23505') { // Unique violation
+       console.error(`[AUTH] Registration failed for ${email}: Conflict (e.g., duplicate email).`);
+       return res.status(409).json({ error: 'Registration failed due to a conflict. Please try again.' });
+    }
+    // Generic server error response
+    res.status(500).json({
+      error: '😢 Registration failed due to a server error. Please try again later.',
+      // Optionally include error details in development, but not in production
+      // details: err.message
+    });
+    // --- End Handle Outer Errors ---
   }
 });
+// --- End Registration Endpoint ---
 
 
 
