@@ -672,6 +672,7 @@ app.post('/register', async (req: Request, res: Response) => {
         ['Bank Account', 'Asset', 'Bank', '1000'], // A default bank account is crucial
         ['Cash', 'Asset', 'Cash', '1100'], // A default cash account is also necessary
         ['Car Loans', 'Liability', 'Car Loans', '2200'],
+        ['Depreciation Expense', 'Expense', 'Depreciation Expense', '7770'],
         ['Credit Facility Payable', 'Liability', 'Credit Facility', '2300'],
       ];
 
