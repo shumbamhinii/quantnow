@@ -519,6 +519,7 @@ const mapCustomerToFrontend = (customer: CustomerDB): CustomerFrontend => ({
 // --- End imports ---
 
 // --- Registration Endpoint (Updated for Extended Frontend Form AND Default Accounts) ---
+// --- Registration Endpoint (Updated for Extended Frontend Form AND Default Accounts) ---
 app.post('/register', async (req: Request, res: Response) => {
   // --- Destructure ALL fields expected from the enhanced frontend form ---
   const {
@@ -558,14 +559,14 @@ app.post('/register', async (req: Request, res: Response) => {
   // Validate email format
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!emailRegex.test(email)) {
-     console.warn(`[AUTH] Registration failed for ${email}: Invalid email format.`);
-     return res.status(400).json({ error: 'Please enter a valid email address.' });
+      console.warn(`[AUTH] Registration failed for ${email}: Invalid email format.`);
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
   }
 
   // Validate password strength (basic example: min length)
   if (password.length < 6) {
-     console.warn(`[AUTH] Registration failed for ${email}: Password too short.`);
-     return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+      console.warn(`[AUTH] Registration failed for ${email}: Password too short.`);
+      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
   }
   // --- End Enhanced Server-Side Validation ---
 
@@ -626,13 +627,13 @@ app.post('/register', async (req: Request, res: Response) => {
            -- $14, $15, $16
          ) RETURNING id, user_id, name, email, role`,
          // Values array matching placeholders ($1, $2, ...)
-        [
-          newUserId, name, email, password_hash,
-          company, position, phone || null, address, city, province, country, postal_code,
-          'admin' // Assign 'admin' role to the registering user
-          // Add values for new columns here if you add them, e.g.,
-          // registrationType || null, companySize || null, gender || null
-        ]
+       [
+         newUserId, name, email, password_hash,
+         company, position, phone || null, address, city, province, country, postal_code,
+         'admin' // Assign 'admin' role to the registering user
+         // Add values for new columns here if you add them, e.g.,
+         // registrationType || null, companySize || null, gender || null
+       ]
       );
       const newUser = insertUserResult.rows[0]; // Get the inserted user data
       console.log(`[AUTH] New user inserted successfully: ID ${newUser.id}, user_id ${newUser.user_id}`);
@@ -647,26 +648,42 @@ app.post('/register', async (req: Request, res: Response) => {
       console.log(`[AUTH] Default 'admin' role inserted for user_id: ${newUserId}.`);
       // --- End Step 2: Insert Default Role ---
 
-      // --- Step 3: Insert Default 'Sales Revenue' Account into `accounts` table ---
-      // This is the crucial part that was missing in the previous update.
-      await client.query(`
-        INSERT INTO public.accounts (name, type, category, code, user_id)
-        VALUES ($1, $2, $3, $4, $5)
-      `, ['Sales Revenue', 'Income', 'Sales Revenue', '4000', newUserId]);
-      console.log(`[AUTH] Default 'Sales Revenue' account created for user_id: ${newUserId}.`);
-      // --- End Step 3: Insert Default Account ---
+      // --- Step 3: Insert Default Accounts based on ImportScreen.tsx ---
+      // These accounts provide a base set for transaction categorization
+      // and align with the logic in the frontend's suggestion functions.
+      const defaultAccounts = [
+        ['Sales Revenue', 'Income', 'Sales Revenue', '4000'],
+        ['Other Income', 'Income', 'Other Income', '4900'],
+        ['Interest Income', 'Income', 'Interest Income', '4100'],
+        ['Cost of Goods Sold', 'Expense', 'Cost of Goods Sold', '5000'],
+        ['Bank Charges & Fees', 'Expense', 'Bank Charges & Fees', '6200'],
+        ['Salaries and wages expense', 'Expense', 'Salaries and wages', '6100'],
+        ['Rent expense', 'Expense', 'Rent', '6300'],
+        ['Repairs & Maintenance expense', 'Expense', 'Repairs & Maintenance', '6400'],
+        ['Fuel expense', 'Expense', 'Fuel', '6500'],
+        ['Utilities Expenses', 'Expense', 'Utilities', '6600'],
+        ['Insurance expense', 'Expense', 'Insurance', '6700'],
+        ['Loan interest expense', 'Expense', 'Loan interest', '6800'],
+        ['Communication expense', 'Expense', 'Computer internet and Telephone', '6900'],
+        ['Website hosting fees', 'Expense', 'Website hosting fees', '6950'],
+        ['Accounting fees expense', 'Expense', 'Accounting fees', '7000'],
+        ['Miscellaneous expense', 'Expense', 'Other expenses', '7900'],
+        ['Accounts Payable', 'Liability', 'Accounts Payable', '2100'],
+        ['Bank Account', 'Asset', 'Bank', '1000'], // A default bank account is crucial
+        ['Cash', 'Asset', 'Cash', '1100'], // A default cash account is also necessary
+        ['Car Loans', 'Liability', 'Car Loans', '2200'],
+        ['Credit Facility Payable', 'Liability', 'Credit Facility', '2300'],
+      ];
 
-      // --- Optional: Insert Additional Default Accounts ---
-      // You can add more default accounts here if needed, following the same pattern:
-      // For example, a 'Cost of Goods Sold' account with code '5000'
-      /*
-      await client.query(`
-        INSERT INTO public.accounts (name, type, category, code, user_id)
-        VALUES ($1, $2, $3, $4, $5)
-      `, ['Cost of Goods Sold', 'Expense', 'Cost of Goods Sold', '5000', newUserId]);
-      console.log(`[AUTH] Default 'Cost of Goods Sold' account created for user_id: ${newUserId}.`);
-      */
-      // --- End Optional: Insert Additional Default Accounts ---
+      for (const account of defaultAccounts) {
+        await client.query(
+          `INSERT INTO public.accounts (name, type, category, code, user_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [account[0], account[1], account[2], account[3], newUserId]
+        );
+      }
+      console.log(`[AUTH] ${defaultAccounts.length} default accounts created for user_id: ${newUserId}.`);
+      // --- End Step 3: Insert Default Accounts ---
 
       // --- COMMIT DATABASE TRANSACTION ---
       await client.query('COMMIT');
@@ -678,10 +695,6 @@ app.post('/register', async (req: Request, res: Response) => {
       const JWT_SECRET = process.env.JWT_SECRET;
       if (!JWT_SECRET) {
           console.error("[AUTH] JWT_SECRET is not defined in environment variables.");
-          // Even if token generation fails, we can still report success to the user
-          // and let them log in manually. Or, return a 500.
-          // For now, proceed without token in response but log the error.
-          // return res.status(500).json({ error: 'Internal server error during registration.' });
       }
       let token = null;
       if (JWT_SECRET) {
@@ -702,8 +715,6 @@ app.post('/register', async (req: Request, res: Response) => {
           user_id: newUser.user_id,
           name: newUser.name,
           email: newUser.email,
-          // role: newUser.role // Include role if needed immediately
-          // Include other non-sensitive user details if needed
         },
         // Include the token only if it was successfully generated
         ...(token && { token: token })
@@ -729,22 +740,17 @@ app.post('/register', async (req: Request, res: Response) => {
     // Differentiate between database errors and others if needed
     // Example: Unique violation on email (though checked above, race condition possible)
     if (err.code === '23505') { // Unique violation
-       console.error(`[AUTH] Registration failed for ${email}: Conflict (e.g., duplicate email).`);
-       return res.status(409).json({ error: 'Registration failed due to a conflict. Please try again.' });
+        console.error(`[AUTH] Registration failed for ${email}: Conflict (e.g., duplicate email).`);
+        return res.status(409).json({ error: 'Registration failed due to a conflict. Please try again.' });
     }
     // Generic server error response
     res.status(500).json({
       error: '😢 Registration failed due to a server error. Please try again later.',
-      // Optionally include error details in development, but not in production
-      // details: err.message
     });
     // --- End Handle Outer Errors ---
   }
 });
 // --- End Registration Endpoint ---
-
-
-
 
 app.post('/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
