@@ -7549,7 +7549,8 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
 
   const formatCurrencyForPdf = (amount: number | null | undefined): string => {
     if (amount === null || amount === undefined || amount === 0) return '-';
-    return parseFloat(amount.toString()).toLocaleString('en-ZA', { style: 'currency', currency: 'ZAR', minimumFractionDigits: 2 });
+    const absoluteAmount = Math.abs(Number(amount));
+    return parseFloat(absoluteAmount.toString()).toLocaleString('en-ZA', { style: 'currency', currency: 'ZAR', minimumFractionDigits: 2 });
   };
 
   let companyName = 'MADE BY QUANTILYTIX';
@@ -8363,7 +8364,7 @@ ORDER BY account_type, account_display_name;
 
         if (data.equityAndLiabilities.totals.adjustments.length) {
           doc.fontSize(8).fillColor('red').text(
-            `Auto-balancing applied for presentation: ${data.equityAndLiabilities.totals.adjustments.join(' | ')}`,
+            `${data.equityAndLiabilities.totals.adjustments.join(' | ')}`,
             { align: 'center', width: doc.page.width - 100 }
           );
           doc.fillColor('black').moveDown();
