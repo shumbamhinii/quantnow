@@ -398,6 +398,19 @@ interface ProductDB {
     // Potentially include the tax rate itself from the joined table
     tax_rate_value?: number; // The actual rate (e.g., 0.15) from tax_rates table
 }
+interface UserProfile {
+  company?: string | null;
+  email?: string | null;
+  address?: string | null;
+  city?: string | null;
+  province?: string | null;
+  postal_code?: string | null;
+  country?: string | null;
+  phone?: string | null;
+  vat_number?: string | null;
+  reg_number?: string | null;
+  contact_person?: string | null;
+}
 
 // Interface for what the frontend expects (camelCase)
 interface ProductFrontend {
@@ -834,165 +847,41 @@ app.post('/login', async (req: Request, res: Response) => {
 });
 
 
+// Define the interface for PDF data again for clarity
+interface QuotationDetailsForPdf {
+    quotation_number: string;
+    customer_name: string;
+    customer_email?: string | null;
+    customer_address?: string | null;
+    quotation_date: string;
+    expiry_date?: string;
+    total_amount: number;
+    currency: string;
+    notes?: string | null;
+    line_items: Array<{
+        product_service_name?: string | null;
+        description: string;
+        quantity: number;
+        unit_price: number;
+        line_total: number;
+        tax_rate: number;
+    }>;
+    companyName: string;
+    companyAddress?: string | null;
+    companyCity?: string | null; // <-- ADDED THIS
+    companyProvince?: string | null; // <-- ADDED THIS
+    companyPostalCode?: string | null; // <-- ADDED THIS
+    companyCountry?: string | null; // <-- ADDED THIS
+    companyVat?: string | null;
+    companyReg?: string | null;
+    companyPhone?: string | null;
+    companyEmail?: string | null;
+}
 
 
 
 // Generic PDF generation endpoint for invoices and statements
-app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
-    const { documentType, id } = req.params;
-    const { startDate, endDate } = req.query;
-    const user_id = req.user!.parent_user_id;
 
-    const doc = new PDFDocument({ margin: 50 });
-
-    try {
-        switch (documentType) {
-            case 'invoices':
-            case 'invoice': {
-                const invoiceQueryResult = await pool.query(
-                    `SELECT
-                        i.*,
-                        c.name AS customer_name,
-                        c.email AS customer_email
-                    FROM invoices i
-                    JOIN customers c ON i.customer_id = c.id
-                    WHERE i.id = $1 AND i.user_id = $2`,
-                    [id, user_id]
-                );
-
-                if (invoiceQueryResult.rows.length === 0) {
-                    res.status(404).json({ error: 'Invoice not found' });
-                    doc.end();
-                    return;
-                }
-
-                const invoice = invoiceQueryResult.rows[0];
-
-                res.setHeader('Content-Type', 'application/pdf');
-                res.setHeader('Content-Disposition', `attachment; filename="invoice_${invoice.invoice_number}.pdf"`);
-
-                doc.pipe(res);
-
-                // Fetch line items
-                const lineItemsResult = await pool.query(
-                    `SELECT
-                        li.*,
-                        ps.name AS product_service_name
-                    FROM invoice_line_items li
-                    LEFT JOIN products_services ps ON li.product_service_id = ps.id
-                    WHERE li.invoice_id = $1
-                    ORDER BY li.created_at`,
-                    [id]
-                );
-                invoice.line_items = lineItemsResult.rows;
-
-                // --- PDF Content Generation for Invoice ---
-                doc.fontSize(24).font('Helvetica-Bold').text('Invoice', { align: 'center' });
-                doc.moveDown(1.5);
-
-                doc.fontSize(12).font('Helvetica-Bold').text('Invoice Details:', { underline: true });
-                doc.font('Helvetica')
-                    .text(`Invoice Number: ${invoice.invoice_number}`)
-                    .text(`Customer: ${invoice.customer_name}`)
-                    .text(`Invoice Date: ${new Date(invoice.invoice_date).toLocaleDateString('en-GB')}`)
-                    .text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-GB')}`);
-                doc.moveDown(1.5);
-
-                doc.fontSize(14).font('Helvetica-Bold').text('Line Items:', { underline: true });
-                doc.moveDown(0.5);
-
-                // Table Headers
-                const tableTop = doc.y;
-                const col1X = 50;
-                const col2X = 250;
-                const col3X = 300;
-                const col4X = 400;
-                const col5X = 470;
-
-                doc.fontSize(10)
-                    .font('Helvetica-Bold')
-                    .text('Description', col1X, tableTop)
-                    .text('Qty', col2X, tableTop)
-                    .text('Unit Price', col3X, tableTop, { width: 70, align: 'right' })
-                    .text('Tax Rate', col4X, tableTop, { width: 60, align: 'right' })
-                    .text('Line Total', col5X, tableTop, { width: 70, align: 'right' });
-
-                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
-
-                let yPos = tableTop + 25;
-
-                // Line Items Table Rows
-                invoice.line_items.forEach((item: any) => {
-                    if (yPos + 20 > doc.page.height - doc.page.margins.bottom) {
-                        doc.addPage();
-                        yPos = doc.page.margins.top;
-                        doc.fontSize(10)
-                            .font('Helvetica-Bold')
-                            .text('Description', col1X, yPos)
-                            .text('Qty', col2X, yPos)
-                            .text('Unit Price', col3X, yPos, { width: 70, align: 'right' })
-                            .text('Tax Rate', col4X, yPos, { width: 60, align: 'right' })
-                            .text('Line Total', col5X, yPos, { width: 70, align: 'right' });
-                        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos + 15).lineTo(550, yPos + 15).stroke();
-                        yPos += 25;
-                    }
-
-                    doc.fontSize(10).font('Helvetica')
-                        .text(item.description, col1X, yPos, { width: 190 })
-                        .text(item.quantity.toString(), col2X, yPos, { width: 40, align: 'right' })
-                        .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, yPos, { width: 70, align: 'right' })
-                        .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, yPos, { width: 60, align: 'right' })
-                        .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, yPos, { width: 70, align: 'right' });
-                    yPos += 20;
-                });
-
-                doc.moveDown();
-                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos).lineTo(550, yPos).stroke();
-
-                yPos += 10;
-                doc.fontSize(14).font('Helvetica-Bold')
-                    .text(`Total Amount: ${invoice.currency} ${(parseFloat(invoice.total_amount)).toFixed(2)}`, col1X, yPos, { align: 'right', width: 500 });
-
-                if (invoice.notes) {
-                    doc.moveDown(1.5);
-                    doc.fontSize(10).font('Helvetica-Oblique').text(`Notes: ${invoice.notes}`);
-                }
-
-                doc.end();
-                return;
-            }
-
-            case 'statement': {
-                res.setHeader('Content-Type', 'application/pdf');
-                doc.pipe(res);
-                doc.text('Statement generation not fully implemented in this example.', { align: 'center' });
-                doc.end();
-                return;
-            }
-
-            default:
-                res.status(400).json({ error: 'Document type not supported.' });
-                doc.end();
-                return;
-        }
-
-    } catch (error: unknown) {
-        console.error(`Error generating ${documentType}:`, error);
-
-        if (res.headersSent) {
-            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
-            doc.end();
-            return;
-        }
-
-        res.status(500).json({
-            error: `Failed to generate ${documentType}`,
-            details: error instanceof Error ? error.message : String(error)
-        });
-        doc.end();
-        return;
-    }
-});
 
 // --- Specific Quotation PDF generation endpoint (MUST BE BEFORE generic one) ---
 app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
@@ -1128,6 +1017,409 @@ app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Res
 
 
 // Generic PDF generation endpoint for invoices and statements
+
+
+
+// NOTE: This function was commented out because the TypeScript error indicates it is a redeclaration.
+// Please use the other `formatCurrency` function that exists in your `server.ts` file.
+// const formatCurrency = (amount: number, currency: string) => {
+//     return `${currency} ${amount.toFixed(2)}`;
+// };
+
+// The code now assumes a `formatCurrency` function is available in the scope.
+// Function to generate the Quotation PDF
+// Function to generate the Quotation PDF
+async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const doc = new (PDFDocument as any)({ margin: 50 }); // Cast to any to avoid type issues with new PDFDocument
+        const buffers: Buffer[] = [];
+
+        doc.on('data', buffers.push.bind(buffers));
+        doc.on('end', () => resolve(Buffer.concat(buffers)));
+        doc.on('error', reject);
+
+        // Header (Company details)
+        doc.fontSize(24).font('Helvetica-Bold').text(quotationData.companyName, { align: 'right' });
+        if (quotationData.companyAddress) {
+            doc.fontSize(10).font('Helvetica').text(quotationData.companyAddress, { align: 'right' });
+        }
+        // Corrected logic to build addressLine2 using the newly added properties
+        if (quotationData.companyCity || quotationData.companyProvince || quotationData.companyPostalCode || quotationData.companyCountry) {
+            const addressLine2 = [quotationData.companyCity, quotationData.companyProvince, quotationData.companyPostalCode, quotationData.companyCountry]
+                .filter(Boolean)
+                .join(', ');
+            doc.fontSize(10).font('Helvetica').text(addressLine2, { align: 'right' });
+        }
+        if (quotationData.companyPhone) {
+            doc.fontSize(10).font('Helvetica').text(`Phone: ${quotationData.companyPhone}`, { align: 'right' });
+        }
+        if (quotationData.companyEmail) {
+            doc.fontSize(10).font('Helvetica').text(`Email: ${quotationData.companyEmail}`, { align: 'right' });
+        }
+        if (quotationData.companyVat) {
+            doc.fontSize(10).font('Helvetica').text(`VAT No: ${quotationData.companyVat}`, { align: 'right' });
+        }
+        if (quotationData.companyReg) {
+            doc.fontSize(10).font('Helvetica').text(`Reg No: ${quotationData.companyReg}`, { align: 'right' });
+        }
+
+        doc.moveDown(1);
+        doc.fontSize(10).text(`Quotation Date: ${new Date(quotationData.quotation_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+        if (quotationData.expiry_date) {
+            doc.fontSize(10).text(`Expiry Date: ${new Date(quotationData.expiry_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+        }
+        doc.moveDown(2);
+
+        // Title
+        doc.fontSize(30).font('Helvetica-Bold').text(`QUOTATION #${quotationData.quotation_number}`, { align: 'center' });
+        doc.moveDown(2);
+
+        // Customer Details
+        doc.fontSize(12).font('Helvetica-Bold').text('Quotation For:');
+        doc.fontSize(12).font('Helvetica').text(quotationData.customer_name);
+        if (quotationData.customer_address) {
+            doc.fontSize(10).text(quotationData.customer_address);
+        }
+        if (quotationData.customer_email) {
+            doc.fontSize(10).text(quotationData.customer_email);
+        }
+        doc.moveDown(2);
+
+        // Table Header
+        const tableTop = doc.y;
+        const itemCol = 50;
+        const descCol = 150;
+        const qtyCol = 320;
+        const priceCol = 370;
+        const taxCol = 430;
+        const totalCol = 500;
+
+        doc.font('Helvetica-Bold').fontSize(10);
+        doc.text('Item', itemCol, tableTop);
+        doc.text('Description', descCol, tableTop);
+        doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Unit Price', priceCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
+        doc.text('Line Total', totalCol, tableTop, { width: 50, align: 'right' });
+
+        doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
+        doc.moveDown();
+
+        // Table Body
+        doc.font('Helvetica').fontSize(9);
+        let currentY = doc.y;
+        let subtotal = 0;
+        let totalTax = 0;
+
+        quotationData.line_items.forEach(item => {
+            currentY = doc.y;
+            const itemDescription = item.product_service_name || item.description;
+            const taxAmount = (item.line_total * item.tax_rate);
+            const lineTotalExclTax = item.line_total - taxAmount;
+
+            doc.text(itemDescription, itemCol, currentY, { width: 140 });
+            doc.text(item.description, descCol, currentY, { width: 160 });
+            doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
+            doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
+            doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
+            doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
+
+            doc.moveDown();
+            subtotal += lineTotalExclTax;
+            totalTax += taxAmount;
+        });
+
+        // Totals
+        doc.moveDown();
+        const totalsY = doc.y;
+        const totalLabelCol = 400; // Aligned with the totals section
+        const totalValueCol = 500;
+        doc.font('Helvetica-Bold').fontSize(10);
+        
+        // Subtotal
+        doc.text('Subtotal:', totalLabelCol, totalsY, { width: 80, align: 'right' });
+        doc.text(formatCurrency(subtotal, quotationData.currency), totalValueCol, totalsY, { width: 50, align: 'right' });
+        doc.moveDown();
+
+        // Tax
+        doc.text('Tax:', totalLabelCol, doc.y, { width: 80, align: 'right' });
+        doc.text(formatCurrency(totalTax, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
+        doc.moveDown();
+
+        // Total Amount
+        doc.fontSize(14).text('Total Amount:', totalLabelCol, doc.y, { width: 80, align: 'right' });
+        doc.text(formatCurrency(quotationData.total_amount, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
+        doc.moveDown(3);
+
+        // Notes
+        if (quotationData.notes) {
+            doc.fontSize(10).font('Helvetica-Bold').text('Notes:');
+            doc.font('Helvetica').fontSize(10).text(quotationData.notes, { align: 'left' });
+            doc.moveDown(2);
+        }
+
+        // Footer
+        doc.fontSize(10).text(`Thank you for considering our quotation!`, doc.page.width / 2, doc.page.height - 50, {
+            align: 'center',
+            width: doc.page.width - 100,
+        });
+
+        doc.end();
+    });
+}
+
+// ... rest of your server.ts code ...
+
+// UPDATE the `/api/quotations/:id/pdf` endpoint
+app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const user_id = req.user!.parent_user_id;
+
+    try {
+        const quotationQueryResult = await pool.query(
+            `SELECT
+                q.*,
+                c.name AS customer_name,
+                c.email AS customer_email,
+                c.address AS customer_address
+            FROM quotations q
+            JOIN customers c ON q.customer_id = c.id
+            WHERE q.id = $1 AND q.user_id = $2`,
+            [id, user_id]
+        );
+
+        if (quotationQueryResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Quotation not found' });
+        }
+
+        const quotation = quotationQueryResult.rows[0];
+
+        // Fetch user's company information using the correct column name 'company' and other profile details
+        const userProfileResult = await pool.query(
+            `SELECT company, address, city, province, postal_code, country, phone, vat_number, reg_number, email
+             FROM users WHERE user_id = $1`,
+            [user_id]
+        );
+        const userCompany: UserProfile = userProfileResult.rows[0];
+
+        // Fetch line items for the quotation
+        const lineItemsResult = await pool.query(
+            `SELECT
+                li.*,
+                ps.name AS product_service_name
+            FROM quotation_line_items li
+            LEFT JOIN products_services ps ON li.product_service_id = ps.id
+            WHERE li.quotation_id = $1
+            ORDER BY li.created_at`,
+            [id]
+        );
+        quotation.line_items = lineItemsResult.rows;
+
+        // Prepare data for PDF generation, now including dynamic company info
+        const quotationDataForPdf: QuotationDetailsForPdf = {
+            quotation_number: quotation.quotation_number,
+            customer_name: quotation.customer_name,
+            customer_email: quotation.customer_email,
+            customer_address: quotation.customer_address,
+            quotation_date: quotation.quotation_date,
+            expiry_date: quotation.expiry_date,
+            total_amount: parseFloat(quotation.total_amount),
+            currency: quotation.currency,
+            notes: quotation.notes,
+            line_items: quotation.line_items.map((item: any) => ({
+                product_service_name: item.product_service_name,
+                description: item.description,
+                quantity: parseFloat(item.quantity),
+                unit_price: parseFloat(item.unit_price),
+                line_total: parseFloat(item.line_total),
+                tax_rate: parseFloat(item.tax_rate),
+            })),
+            companyName: userCompany?.company || 'Your Company Name',
+            companyAddress: userCompany?.address || null,
+            companyCity: userCompany?.city || null,
+            companyProvince: userCompany?.province || null,
+            companyPostalCode: userCompany?.postal_code || null,
+            companyCountry: userCompany?.country || null,
+            companyPhone: userCompany?.phone || null,
+            companyEmail: userCompany?.email || null,
+            companyVat: userCompany?.vat_number || null,
+            companyReg: userCompany?.reg_number || null,
+        };
+
+        const pdfBuffer = await generateQuotationPdf(quotationDataForPdf);
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="quotation_${quotation.quotation_number}.pdf"`);
+        res.send(pdfBuffer);
+    } catch (error: unknown) {
+        console.error(`Error generating quotation PDF:`, error);
+        if (res.headersSent) {
+            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
+            return;
+        }
+        res.status(500).json({
+            error: `Failed to generate quotation PDF`,
+            details: error instanceof Error ? error.message : String(error)
+        });
+    }
+});
+
+
+app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
+    const { documentType, id } = req.params;
+    const { startDate, endDate } = req.query;
+    const user_id = req.user!.parent_user_id;
+
+    const doc = new PDFDocument({ margin: 50 });
+
+    try {
+        switch (documentType) {
+            case 'invoices':
+            case 'invoice': {
+                const invoiceQueryResult = await pool.query(
+                    `SELECT
+                        i.*,
+                        c.name AS customer_name,
+                        c.email AS customer_email
+                    FROM invoices i
+                    JOIN customers c ON i.customer_id = c.id
+                    WHERE i.id = $1 AND i.user_id = $2`,
+                    [id, user_id]
+                );
+
+                if (invoiceQueryResult.rows.length === 0) {
+                    res.status(404).json({ error: 'Invoice not found' });
+                    doc.end();
+                    return;
+                }
+
+                const invoice = invoiceQueryResult.rows[0];
+
+                res.setHeader('Content-Type', 'application/pdf');
+                res.setHeader('Content-Disposition', `attachment; filename="invoice_${invoice.invoice_number}.pdf"`);
+
+                doc.pipe(res);
+
+                // Fetch line items
+                const lineItemsResult = await pool.query(
+                    `SELECT
+                        li.*,
+                        ps.name AS product_service_name
+                    FROM invoice_line_items li
+                    LEFT JOIN products_services ps ON li.product_service_id = ps.id
+                    WHERE li.invoice_id = $1
+                    ORDER BY li.created_at`,
+                    [id]
+                );
+                invoice.line_items = lineItemsResult.rows;
+
+                // --- PDF Content Generation for Invoice ---
+                doc.fontSize(24).font('Helvetica-Bold').text('Invoice', { align: 'center' });
+                doc.moveDown(1.5);
+
+                doc.fontSize(12).font('Helvetica-Bold').text('Invoice Details:', { underline: true });
+                doc.font('Helvetica')
+                    .text(`Invoice Number: ${invoice.invoice_number}`)
+                    .text(`Customer: ${invoice.customer_name}`)
+                    .text(`Invoice Date: ${new Date(invoice.invoice_date).toLocaleDateString('en-GB')}`)
+                    .text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-GB')}`);
+                doc.moveDown(1.5);
+
+                doc.fontSize(14).font('Helvetica-Bold').text('Line Items:', { underline: true });
+                doc.moveDown(0.5);
+
+                // Table Headers
+                const tableTop = doc.y;
+                const col1X = 50;
+                const col2X = 250;
+                const col3X = 300;
+                const col4X = 400;
+                const col5X = 470;
+
+                doc.fontSize(10)
+                    .font('Helvetica-Bold')
+                    .text('Description', col1X, tableTop)
+                    .text('Qty', col2X, tableTop)
+                    .text('Unit Price', col3X, tableTop, { width: 70, align: 'right' })
+                    .text('Tax Rate', col4X, tableTop, { width: 60, align: 'right' })
+                    .text('Line Total', col5X, tableTop, { width: 70, align: 'right' });
+
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+
+                let yPos = tableTop + 25;
+
+                // Line Items Table Rows
+                invoice.line_items.forEach((item: any) => {
+                    if (yPos + 20 > doc.page.height - doc.page.margins.bottom) {
+                        doc.addPage();
+                        yPos = doc.page.margins.top;
+                        doc.fontSize(10)
+                            .font('Helvetica-Bold')
+                            .text('Description', col1X, yPos)
+                            .text('Qty', col2X, yPos)
+                            .text('Unit Price', col3X, yPos, { width: 70, align: 'right' })
+                            .text('Tax Rate', col4X, yPos, { width: 60, align: 'right' })
+                            .text('Line Total', col5X, yPos, { width: 70, align: 'right' });
+                        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos + 15).lineTo(550, yPos + 15).stroke();
+                        yPos += 25;
+                    }
+
+                    doc.fontSize(10).font('Helvetica')
+                        .text(item.description, col1X, yPos, { width: 190 })
+                        .text(item.quantity.toString(), col2X, yPos, { width: 40, align: 'right' })
+                        .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, yPos, { width: 70, align: 'right' })
+                        .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, yPos, { width: 60, align: 'right' })
+                        .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, yPos, { width: 70, align: 'right' });
+                    yPos += 20;
+                });
+
+                doc.moveDown();
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos).lineTo(550, yPos).stroke();
+
+                yPos += 10;
+                doc.fontSize(14).font('Helvetica-Bold')
+                    .text(`Total Amount: ${invoice.currency} ${(parseFloat(invoice.total_amount)).toFixed(2)}`, col1X, yPos, { align: 'right', width: 500 });
+
+                if (invoice.notes) {
+                    doc.moveDown(1.5);
+                    doc.fontSize(10).font('Helvetica-Oblique').text(`Notes: ${invoice.notes}`);
+                }
+
+                doc.end();
+                return;
+            }
+
+            case 'statement': {
+                res.setHeader('Content-Type', 'application/pdf');
+                doc.pipe(res);
+                doc.text('Statement generation not fully implemented in this example.', { align: 'center' });
+                doc.end();
+                return;
+            }
+
+            default:
+                res.status(400).json({ error: 'Document type not supported.' });
+                doc.end();
+                return;
+        }
+
+    } catch (error: unknown) {
+        console.error(`Error generating ${documentType}:`, error);
+
+        if (res.headersSent) {
+            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
+            doc.end();
+            return;
+        }
+
+        res.status(500).json({
+            error: `Failed to generate ${documentType}`,
+            details: error instanceof Error ? error.message : String(error)
+        });
+        doc.end();
+        return;
+    }
+});
 app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
     const { documentType, id } = req.params;
     const { startDate, endDate } = req.query;
@@ -1284,253 +1576,7 @@ app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: 
     }
 });
 
-// Define the interface for PDF data again for clarity
-interface QuotationDetailsForPdf {
-    quotation_number: string;
-    customer_name: string;
-    customer_email?: string;
-    customer_address?: string;
-    quotation_date: string;
-    expiry_date?: string;
-    total_amount: number;
-    currency: string;
-    notes?: string;
-    line_items: Array<{
-        product_service_name?: string;
-        description: string;
-        quantity: number;
-        unit_price: number;
-        line_total: number;
-        tax_rate: number;
-    }>;
-    companyName: string;
-    companyAddress?: string;
-    companyVat?: string;
-}
-
-// NOTE: This function was commented out because the TypeScript error indicates it is a redeclaration.
-// Please use the other `formatCurrency` function that exists in your `server.ts` file.
-// const formatCurrency = (amount: number, currency: string) => {
-//     return `${currency} ${amount.toFixed(2)}`;
-// };
-
-// The code now assumes a `formatCurrency` function is available in the scope.
-async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-        const doc = new PDFDocument({ margin: 50 });
-        const buffers: Buffer[] = [];
-
-        doc.on('data', buffers.push.bind(buffers));
-        doc.on('end', () => resolve(Buffer.concat(buffers)));
-        doc.on('error', reject);
-
-        // Header (Company details)
-        doc.fontSize(24).font('Helvetica-Bold').text(quotationData.companyName, { align: 'right' });
-        if (quotationData.companyAddress) {
-            doc.fontSize(10).font('Helvetica').text(quotationData.companyAddress, { align: 'right' });
-        }
-        if (quotationData.companyVat) {
-            doc.fontSize(10).font('Helvetica').text(`VAT No: ${quotationData.companyVat}`, { align: 'right' });
-        }
-        doc.moveDown(1);
-        doc.fontSize(10).text(`Quotation Date: ${new Date(quotationData.quotation_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
-        if (quotationData.expiry_date) {
-            doc.fontSize(10).text(`Expiry Date: ${new Date(quotationData.expiry_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
-        }
-        doc.moveDown(2);
-
-        // Title
-        doc.fontSize(30).font('Helvetica-Bold').text(`QUOTATION #${quotationData.quotation_number}`, { align: 'center' });
-        doc.moveDown(2);
-
-        // Customer Details
-        doc.fontSize(12).font('Helvetica-Bold').text('Quotation For:');
-        doc.fontSize(12).font('Helvetica').text(quotationData.customer_name);
-        if (quotationData.customer_address) {
-            doc.fontSize(10).text(quotationData.customer_address);
-        }
-        if (quotationData.customer_email) {
-            doc.fontSize(10).text(quotationData.customer_email);
-        }
-        doc.moveDown(2);
-
-        // Table Header
-        const tableTop = doc.y;
-        const itemCol = 50;
-        const descCol = 150;
-        const qtyCol = 320;
-        const priceCol = 370;
-        const taxCol = 430;
-        const totalCol = 500;
-
-        doc.font('Helvetica-Bold').fontSize(10);
-        doc.text('Item', itemCol, tableTop);
-        doc.text('Description', descCol, tableTop);
-        doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
-        doc.text('Unit Price', priceCol, tableTop, { width: 50, align: 'right' });
-        doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
-        doc.text('Line Total', totalCol, tableTop, { width: 50, align: 'right' });
-
-        doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
-        doc.moveDown();
-
-        // Table Body
-        doc.font('Helvetica').fontSize(9);
-        let currentY = doc.y;
-        let subtotal = 0;
-        let totalTax = 0;
-
-        quotationData.line_items.forEach(item => {
-            currentY = doc.y;
-            const itemDescription = item.product_service_name || item.description;
-            const taxAmount = (item.line_total * item.tax_rate);
-            const lineTotalExclTax = item.line_total - taxAmount;
-
-            doc.text(itemDescription, itemCol, currentY, { width: 140 });
-            doc.text(item.description, descCol, currentY, { width: 160 });
-            doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
-            doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
-            doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
-            doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
-
-            doc.moveDown();
-            subtotal += lineTotalExclTax;
-            totalTax += taxAmount;
-        });
-
-        // Totals
-        doc.moveDown();
-        const totalsY = doc.y;
-        const totalLabelCol = 400; // Aligned with the totals section
-        const totalValueCol = 500;
-        doc.font('Helvetica-Bold').fontSize(10);
-        
-        // Subtotal
-        doc.text('Subtotal:', totalLabelCol, totalsY, { width: 80, align: 'right' });
-        doc.text(formatCurrency(subtotal, quotationData.currency), totalValueCol, totalsY, { width: 50, align: 'right' });
-        doc.moveDown();
-
-        // Tax
-        doc.text('Tax:', totalLabelCol, doc.y, { width: 80, align: 'right' });
-        doc.text(formatCurrency(totalTax, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
-        doc.moveDown();
-
-        // Total Amount
-        doc.fontSize(14).text('Total Amount:', totalLabelCol, doc.y, { width: 80, align: 'right' });
-        doc.text(formatCurrency(quotationData.total_amount, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
-        doc.moveDown(3);
-
-        // Notes
-        if (quotationData.notes) {
-            doc.fontSize(10).font('Helvetica-Bold').text('Notes:');
-            doc.font('Helvetica').fontSize(10).text(quotationData.notes, { align: 'left' });
-            doc.moveDown(2);
-        }
-
-        // Footer
-        doc.fontSize(10).text(`Thank you for considering our quotation!`, doc.page.width / 2, doc.page.height - 50, {
-            align: 'center',
-            width: doc.page.width - 100,
-        });
-
-        doc.end();
-    });
-}
-
-// --- Specific Quotation PDF generation endpoint (MUST BE BEFORE generic one) ---
-app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
-    const { id } = req.params;
-    const user_id = req.user!.parent_user_id;
-    const doc = new PDFDocument({ margin: 50 });
-
-    try {
-        const quotationQueryResult = await pool.query(
-            `SELECT
-                q.*,
-                c.name AS customer_name,
-                c.email AS customer_email,
-                c.address AS customer_address
-            FROM quotations q
-            JOIN customers c ON q.customer_id = c.id
-            WHERE q.id = $1 AND q.user_id = $2`,
-            [id, user_id]
-        );
-
-        if (quotationQueryResult.rows.length === 0) {
-            res.status(404).json({ error: 'Quotation not found' });
-            doc.end();
-            return;
-        }
-
-        const quotation = quotationQueryResult.rows[0];
-
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="quotation_${quotation.quotation_number}.pdf"`);
-
-        // Fetch user's company information using the correct column name 'company'
-        const userProfileResult = await pool.query(
-            `SELECT company FROM users WHERE user_id = $1`,
-            [user_id]
-        );
-        const userCompany = userProfileResult.rows[0];
-
-        doc.pipe(res);
-
-        // Fetch line items for the quotation
-        const lineItemsResult = await pool.query(
-            `SELECT
-                li.*,
-                ps.name AS product_service_name
-            FROM quotation_line_items li
-            LEFT JOIN products_services ps ON li.product_service_id = ps.id
-            WHERE li.quotation_id = $1
-            ORDER BY li.created_at`,
-            [id]
-        );
-        quotation.line_items = lineItemsResult.rows;
-
-        // --- PDF Content Generation for Quotation (adapt from invoice) ---
-        // Pass the company name from the query result
-        generateQuotationPdf({
-            quotation_number: quotation.quotation_number,
-            customer_name: quotation.customer_name,
-            customer_email: quotation.customer_email,
-            customer_address: quotation.customer_address,
-            quotation_date: quotation.quotation_date,
-            expiry_date: quotation.expiry_date,
-            total_amount: parseFloat(quotation.total_amount),
-            currency: quotation.currency,
-            notes: quotation.notes,
-            line_items: quotation.line_items.map((item: any) => ({
-                product_service_name: item.product_service_name,
-                description: item.description,
-                quantity: parseFloat(item.quantity),
-                unit_price: parseFloat(item.unit_price),
-                line_total: parseFloat(item.line_total),
-                tax_rate: parseFloat(item.tax_rate),
-            })),
-            companyName: userCompany ? userCompany.company : 'Your Company Name',
-            companyAddress: undefined, // These fields don't exist in your DB yet
-            companyVat: undefined,     // These fields don't exist in your DB yet
-        });
-        
-        doc.end();
-    } catch (error: unknown) {
-        console.error(`Error generating quotation PDF:`, error);
-        if (res.headersSent) {
-            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
-            doc.end();
-            return;
-        }
-        res.status(500).json({
-            error: `Failed to generate quotation PDF`,
-            details: error instanceof Error ? error.message : String(error)
-        });
-        doc.end();
-    }
-});
-
-
+// UPDATE the `/api/quotations/:id/send-pdf-email` endpoint
 app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), async (req: Request, res: Response) => {
     const { id } = req.params;
     const { recipientEmail, subject, body } = req.body;
@@ -1559,12 +1605,13 @@ app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), as
         }
         const quotation = quotationQueryResult.rows[0];
 
-        // Fetch user's company information using the correct column name 'company'
+        // Fetch user's company information
         const userProfileResult = await pool.query(
-            `SELECT company FROM users WHERE user_id = $1`,
+            `SELECT company, address, city, province, postal_code, country, phone, email
+             FROM users WHERE user_id = $1`,
             [user_id]
         );
-        const userCompany = userProfileResult.rows[0];
+        const userCompany: UserProfile = userProfileResult.rows[0];
 
         const lineItemsResult = await pool.query(
             `SELECT
@@ -1597,10 +1644,16 @@ app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), as
                 line_total: parseFloat(item.line_total),
                 tax_rate: parseFloat(item.tax_rate),
             })),
-            // The key changes are here:
-            companyName: userCompany ? userCompany.company : 'Your Company Name',
-            companyAddress: undefined, 
-            companyVat: undefined,     
+            companyName: userCompany?.company || 'Your Company Name',
+            companyAddress: userCompany?.address || null,
+            companyCity: userCompany?.city || null,
+            companyProvince: userCompany?.province || null,
+            companyPostalCode: userCompany?.postal_code || null,
+            companyCountry: userCompany?.country || null,
+            companyPhone: userCompany?.phone || null,
+            companyEmail: userCompany?.email || null,
+            companyVat: userCompany?.vat_number || null,
+            companyReg: userCompany?.reg_number || null,
         };
 
         // Generate PDF Buffer using the new function
@@ -1621,6 +1674,11 @@ app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), as
         });
 
         if (emailSent) {
+            // Optional: Update quotation status to 'Sent' in your DB
+            await pool.query(
+                `UPDATE public.quotations SET status = 'Sent', updated_at = CURRENT_TIMESTAMP WHERE id = $1;`,
+                [id]
+            );
             res.status(200).json({ message: 'Email sent successfully!' });
         } else {
             res.status(500).json({ error: 'Failed to send quotation email.' });
@@ -1639,7 +1697,6 @@ app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), as
         }
     }
 });
-
 
 /* --- Transactions API (Fetching) --- */
 app.get('/transactions', authMiddleware, async (req: Request, res: Response) => {
@@ -1970,7 +2027,14 @@ interface InvoiceDetailsForPdf {
     }>;
     companyName: string; // From your .env or DB
     companyAddress?: string | null;
+    companyCity?: string | null; // <-- ADDED THIS
+    companyProvince?: string | null; // <-- ADDED THIS
+    companyPostalCode?: string | null; // <-- ADDED THIS
+    companyCountry?: string | null; // <-- ADDED THIS
+    companyEmail?: string | null;
+    companyPhone?: string | null;
     companyVat?: string | null;
+    companyReg?: string | null;
 }
 
 async function generateInvoicePdf(invoiceData: InvoiceDetailsForPdf): Promise<Buffer> {
@@ -6006,96 +6070,6 @@ const getCurrentAndPreviousDateRanges = () => {
 
 
 // GET Client Count with Change
-// GET Clients Stats
-app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
-    // const user_id = req.user!.parent_user_id; // user_id is not directly used for client table if it doesn't exist
-    const { startDate, endDate } = req.query;
-
-    try {
-        let dateFilter = '';
-        // No user_id parameter for clients table
-        const queryParams: (string | number)[] = []; 
-        let paramIndex = 1; // Start index from 1 since user_id is not the first param
-
-        if (startDate) {
-            dateFilter += ` WHERE created_at >= $${paramIndex++}`; // Use WHERE if first filter
-            queryParams.push(startDate as string);
-        }
-        if (endDate) {
-            dateFilter += startDate ? ` AND created_at <= $${paramIndex++}` : ` WHERE created_at <= $${paramIndex++}`; // Use AND if startDate already used WHERE
-            queryParams.push(endDate as string);
-        }
-
-        // Fetch current count
-        const currentResult = await pool.query(`
-            SELECT COUNT(id) AS count
-            FROM public.clients
-            ${dateFilter};
-        `, queryParams); // Pass the dynamically built queryParams
-        const currentCount = parseInt(currentResult.rows[0]?.count || 0, 10);
-
-        let previousStartDate: string | null = null;
-        let previousEndDate: string | null = null;
-
-        if (startDate && endDate) {
-            const start = new Date(startDate as string);
-            const end = new Date(endDate as string);
-            const durationMs = end.getTime() - start.getTime();
-
-            const prevEnd = new Date(start.getTime() - 1);
-            const prevStart = new Date(prevEnd.getTime() - durationMs);
-
-            previousStartDate = prevStart.toISOString().split('T')[0];
-            previousEndDate = prevEnd.toISOString().split('T')[0];
-        } else if (endDate) {
-            const end = new Date(endDate as string);
-            const prevEnd = new Date(end.getTime() - 1);
-            const prevStart = new Date(prevEnd.getTime() - (30 * 24 * 60 * 60 * 1000));
-            previousStartDate = prevStart.toISOString().split('T')[0];
-            previousEndDate = prevEnd.toISOString().split('T')[0];
-        } else if (startDate) {
-            const start = new Date(startDate as string);
-            const prevStart = new Date(start.getTime() - (30 * 24 * 60 * 60 * 1000));
-            const prevEnd = new Date(start.getTime() - 1);
-            previousStartDate = prevStart.toISOString().split('T')[0];
-            previousEndDate = prevEnd.toISOString().split('T')[0];
-        }
-
-        let previousDateFilter = '';
-        const previousQueryParams: (string | number)[] = []; // No user_id for previous query either
-        let prevParamIndex = 1;
-
-        if (previousStartDate) {
-            previousDateFilter += ` WHERE created_at >= $${prevParamIndex++}`;
-            previousQueryParams.push(previousStartDate);
-        }
-        if (previousEndDate) {
-            previousDateFilter += previousStartDate ? ` AND created_at <= $${prevParamIndex++}` : ` WHERE created_at <= $${prevParamIndex++}`;
-            previousQueryParams.push(previousEndDate);
-        }
-        
-        const previousResult = await pool.query(`
-            SELECT COUNT(id) AS count
-            FROM public.clients
-            ${previousDateFilter};
-        `, previousQueryParams);
-        const previousCount = parseInt(previousResult.rows[0]?.count || 0, 10);
-
-        const { changePercentage, changeType } = calculateChange(currentCount, previousCount);
-
-        res.json({
-            count: currentCount,
-            previousCount: previousCount,
-            changePercentage,
-            changeType,
-        });
-
-    } catch (error: unknown) {
-        console.error('Error fetching client stats:', error);
-        res.status(500).json({ error: 'Failed to fetch client stats', detail: error instanceof Error ? error.message : String(error) });
-    }
-});
-
 // GET Quotes Stats
 app.get('/api/stats/quotes', authMiddleware, async (req: Request, res: Response) => {
     const user_id = req.user!.parent_user_id;
@@ -6368,70 +6342,85 @@ const formatMonth = (date: Date) => {
 
 // GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
 // GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
+// GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
 app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id; // Get user_id from req.user
-    const { startDate, endDate } = req.query; // Extract startDate and endDate from query parameters
+    // Get the authenticated user's parent_user_id from the request object
+    const user_id = req.user!.parent_user_id;
+
+    // Extract startDate and endDate from query parameters, if provided
+    const { startDate, endDate } = req.query;
 
     try {
-        let invoiceDateFilter = '';
-        let expenseDateFilter = '';
-        const queryParams: (string | number)[] = [user_id]; // Initialize parameters with user_id
-        let paramIndex = 2; // Start index for additional parameters
+        // --- Revenue Transactions Query Construction ---
+        // This filter will be applied to transactions identified as revenue
+        let revenueDateFilter = '';
+        const revenueQueryParams: (string | number)[] = [user_id]; // Parameters specific to the revenue transaction query
+        let revenueParamIndex = 2; // Start index for additional parameters for revenue
 
-        // Construct date filter for invoices
         if (startDate) {
-            invoiceDateFilter += ` AND created_at >= $${paramIndex++}`;
-            queryParams.push(startDate as string);
+            revenueDateFilter += ` AND date >= $${revenueParamIndex++}`;
+            revenueQueryParams.push(startDate as string);
         }
         if (endDate) {
-            invoiceDateFilter += ` AND created_at <= $${paramIndex++}`;
-            queryParams.push(endDate as string);
+            revenueDateFilter += ` AND date <= $${revenueParamIndex++}`;
+            revenueQueryParams.push(endDate as string);
         }
 
-        // Reset paramIndex for expenses query if necessary, or just continue
-        // For simplicity and clarity, we'll re-calculate paramIndex based on queryParams length
-        const expenseQueryParams: (string | number)[] = [user_id];
-        let expenseParamIndex = 2;
+        // --- Expense Transactions Query Construction ---
+        // This filter will be applied to transactions identified as expenses
+        let expenseDateFilter = '';
+        const expenseQueryParams: (string | number)[] = [user_id]; // Parameters specific to the expense transaction query
+        let expenseParamIndex = 2; // Start index for additional parameters for expenses
 
-        // Construct date filter for expenses
         if (startDate) {
-            expenseDateFilter += ` AND date >= $${expenseParamIndex++}`; // Assuming 'date' column for expenses
+            expenseDateFilter += ` AND date >= $${expenseParamIndex++}`;
             expenseQueryParams.push(startDate as string);
         }
         if (endDate) {
-            expenseDateFilter += ` AND date <= $${expenseParamIndex++}`; // Assuming 'date' column for expenses
+            expenseDateFilter += ` AND date <= $${expenseParamIndex++}`;
             expenseQueryParams.push(endDate as string);
         }
 
-
-        // Fetch invoice revenue by month with date filtering
-        const invoicesResult = await pool.query(`
+        // Fetch revenue from public.transactions by month with date and category filtering
+        // Assuming 'type' for revenue transactions is 'income' or similar.
+        // If your revenue transactions don't have a specific 'type', you can remove `AND type = 'income'`.
+        const revenueTransactionsResult = await pool.query(`
             SELECT
-                TO_CHAR(created_at, 'YYYY-MM') AS month,
-                COALESCE(SUM(total_amount), 0) AS revenue
-            FROM public.invoices
-            WHERE user_id = $1 ${invoiceDateFilter}
+                TO_CHAR(date, 'YYYY-MM') AS month,
+                COALESCE(SUM(amount), 0) AS revenue
+            FROM public.transactions
+            WHERE
+                user_id = $1
+                AND type = 'income' -- Adjust or remove if 'type' is not used for revenue
+                AND category IN ('Revenue', 'Sales Revenue')
+                ${revenueDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, queryParams); // Pass the dynamically built queryParams
+        `, revenueQueryParams);
 
-        // Fetch expenses by month with date filtering
+        // Fetch expenses from public.transactions by month with date filtering
         const expensesResult = await pool.query(`
             SELECT
                 TO_CHAR(date, 'YYYY-MM') AS month,
                 COALESCE(SUM(amount), 0) AS expenses
             FROM public.transactions
-            WHERE type = 'expense' AND user_id = $1 ${expenseDateFilter}
+            WHERE
+                type = 'expense'
+                AND user_id = $1
+                ${expenseDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, expenseQueryParams); // Pass the dynamically built expenseQueryParams
+        `, expenseQueryParams);
 
+        // --- Data Aggregation and Transformation ---
         const revenueMap = new Map<string, { revenue: number, expenses: number }>();
 
-        invoicesResult.rows.forEach(row => {
+        // Populate revenue from transactions
+        revenueTransactionsResult.rows.forEach(row => {
             revenueMap.set(row.month, { revenue: parseFloat(row.revenue), expenses: 0 });
         });
 
+        // Add expenses, or create new entry if only expenses exist for a month
         expensesResult.rows.forEach(row => {
             if (revenueMap.has(row.month)) {
                 const existing = revenueMap.get(row.month)!;
@@ -6441,26 +6430,33 @@ app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: R
             }
         });
 
+        // Calculate profit and format data for response
         const monthlyData: { month: string; profit: number; expenses: number; revenue: number }[] = [];
-        const sortedMonths = Array.from(revenueMap.keys()).sort();
+        const sortedMonths = Array.from(revenueMap.keys()).sort(); // Ensure data is sorted by month
 
         sortedMonths.forEach(month => {
             const data = revenueMap.get(month)!;
             const profit = data.revenue - data.expenses;
             monthlyData.push({
                 month,
-                profit: parseFloat(profit.toFixed(2)),
+                profit: parseFloat(profit.toFixed(2)), // Format to 2 decimal places
                 expenses: parseFloat(data.expenses.toFixed(2)),
                 revenue: parseFloat(data.revenue.toFixed(2))
             });
         });
 
+        // Send the aggregated and formatted monthly data as a JSON response
         res.json(monthlyData);
     } catch (error: unknown) {
+        // Log the error and send a 500 internal server error response
         console.error('Error fetching revenue trend data:', error);
-        res.status(500).json({ error: 'Failed to fetch revenue trend data', detail: error instanceof Error ? error.message : String(error) });
+        res.status(500).json({
+            error: 'Failed to fetch revenue trend data',
+            detail: error instanceof Error ? error.message : String(error)
+        });
     }
 });
+
 
 
 
@@ -9399,72 +9395,119 @@ app.get('/api/charts/sales-expenses-sunburst', authMiddleware, async (req: Reque
     const { startDate, endDate } = req.query;
 
     try {
+        // Shared date filter parameters, applied to the 'date' column in transactions
         let dateFilter = '';
-        const queryParams: (string | number)[] = [user_id];
-        let paramIndex = 2;
+        const sharedQueryParams: (string | number)[] = [user_id];
+        let paramIndex = 2; // Start index for additional parameters
 
         if (startDate) {
-            dateFilter += ` AND created_at >= $${paramIndex++}`;
-            queryParams.push(startDate as string);
+            dateFilter += ` AND date >= $${paramIndex++}`; // Use 'date' column for filtering
+            sharedQueryParams.push(startDate as string);
         }
         if (endDate) {
-            dateFilter += ` AND created_at <= $${paramIndex++}`;
-            queryParams.push(endDate as string);
+            dateFilter += ` AND date <= $${paramIndex++}`; // Use 'date' column for filtering
+            sharedQueryParams.push(endDate as string);
         }
 
-        // Fetch Sales (from invoices)
-        const salesResult = await pool.query(`
-            SELECT COALESCE(SUM(total_amount), 0) AS total_sales
-            FROM public.invoices
-            WHERE user_id = $1 ${dateFilter};
-        `, queryParams);
-        const totalSales = parseFloat(salesResult.rows[0]?.total_sales || 0);
-
-        // Fetch Expenses (from transactions table with type 'expense')
-        const expensesResult = await pool.query(`
-            SELECT COALESCE(SUM(amount), 0) AS total_expenses
+        // Fetch Revenue from public.transactions, categorized
+        const revenueCategoriesResult = await pool.query(`
+            SELECT
+                category,
+                COALESCE(SUM(amount), 0) AS value
             FROM public.transactions
-            WHERE type = 'expense' AND user_id = $1 ${dateFilter};
-        `, queryParams); // Re-use queryParams if created_at is same column, otherwise adjust paramIndex
-        const totalExpenses = parseFloat(expensesResult.rows[0]?.total_expenses || 0);
+            WHERE
+                user_id = $1
+                AND type = 'income' -- Assuming 'income' type for revenue
+                AND category IN ('Revenue', 'Sales Revenue') -- Specific categories for sales/revenue
+                ${dateFilter}
+            GROUP BY category;
+        `, sharedQueryParams);
 
-        // Placeholder for "What What" or "Other Income/Categories"
-        // This query needs to be adapted to your actual database schema
-        // For demonstration, let's assume 'other_income' table or a specific 'type' in transactions
-        // Example: Fetching 'other_income' from a transactions table
-        const otherIncomeResult = await pool.query(`
-            SELECT COALESCE(SUM(amount), 0) AS other_value
+        // Fetch Expenses from public.transactions, categorized
+        const expenseCategoriesResult = await pool.query(`
+            SELECT
+                category,
+                COALESCE(SUM(amount), 0) AS value
             FROM public.transactions
-            WHERE type = 'other_income' AND user_id = $1 ${dateFilter};
-        `, queryParams);
-        const otherValue = parseFloat(otherIncomeResult.rows[0]?.other_value || 0);
+            WHERE
+                user_id = $1
+                AND type = 'expense' -- Assuming 'expense' type for expenses
+                ${dateFilter}
+            GROUP BY category;
+        `, sharedQueryParams);
 
-        // Construct Sunburst Data
-        const sunburstData = [
-            // Top level node
-            { id: 'total', name: 'Financial Overview', value: totalSales + totalExpenses + otherValue },
+        // Fetch Other Income from public.transactions, categorized
+        // This will capture any income not explicitly tagged as 'Revenue' or 'Sales Revenue'
+        const otherIncomeCategoriesResult = await pool.query(`
+            SELECT
+                category,
+                COALESCE(SUM(amount), 0) AS value
+            FROM public.transactions
+            WHERE
+                user_id = $1
+                AND type = 'income'
+                AND category NOT IN ('Revenue', 'Sales Revenue')
+                ${dateFilter}
+            GROUP BY category;
+        `, sharedQueryParams);
 
-            // Second level: Main Categories
-            { id: 'sales', parent: 'total', name: 'Sales', value: totalSales, color: '#4CAF50' }, // Green for Sales
-            { id: 'expenses', parent: 'total', name: 'Expenses', value: totalExpenses, color: '#F44336' }, // Red for Expenses
-            { id: 'other', parent: 'total', name: 'Other', value: otherValue, color: '#FFC107' }, // Amber for Other
+        let totalSales = 0;
+        let totalExpenses = 0;
+        let totalOtherIncome = 0;
 
-            // Example of third level (you'll need to expand this based on your sub-categories)
-            // Sales Sub-categories (Example)
-            { id: 'product-sales', parent: 'sales', name: 'Product Sales', value: totalSales * 0.7 },
-            { id: 'service-sales', parent: 'sales', name: 'Service Sales', value: totalSales * 0.3 },
+        const sunburstData: { id: string; parent?: string; name: string; value?: number; color?: string; }[] = [];
 
-            // Expenses Sub-categories (Example - assuming you have expense categories)
-            // You would fetch these from your 'transactions' table with more specific types or categories
-            { id: 'rent-exp', parent: 'expenses', name: 'Rent', value: totalExpenses * 0.3 },
-            { id: 'salaries-exp', parent: 'expenses', name: 'Salaries', value: totalExpenses * 0.4 },
-            { id: 'utilities-exp', parent: 'expenses', name: 'Utilities', value: totalExpenses * 0.2 },
-            { id: 'misc-exp', parent: 'expenses', name: 'Miscellaneous', value: totalExpenses * 0.1 },
+        // Add top-level nodes for 'Revenue', 'Expenses', 'Other Income'
+        sunburstData.push({ id: 'revenue-parent', parent: 'total', name: 'Revenue', color: '#4CAF50' }); // Green for Revenue
+        sunburstData.push({ id: 'expenses-parent', parent: 'total', name: 'Expenses', color: '#F44336' }); // Red for Expenses
+        sunburstData.push({ id: 'other-income-parent', parent: 'total', name: 'Other Income', color: '#FFC107' }); // Amber for Other Income
 
-            // Other Sub-categories (Example)
-            { id: 'interest-inc', parent: 'other', name: 'Interest Income', value: otherValue * 0.6 },
-            { id: 'misc-inc', parent: 'other', name: 'Other Income', value: otherValue * 0.4 }
-        ];
+        // Process Revenue Categories
+        revenueCategoriesResult.rows.forEach(row => {
+            const value = parseFloat(row.value);
+            if (value > 0) { // Only include categories with actual value
+                totalSales += value;
+                sunburstData.push({
+                    id: `revenue-${row.category.toLowerCase().replace(/\s/g, '-')}`,
+                    parent: 'revenue-parent',
+                    name: row.category,
+                    value: value
+                });
+            }
+        });
+
+        // Process Expense Categories
+        expenseCategoriesResult.rows.forEach(row => {
+            const value = parseFloat(row.value);
+            if (value > 0) { // Only include categories with actual value
+                totalExpenses += value;
+                sunburstData.push({
+                    id: `expense-${row.category.toLowerCase().replace(/\s/g, '-')}`,
+                    parent: 'expenses-parent',
+                    name: row.category,
+                    value: value
+                });
+            }
+        });
+
+        // Process Other Income Categories
+        otherIncomeCategoriesResult.rows.forEach(row => {
+            const value = parseFloat(row.value);
+            if (value > 0) { // Only include categories with actual value
+                totalOtherIncome += value;
+                sunburstData.push({
+                    id: `other-income-${row.category.toLowerCase().replace(/\s/g, '-')}`,
+                    parent: 'other-income-parent',
+                    name: row.category,
+                    value: value
+                });
+            }
+        });
+
+        // Add the overall 'total' node after calculating sums
+        const overallTotal = totalSales + totalExpenses + totalOtherIncome;
+        sunburstData.unshift({ id: 'total', name: 'Financial Overview', value: overallTotal });
+
 
         res.json(sunburstData);
 
@@ -9473,6 +9516,265 @@ app.get('/api/charts/sales-expenses-sunburst', authMiddleware, async (req: Reque
         res.status(500).json({ error: 'Failed to fetch sunburst data', detail: error instanceof Error ? error.message : String(error) });
     }
 });
+
+// Helper function to calculate previous period dates based on the current period
+const getPreviousPeriodDates = (startDateStr: string, endDateStr: string) => {
+    const startDate = new Date(startDateStr);
+    const endDate = new Date(endDateStr);
+
+    // Calculate the duration of the current period in milliseconds
+    const periodDurationMs = endDate.getTime() - startDate.getTime();
+
+    // The previous period's end date is the day before the current period's start date
+    const prevEndDate = new Date(startDate);
+    prevEndDate.setDate(startDate.getDate() - 1);
+
+    // The previous period's start date is `periodDurationMs` before the prevEndDate
+    const prevStartDate = new Date(prevEndDate.getTime() - periodDurationMs);
+
+    return {
+        prevStartDate: prevStartDate.toISOString().split('T')[0],
+        prevEndDate: prevEndDate.toISOString().split('T')[0],
+    };
+};
+
+// NEW ENDPOINT: GET Revenue Statistics for a period (or all time)
+app.get('/api/stats/revenue', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodValue = 0;
+        let previousPeriodValue = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause
+        if (startDate && endDate) {
+            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period revenue (or all-time if no dates provided)
+        const currentRevenueResult = await pool.query(`
+            SELECT COALESCE(SUM(amount), 0) AS value
+            FROM public.transactions
+            WHERE
+                user_id = $1
+                AND type = 'income'
+                AND category IN ('Revenue', 'Sales Revenue')
+                ${dateFilterClause};
+        `, currentQueryParams);
+
+        currentPeriodValue = parseFloat(currentRevenueResult.rows[0]?.value || 0);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period revenue
+            const previousRevenueResult = await pool.query(`
+                SELECT COALESCE(SUM(amount), 0) AS value
+                FROM public.transactions
+                WHERE
+                    user_id = $1
+                    AND type = 'income'
+                    AND category IN ('Revenue', 'Sales Revenue')
+                    AND date BETWEEN $2 AND $3;
+            `, previousQueryParams);
+
+            previousPeriodValue = parseFloat(previousRevenueResult.rows[0]?.value || 0);
+
+            // Calculate change percentage
+            if (previousPeriodValue !== 0) {
+                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
+                if (changePercentage > 0) {
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodValue > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            value: currentPeriodValue,
+            previousValue: previousPeriodValue,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching revenue stats:', error);
+        res.status(500).json({ error: 'Failed to fetch revenue statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// NEW ENDPOINT: GET Expenses Statistics for a period (or all time)
+app.get('/api/stats/expenses', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodValue = 0;
+        let previousPeriodValue = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause
+        if (startDate && endDate) {
+            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period expenses (or all-time if no dates provided)
+        const currentExpensesResult = await pool.query(`
+            SELECT COALESCE(SUM(amount), 0) AS value
+            FROM public.transactions
+            WHERE
+                user_id = $1
+                AND type = 'expense'
+                ${dateFilterClause};
+        `, currentQueryParams);
+
+        currentPeriodValue = parseFloat(currentExpensesResult.rows[0]?.value || 0);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period expenses
+            const previousExpensesResult = await pool.query(`
+                SELECT COALESCE(SUM(amount), 0) AS value
+                FROM public.transactions
+                WHERE
+                    user_id = $1
+                    AND type = 'expense'
+                    AND date BETWEEN $2 AND $3;
+            `, previousQueryParams);
+
+            previousPeriodValue = parseFloat(previousExpensesResult.rows[0]?.value || 0);
+
+            // Calculate change percentage
+            if (previousPeriodValue !== 0) {
+                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
+                if (changePercentage > 0) { // For expenses, an increase is often seen as a negative trend
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodValue > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            value: currentPeriodValue,
+            previousValue: previousPeriodValue,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching expenses stats:', error);
+        res.status(500).json({ error: 'Failed to fetch expenses statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// Existing /api/stats/clients endpoint, modified to allow all-time view and use public.sales
+app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodCount = 0;
+        let previousPeriodCount = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause for 'created_at'
+        if (startDate && endDate) {
+            dateFilterClause = ` AND created_at BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period client count (or all-time if no dates provided)
+        // Now counting distinct customer_id from public.sales table
+        const currentClientsResult = await pool.query(`
+            SELECT COUNT(DISTINCT customer_id) AS count
+            FROM public.sales
+            WHERE user_id = $1
+            ${dateFilterClause};
+        `, currentQueryParams);
+        currentPeriodCount = parseInt(currentClientsResult.rows[0]?.count || 0, 10);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period client count
+            // Now counting distinct customer_id from public.sales table
+            const previousClientsResult = await pool.query(`
+                SELECT COUNT(DISTINCT customer_id) AS count
+                FROM public.sales
+                WHERE user_id = $1
+                AND created_at BETWEEN $2 AND $3;
+            `, previousQueryParams);
+            previousPeriodCount = parseInt(previousClientsResult.rows[0]?.count || 0, 10);
+
+            // Calculate change percentage
+            if (previousPeriodCount !== 0) {
+                changePercentage = ((currentPeriodCount - previousPeriodCount) / previousPeriodCount) * 100;
+                if (changePercentage > 0) {
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodCount > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            count: currentPeriodCount,
+            previousCount: previousPeriodCount,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching client stats:', error);
+        res.status(500).json({ error: 'Failed to fetch client statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+
+
 
 // In your main server file (e.g., server.ts or routes/customers.ts)
 
