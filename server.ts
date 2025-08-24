@@ -876,6 +876,7 @@ interface QuotationDetailsForPdf {
     companyReg?: string | null;
     companyPhone?: string | null;
     companyEmail?: string | null;
+    companyLogoUrl?: string | null;
 }
 
 
@@ -8455,23 +8456,7 @@ app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
 
 // Profile endpoints
 // GET /api/profile
-app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const userId = req.user?.user_id;
-    if (!userId) return res.status(401).json({ error: 'User not authenticated.' });
 
-    const result = await pool.query('SELECT * FROM public.users WHERE user_id = $1', [userId]);
-
-    if (result.rows.length > 0) {
-      res.status(200).json(result.rows[0]);
-    } else {
-      res.status(404).json({ error: 'Profile not found.' });
-    }
-  } catch (error) {
-    console.error('Error fetching user profile:', error);
-    res.status(500).json({ error: 'Failed to fetch user profile.' });
-  }
-});
 
 
 
@@ -9773,8 +9758,203 @@ app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response
     }
 });
 
+const logoBucket = 'company-logos';
+const uploadLogo = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
+// POST /upload-logo
+app.post('/upload-logo', authMiddleware, uploadLogo.single('logo'), async (req: Request, res: Response) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded.' });
+  }
 
+  const user_id = req.user!.user_id;
+  const uniqueFileName = `${user_id}/${Date.now()}_${req.file.originalname}`;
 
+  try {
+    const { data, error: uploadError } = await supabase.storage
+      .from(logoBucket)
+      .upload(uniqueFileName, req.file.buffer, {
+        cacheControl: '3600',
+        upsert: true,
+        contentType: req.file.mimetype,
+        duplex: 'half',
+      });
+
+    if (uploadError) {
+      console.error('Supabase upload error:', uploadError);
+      return res.status(500).json({ error: 'Failed to upload logo.' });
+    }
+
+    // Persist on users row
+    await pool.query(
+      `UPDATE public.users
+         SET company_logo_bucket = $1,
+             company_logo_path   = $2,
+             company_logo_mime   = $3,
+             company_logo_updated_at = NOW()
+       WHERE user_id = $4`,
+      [logoBucket, data!.path, req.file.mimetype, user_id]
+    );
+
+    // Match your documents upload response shape
+    res.status(201).json({
+      message: 'Logo uploaded successfully!',
+      filePath: data!.path,
+    });
+  } catch (error) {
+    console.error('Unexpected error (logo upload):', error);
+    // Best effort cleanup if we already uploaded
+    if (uniqueFileName) {
+      await supabase.storage.from(logoBucket).remove([uniqueFileName]);
+    }
+    res.status(500).json({ error: 'An unexpected error occurred while uploading the logo.' });
+  }
+});
+
+// GET /logo  → returns { url } (signed for 1 hour)
+app.get('/logo', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.user_id;
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT company_logo_path
+         FROM public.users
+        WHERE user_id = $1
+        LIMIT 1`,
+      [user_id]
+    );
+
+    const filePath = rows?.[0]?.company_logo_path || null;
+    if (!filePath) {
+      return res.status(200).json({ url: null });
+    }
+
+    const { data, error } = await supabase.storage
+      .from(logoBucket)
+      .createSignedUrl(filePath, 3600); // 1 hour
+
+    if (error) {
+      console.error('Error creating signed URL:', error);
+      return res.status(500).json({ error: 'Failed to generate logo URL.' });
+    }
+
+    return res.status(200).json({ url: data.signedUrl });
+  } catch (error) {
+    console.error('Error fetching logo:', error);
+    res.status(500).json({ error: 'Failed to fetch logo.' });
+  }
+});
+
+// GET /logo/download  → redirect to signed URL (like /documents/:id/download)
+app.get('/logo/download', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.user_id;
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT company_logo_path
+         FROM public.users
+        WHERE user_id = $1
+        LIMIT 1`,
+      [user_id]
+    );
+
+    if (!rows.length || !rows[0].company_logo_path) {
+      return res.status(404).json({ error: 'Logo not found.' });
+    }
+
+    const filePath = rows[0].company_logo_path;
+
+    const { data, error } = await supabase.storage
+      .from(logoBucket)
+      .createSignedUrl(filePath, 3600);
+
+    if (error) {
+      console.error('Error creating signed URL:', error);
+      return res.status(500).json({ error: 'Failed to generate download link.' });
+    }
+
+    return res.redirect(data.signedUrl);
+  } catch (error) {
+    console.error('Error during logo download:', error);
+    res.status(500).json({ error: 'Failed to process download request.' });
+  }
+});
+
+// DELETE /logo  → delete from storage, then clear columns
+app.delete('/logo', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.user_id;
+
+  try {
+    // 1) Fetch current path
+    const { rows } = await pool.query(
+      `SELECT company_logo_path
+         FROM public.users
+        WHERE user_id = $1
+        LIMIT 1`,
+      [user_id]
+    );
+
+    if (!rows.length || !rows[0].company_logo_path) {
+      return res.status(204).send(); // nothing to delete
+    }
+
+    const filePath = rows[0].company_logo_path;
+
+    // 2) Remove from storage first (so we only clear DB if storage succeeded)
+    const { error: storageError } = await supabase.storage.from(logoBucket).remove([filePath]);
+    if (storageError) {
+      console.error('Supabase storage deletion error (logo):', storageError);
+      return res.status(500).json({ error: 'Failed to delete logo from storage.' });
+    }
+
+    // 3) Clear DB columns
+    await pool.query(
+      `UPDATE public.users
+          SET company_logo_path = NULL,
+              company_logo_mime = NULL,
+              company_logo_updated_at = NULL
+        WHERE user_id = $1`,
+      [user_id]
+    );
+
+    return res.status(204).send();
+  } catch (error) {
+    console.error('Error deleting logo:', error);
+    res.status(500).json({ error: 'Failed to delete logo.' });
+  }
+});
+
+app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+
+    try {
+        const { rows } = await pool.query(
+            `SELECT company, email, address, city, province, postal_code, country, phone, vat_number, reg_number, company_logo_path
+             FROM public.users
+             WHERE user_id = $1`,
+            [user_id]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({ message: 'User profile not found.' });
+        }
+
+        const userProfile = rows[0];
+
+        // NEW: Get the public URL for the company logo if a path exists
+        let companyLogoUrl = null;
+        if (userProfile.company_logo_path) {
+            const { data } = supabase.storage.from('company_logos').getPublicUrl(userProfile.company_logo_path);
+            companyLogoUrl = data.publicUrl;
+        }
+
+        // Return the user profile along with the logo URL
+        res.status(200).json({ ...userProfile, company_logo_url: companyLogoUrl });
+
+    } catch (error) {
+        console.error('Error fetching user profile:', error);
+        res.status(500).json({ error: 'Failed to fetch user profile.' });
+    }
+});
 
 // In your main server file (e.g., server.ts or routes/customers.ts)
 
