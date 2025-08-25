@@ -10,7 +10,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
-
+import axios from 'axios';
 import express, { Request, Response, NextFunction } from 'express';
 
 const app = express();
@@ -885,136 +885,7 @@ interface QuotationDetailsForPdf {
 
 
 // --- Specific Quotation PDF generation endpoint (MUST BE BEFORE generic one) ---
-app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
-    const { id } = req.params;
-    const user_id = req.user!.parent_user_id;
-    const doc = new PDFDocument({ margin: 50 });
 
-    try {
-        const quotationQueryResult = await pool.query(
-            `SELECT
-                q.*,
-                c.name AS customer_name,
-                c.email AS customer_email
-            FROM quotations q
-            JOIN customers c ON q.customer_id = c.id
-            WHERE q.id = $1 AND q.user_id = $2`,
-            [id, user_id]
-        );
-
-        if (quotationQueryResult.rows.length === 0) {
-            res.status(404).json({ error: 'Quotation not found' });
-            doc.end();
-            return;
-        }
-
-        const quotation = quotationQueryResult.rows[0];
-
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="quotation_${quotation.quotation_number}.pdf"`);
-
-        doc.pipe(res);
-
-        // Fetch line items for the quotation
-        const lineItemsResult = await pool.query(
-            `SELECT
-                li.*,
-                ps.name AS product_service_name
-            FROM quotation_line_items li
-            LEFT JOIN products_services ps ON li.product_service_id = ps.id
-            WHERE li.quotation_id = $1
-            ORDER BY li.created_at`,
-            [id]
-        );
-        quotation.line_items = lineItemsResult.rows;
-
-        // --- PDF Content Generation for Quotation (adapt from invoice) ---
-        doc.fontSize(24).font('Helvetica-Bold').text('Quotation', { align: 'center' });
-        doc.moveDown(1.5);
-
-        doc.fontSize(12).font('Helvetica-Bold').text('Quotation Details:', { underline: true });
-        doc.font('Helvetica')
-            .text(`Quotation Number: ${quotation.quotation_number}`)
-            .text(`Customer: ${quotation.customer_name}`)
-            .text(`Quotation Date: ${new Date(quotation.quotation_date).toLocaleDateString('en-GB')}`)
-            .text(`Expiry Date: ${quotation.expiry_date ? new Date(quotation.expiry_date).toLocaleDateString('en-GB') : 'N/A'}`);
-        doc.moveDown(1.5);
-
-        doc.fontSize(14).font('Helvetica-Bold').text('Line Items:', { underline: true });
-        doc.moveDown(0.5);
-
-        // Table Headers (adjust columns as per quotation_line_items schema)
-        const tableTop = doc.y;
-        const col1X = 50;
-        const col2X = 250;
-        const col3X = 300;
-        const col4X = 400;
-        const col5X = 470;
-
-        doc.fontSize(10)
-            .font('Helvetica-Bold')
-            .text('Description', col1X, tableTop)
-            .text('Qty', col2X, tableTop)
-            .text('Unit Price', col3X, tableTop, { width: 70, align: 'right' })
-            .text('Tax Rate', col4X, tableTop, { width: 60, align: 'right' })
-            .text('Line Total', col5X, tableTop, { width: 70, align: 'right' });
-
-        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
-
-        let yPos = tableTop + 25;
-
-        // Line Items Table Rows
-        quotation.line_items.forEach((item: any) => {
-            if (yPos + 20 > doc.page.height - doc.page.margins.bottom) {
-                doc.addPage();
-                yPos = doc.page.margins.top;
-                doc.fontSize(10)
-                    .font('Helvetica-Bold')
-                    .text('Description', col1X, yPos)
-                    .text('Qty', col2X, yPos)
-                    .text('Unit Price', col3X, yPos, { width: 70, align: 'right' })
-                    .text('Tax Rate', col4X, yPos, { width: 60, align: 'right' })
-                    .text('Line Total', col5X, yPos, { width: 70, align: 'right' });
-                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos + 15).lineTo(550, yPos + 15).stroke();
-                yPos += 25;
-            }
-
-            doc.fontSize(10).font('Helvetica')
-                .text(item.description, col1X, yPos, { width: 190 })
-                .text(item.quantity.toString(), col2X, yPos, { width: 40, align: 'right' })
-                .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, yPos, { width: 70, align: 'right' })
-                .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, yPos, { width: 60, align: 'right' })
-                .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, yPos, { width: 70, align: 'right' });
-            yPos += 20;
-        });
-
-        doc.moveDown();
-        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos).lineTo(550, yPos).stroke();
-
-        yPos += 10;
-        doc.fontSize(14).font('Helvetica-Bold')
-            .text(`Total Amount: ${quotation.currency} ${(parseFloat(quotation.total_amount)).toFixed(2)}`, col1X, yPos, { align: 'right', width: 500 });
-
-        if (quotation.notes) {
-            doc.moveDown(1.5);
-            doc.fontSize(10).font('Helvetica-Oblique').text(`Notes: ${quotation.notes}`);
-        }
-
-        doc.end();
-    } catch (error: unknown) {
-        console.error(`Error generating quotation PDF:`, error);
-        if (res.headersSent) {
-            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
-            doc.end();
-            return;
-        }
-        res.status(500).json({
-            error: `Failed to generate quotation PDF`,
-            details: error instanceof Error ? error.message : String(error)
-        });
-        doc.end();
-    }
-});
 
 
 // Generic PDF generation endpoint for invoices and statements
@@ -1031,51 +902,70 @@ app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Res
 // Function to generate the Quotation PDF
 // Function to generate the Quotation PDF
 async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-        const doc = new (PDFDocument as any)({ margin: 50 }); // Cast to any to avoid type issues with new PDFDocument
+    return new Promise(async (resolve, reject) => {
+        const doc = new PDFDocument({ margin: 50 });
         const buffers: Buffer[] = [];
 
         doc.on('data', buffers.push.bind(buffers));
         doc.on('end', () => resolve(Buffer.concat(buffers)));
         doc.on('error', reject);
 
-        // Header (Company details)
-        doc.fontSize(24).font('Helvetica-Bold').text(quotationData.companyName, { align: 'right' });
-        if (quotationData.companyAddress) {
-            doc.fontSize(10).font('Helvetica').text(quotationData.companyAddress, { align: 'right' });
+        // --- Header Section ---
+        let companyLogoBuffer: Buffer | null = null;
+        let logoWidth = 120;
+        const logoX = doc.page.width - doc.page.margins.right - logoWidth;
+
+        if (quotationData.companyLogoUrl) {
+            try {
+                const logoResponse = await axios.get(quotationData.companyLogoUrl, { responseType: 'arraybuffer' });
+                companyLogoBuffer = Buffer.from(logoResponse.data, 'binary');
+                doc.image(companyLogoBuffer, logoX, 50, { width: logoWidth });
+            } catch (error) {
+                console.error('Failed to fetch company logo for PDF:', error);
+                // Continue generating PDF without the logo if fetch fails
+            }
         }
-        // Corrected logic to build addressLine2 using the newly added properties
+        
+        // Company details - placed on the top-left side
+        const companyDetailsY = 50;
+        doc.fontSize(14).font('Helvetica-Bold').text(quotationData.companyName, 50, companyDetailsY);
+        doc.moveDown(0.5);
+
+        if (quotationData.companyAddress) {
+            doc.fontSize(10).font('Helvetica').text(quotationData.companyAddress);
+        }
         if (quotationData.companyCity || quotationData.companyProvince || quotationData.companyPostalCode || quotationData.companyCountry) {
             const addressLine2 = [quotationData.companyCity, quotationData.companyProvince, quotationData.companyPostalCode, quotationData.companyCountry]
                 .filter(Boolean)
                 .join(', ');
-            doc.fontSize(10).font('Helvetica').text(addressLine2, { align: 'right' });
+            doc.text(addressLine2);
         }
         if (quotationData.companyPhone) {
-            doc.fontSize(10).font('Helvetica').text(`Phone: ${quotationData.companyPhone}`, { align: 'right' });
+            doc.text(`Phone: ${quotationData.companyPhone}`);
         }
         if (quotationData.companyEmail) {
-            doc.fontSize(10).font('Helvetica').text(`Email: ${quotationData.companyEmail}`, { align: 'right' });
+            doc.text(`Email: ${quotationData.companyEmail}`);
         }
         if (quotationData.companyVat) {
-            doc.fontSize(10).font('Helvetica').text(`VAT No: ${quotationData.companyVat}`, { align: 'right' });
+            doc.text(`VAT No: ${quotationData.companyVat}`);
         }
         if (quotationData.companyReg) {
-            doc.fontSize(10).font('Helvetica').text(`Reg No: ${quotationData.companyReg}`, { align: 'right' });
+            doc.text(`Reg No: ${quotationData.companyReg}`);
         }
 
+        doc.moveDown(2);
+
+        // --- Quotation Details and Title ---
+        doc.fontSize(30).font('Helvetica-Bold').text(`QUOTATION`, { align: 'center' });
         doc.moveDown(1);
-        doc.fontSize(10).text(`Quotation Date: ${new Date(quotationData.quotation_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+        doc.fontSize(12).font('Helvetica').text(`Quotation #: ${quotationData.quotation_number}`, { align: 'center' });
+        doc.fontSize(10).text(`Quotation Date: ${new Date(quotationData.quotation_date).toLocaleDateString('en-ZA')}`, { align: 'center' });
         if (quotationData.expiry_date) {
-            doc.fontSize(10).text(`Expiry Date: ${new Date(quotationData.expiry_date).toLocaleDateString('en-ZA')}`, { align: 'right' });
+            doc.fontSize(10).text(`Expiry Date: ${new Date(quotationData.expiry_date).toLocaleDateString('en-ZA')}`, { align: 'center' });
         }
         doc.moveDown(2);
 
-        // Title
-        doc.fontSize(30).font('Helvetica-Bold').text(`QUOTATION #${quotationData.quotation_number}`, { align: 'center' });
-        doc.moveDown(2);
-
-        // Customer Details
+        // --- Customer Details ---
         doc.fontSize(12).font('Helvetica-Bold').text('Quotation For:');
         doc.fontSize(12).font('Helvetica').text(quotationData.customer_name);
         if (quotationData.customer_address) {
@@ -1085,7 +975,8 @@ async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Prom
             doc.fontSize(10).text(quotationData.customer_email);
         }
         doc.moveDown(2);
-
+        
+        // ... (rest of the code is the same)
         // Table Header
         const tableTop = doc.y;
         const itemCol = 50;
@@ -1133,21 +1024,18 @@ async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Prom
         // Totals
         doc.moveDown();
         const totalsY = doc.y;
-        const totalLabelCol = 400; // Aligned with the totals section
+        const totalLabelCol = 400;
         const totalValueCol = 500;
         doc.font('Helvetica-Bold').fontSize(10);
         
-        // Subtotal
         doc.text('Subtotal:', totalLabelCol, totalsY, { width: 80, align: 'right' });
         doc.text(formatCurrency(subtotal, quotationData.currency), totalValueCol, totalsY, { width: 50, align: 'right' });
         doc.moveDown();
 
-        // Tax
         doc.text('Tax:', totalLabelCol, doc.y, { width: 80, align: 'right' });
         doc.text(formatCurrency(totalTax, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
         doc.moveDown();
 
-        // Total Amount
         doc.fontSize(14).text('Total Amount:', totalLabelCol, doc.y, { width: 80, align: 'right' });
         doc.text(formatCurrency(quotationData.total_amount, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
         doc.moveDown(3);
@@ -1168,6 +1056,8 @@ async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Prom
         doc.end();
     });
 }
+
+
 
 // ... rest of your server.ts code ...
 
@@ -1195,13 +1085,18 @@ app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Res
 
         const quotation = quotationQueryResult.rows[0];
 
-        // Fetch user's company information using the correct column name 'company' and other profile details
+        // Fetch user's company information and logo path
         const userProfileResult = await pool.query(
-            `SELECT company, address, city, province, postal_code, country, phone, vat_number, reg_number, email
+            `SELECT company, address, city, province, postal_code, country, phone, email, company_logo_path
              FROM users WHERE user_id = $1`,
             [user_id]
         );
-        const userCompany: UserProfile = userProfileResult.rows[0];
+        const userCompany = userProfileResult.rows[0];
+        let companyLogoUrl: string | null = null;
+        if (userCompany && userCompany.company_logo_path) {
+            const { data } = supabase.storage.from('company-logos').getPublicUrl(userCompany.company_logo_path);
+            companyLogoUrl = data.publicUrl;
+        }
 
         // Fetch line items for the quotation
         const lineItemsResult = await pool.query(
@@ -1216,20 +1111,12 @@ app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Res
         );
         quotation.line_items = lineItemsResult.rows;
 
-        // Prepare data for PDF generation, now including dynamic company info
-        const quotationDataForPdf: QuotationDetailsForPdf = {
-            quotation_number: quotation.quotation_number,
-            customer_name: quotation.customer_name,
-            customer_email: quotation.customer_email,
-            customer_address: quotation.customer_address,
-            quotation_date: quotation.quotation_date,
-            expiry_date: quotation.expiry_date,
+        // Prepare data for PDF generation, now including dynamic company info and logo URL
+        const quotationDataForPdf = {
+            ...quotation,
             total_amount: parseFloat(quotation.total_amount),
-            currency: quotation.currency,
-            notes: quotation.notes,
             line_items: quotation.line_items.map((item: any) => ({
-                product_service_name: item.product_service_name,
-                description: item.description,
+                ...item,
                 quantity: parseFloat(item.quantity),
                 unit_price: parseFloat(item.unit_price),
                 line_total: parseFloat(item.line_total),
@@ -1245,6 +1132,7 @@ app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Res
             companyEmail: userCompany?.email || null,
             companyVat: userCompany?.vat_number || null,
             companyReg: userCompany?.reg_number || null,
+            companyLogoUrl: companyLogoUrl, // NEW: Pass the logo URL to the PDF generator
         };
 
         const pdfBuffer = await generateQuotationPdf(quotationDataForPdf);
@@ -1266,165 +1154,25 @@ app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Res
 });
 
 
+// UPDATE the `/api/:documentType/:id/pdf` endpoint to include the logo
+// UPDATE the `/api/:documentType/:id/pdf` endpoint to include the logo
 app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
     const { documentType, id } = req.params;
     const { startDate, endDate } = req.query;
     const user_id = req.user!.parent_user_id;
 
-    const doc = new PDFDocument({ margin: 50 });
-
-    try {
-        switch (documentType) {
-            case 'invoices':
-            case 'invoice': {
-                const invoiceQueryResult = await pool.query(
-                    `SELECT
-                        i.*,
-                        c.name AS customer_name,
-                        c.email AS customer_email
-                    FROM invoices i
-                    JOIN customers c ON i.customer_id = c.id
-                    WHERE i.id = $1 AND i.user_id = $2`,
-                    [id, user_id]
-                );
-
-                if (invoiceQueryResult.rows.length === 0) {
-                    res.status(404).json({ error: 'Invoice not found' });
-                    doc.end();
-                    return;
-                }
-
-                const invoice = invoiceQueryResult.rows[0];
-
-                res.setHeader('Content-Type', 'application/pdf');
-                res.setHeader('Content-Disposition', `attachment; filename="invoice_${invoice.invoice_number}.pdf"`);
-
-                doc.pipe(res);
-
-                // Fetch line items
-                const lineItemsResult = await pool.query(
-                    `SELECT
-                        li.*,
-                        ps.name AS product_service_name
-                    FROM invoice_line_items li
-                    LEFT JOIN products_services ps ON li.product_service_id = ps.id
-                    WHERE li.invoice_id = $1
-                    ORDER BY li.created_at`,
-                    [id]
-                );
-                invoice.line_items = lineItemsResult.rows;
-
-                // --- PDF Content Generation for Invoice ---
-                doc.fontSize(24).font('Helvetica-Bold').text('Invoice', { align: 'center' });
-                doc.moveDown(1.5);
-
-                doc.fontSize(12).font('Helvetica-Bold').text('Invoice Details:', { underline: true });
-                doc.font('Helvetica')
-                    .text(`Invoice Number: ${invoice.invoice_number}`)
-                    .text(`Customer: ${invoice.customer_name}`)
-                    .text(`Invoice Date: ${new Date(invoice.invoice_date).toLocaleDateString('en-GB')}`)
-                    .text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-GB')}`);
-                doc.moveDown(1.5);
-
-                doc.fontSize(14).font('Helvetica-Bold').text('Line Items:', { underline: true });
-                doc.moveDown(0.5);
-
-                // Table Headers
-                const tableTop = doc.y;
-                const col1X = 50;
-                const col2X = 250;
-                const col3X = 300;
-                const col4X = 400;
-                const col5X = 470;
-
-                doc.fontSize(10)
-                    .font('Helvetica-Bold')
-                    .text('Description', col1X, tableTop)
-                    .text('Qty', col2X, tableTop)
-                    .text('Unit Price', col3X, tableTop, { width: 70, align: 'right' })
-                    .text('Tax Rate', col4X, tableTop, { width: 60, align: 'right' })
-                    .text('Line Total', col5X, tableTop, { width: 70, align: 'right' });
-
-                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
-
-                let yPos = tableTop + 25;
-
-                // Line Items Table Rows
-                invoice.line_items.forEach((item: any) => {
-                    if (yPos + 20 > doc.page.height - doc.page.margins.bottom) {
-                        doc.addPage();
-                        yPos = doc.page.margins.top;
-                        doc.fontSize(10)
-                            .font('Helvetica-Bold')
-                            .text('Description', col1X, yPos)
-                            .text('Qty', col2X, yPos)
-                            .text('Unit Price', col3X, yPos, { width: 70, align: 'right' })
-                            .text('Tax Rate', col4X, yPos, { width: 60, align: 'right' })
-                            .text('Line Total', col5X, yPos, { width: 70, align: 'right' });
-                        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos + 15).lineTo(550, yPos + 15).stroke();
-                        yPos += 25;
-                    }
-
-                    doc.fontSize(10).font('Helvetica')
-                        .text(item.description, col1X, yPos, { width: 190 })
-                        .text(item.quantity.toString(), col2X, yPos, { width: 40, align: 'right' })
-                        .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, yPos, { width: 70, align: 'right' })
-                        .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, yPos, { width: 60, align: 'right' })
-                        .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, yPos, { width: 70, align: 'right' });
-                    yPos += 20;
-                });
-
-                doc.moveDown();
-                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos).lineTo(550, yPos).stroke();
-
-                yPos += 10;
-                doc.fontSize(14).font('Helvetica-Bold')
-                    .text(`Total Amount: ${invoice.currency} ${(parseFloat(invoice.total_amount)).toFixed(2)}`, col1X, yPos, { align: 'right', width: 500 });
-
-                if (invoice.notes) {
-                    doc.moveDown(1.5);
-                    doc.fontSize(10).font('Helvetica-Oblique').text(`Notes: ${invoice.notes}`);
-                }
-
-                doc.end();
-                return;
-            }
-
-            case 'statement': {
-                res.setHeader('Content-Type', 'application/pdf');
-                doc.pipe(res);
-                doc.text('Statement generation not fully implemented in this example.', { align: 'center' });
-                doc.end();
-                return;
-            }
-
-            default:
-                res.status(400).json({ error: 'Document type not supported.' });
-                doc.end();
-                return;
-        }
-
-    } catch (error: unknown) {
-        console.error(`Error generating ${documentType}:`, error);
-
-        if (res.headersSent) {
-            console.error('Headers already sent. Cannot send JSON error for PDF generation error.');
-            doc.end();
-            return;
-        }
-
-        res.status(500).json({
-            error: `Failed to generate ${documentType}`,
-            details: error instanceof Error ? error.message : String(error)
-        });
-        doc.end();
-        return;
+    // Fetch user's company information and logo path once
+    const userProfileResult = await pool.query(
+        `SELECT company, email, address, city, province, postal_code, country, phone, company_logo_path
+         FROM users WHERE user_id = $1`,
+        [user_id]
+    );
+    const userCompany = userProfileResult.rows[0];
+    let companyLogoUrl: string | null = null;
+    if (userCompany && userCompany.company_logo_path) {
+        const { data } = supabase.storage.from('company-logos').getPublicUrl(userCompany.company_logo_path);
+        companyLogoUrl = data.publicUrl;
     }
-});
-app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
-    const { documentType, id } = req.params;
-    const { startDate, endDate } = req.query;
-    const user_id = req.user!.parent_user_id;
 
     const doc = new PDFDocument({ margin: 50 });
 
@@ -1468,23 +1216,71 @@ app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: 
                     [id]
                 );
                 invoice.line_items = lineItemsResult.rows;
-
+                
                 // --- PDF Content Generation for Invoice ---
-                doc.fontSize(24).font('Helvetica-Bold').text('Invoice', { align: 'center' });
-                doc.moveDown(1.5);
 
-                doc.fontSize(12).font('Helvetica-Bold').text('Invoice Details:', { underline: true });
-                doc.font('Helvetica')
-                    .text(`Invoice Number: ${invoice.invoice_number}`)
-                    .text(`Customer: ${invoice.customer_name}`)
-                    .text(`Invoice Date: ${new Date(invoice.invoice_date).toLocaleDateString('en-GB')}`)
-                    .text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-GB')}`);
-                doc.moveDown(1.5);
+                // Add the company logo and details
+                let companyLogoBuffer: Buffer | null = null;
+                let logoWidth = 120;
+                const logoX = doc.page.width - doc.page.margins.right - logoWidth;
 
-                doc.fontSize(14).font('Helvetica-Bold').text('Line Items:', { underline: true });
+                if (companyLogoUrl) {
+                    try {
+                        const logoResponse = await axios.get(companyLogoUrl, { responseType: 'arraybuffer' });
+                        companyLogoBuffer = Buffer.from(logoResponse.data, 'binary');
+                        doc.image(companyLogoBuffer, logoX, 50, { width: logoWidth });
+                    } catch (error) {
+                        console.error('Failed to fetch company logo for PDF:', error);
+                        // Continue generating PDF without the logo if fetch fails
+                    }
+                }
+
+                // Company details - placed on the top-left side
+                const companyDetailsY = 50;
+                doc.fontSize(14).font('Helvetica-Bold').text(userCompany.company, 50, companyDetailsY);
                 doc.moveDown(0.5);
 
-                // Table Headers
+                if (userCompany.address) {
+                    doc.fontSize(10).font('Helvetica').text(userCompany.address);
+                }
+                const addressLine2 = [userCompany.city, userCompany.province, userCompany.postal_code, userCompany.country]
+                    .filter(Boolean)
+                    .join(', ');
+                if (addressLine2) {
+                    doc.text(addressLine2);
+                }
+                if (userCompany.phone) {
+                    doc.text(`Phone: ${userCompany.phone}`);
+                }
+                if (userCompany.email) {
+                    doc.text(`Email: ${userCompany.email}`);
+                }
+                if (userCompany.vat_number) {
+                    doc.text(`VAT No: ${userCompany.vat_number}`);
+                }
+                if (userCompany.reg_number) {
+                    doc.text(`Reg No: ${userCompany.reg_number}`);
+                }
+
+                doc.moveDown(2);
+
+                // Invoice Title and Details on the right side
+                doc.fontSize(30).font('Helvetica-Bold').text('INVOICE', { align: 'center' });
+                doc.moveDown(1);
+                doc.fontSize(12).font('Helvetica-Bold').text(`Invoice #${invoice.invoice_number}`, { align: 'center' });
+                doc.fontSize(10).font('Helvetica')
+                    .text(`Invoice Date: ${new Date(invoice.invoice_date).toLocaleDateString('en-GB')}`, { align: 'center' })
+                    .text(`Due Date: ${new Date(invoice.due_date).toLocaleDateString('en-GB')}`, { align: 'center' });
+                doc.moveDown(2);
+
+                // Customer Details section
+                doc.fontSize(12).font('Helvetica-Bold').text('Bill To:', 50, doc.y);
+                doc.fontSize(10).font('Helvetica')
+                    .text(invoice.customer_name, 50, doc.y + 15)
+                    .text(invoice.customer_email, 50, doc.y + 30);
+                doc.moveDown(2);
+
+                // Line Items table
                 const tableTop = doc.y;
                 const col1X = 50;
                 const col2X = 250;
@@ -1502,39 +1298,38 @@ app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: 
 
                 doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
 
-                let yPos = tableTop + 25;
+                let currentYPos = tableTop + 25;
 
-                // Line Items Table Rows
                 invoice.line_items.forEach((item: any) => {
-                    if (yPos + 20 > doc.page.height - doc.page.margins.bottom) {
+                    if (currentYPos + 20 > doc.page.height - doc.page.margins.bottom) {
                         doc.addPage();
-                        yPos = doc.page.margins.top;
+                        currentYPos = doc.page.margins.top;
                         doc.fontSize(10)
                             .font('Helvetica-Bold')
-                            .text('Description', col1X, yPos)
-                            .text('Qty', col2X, yPos)
-                            .text('Unit Price', col3X, yPos, { width: 70, align: 'right' })
-                            .text('Tax Rate', col4X, yPos, { width: 60, align: 'right' })
-                            .text('Line Total', col5X, yPos, { width: 70, align: 'right' });
-                        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos + 15).lineTo(550, yPos + 15).stroke();
-                        yPos += 25;
+                            .text('Description', col1X, currentYPos)
+                            .text('Qty', col2X, currentYPos)
+                            .text('Unit Price', col3X, currentYPos, { width: 70, align: 'right' })
+                            .text('Tax Rate', col4X, currentYPos, { width: 60, align: 'right' })
+                            .text('Line Total', col5X, currentYPos, { width: 70, align: 'right' });
+                        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, currentYPos + 15).lineTo(550, currentYPos + 15).stroke();
+                        currentYPos += 25;
                     }
 
                     doc.fontSize(10).font('Helvetica')
-                        .text(item.description, col1X, yPos, { width: 190 })
-                        .text(item.quantity.toString(), col2X, yPos, { width: 40, align: 'right' })
-                        .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, yPos, { width: 70, align: 'right' })
-                        .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, yPos, { width: 60, align: 'right' })
-                        .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, yPos, { width: 70, align: 'right' });
-                    yPos += 20;
+                        .text(item.description, col1X, currentYPos, { width: 190 })
+                        .text(item.quantity.toString(), col2X, currentYPos, { width: 40, align: 'right' })
+                        .text(`R${(parseFloat(item.unit_price)).toFixed(2)}`, col3X, currentYPos, { width: 70, align: 'right' })
+                        .text(`${(parseFloat(item.tax_rate) * 100).toFixed(2)}%`, col4X, currentYPos, { width: 60, align: 'right' })
+                        .text(`R${(parseFloat(item.line_total)).toFixed(2)}`, col5X, currentYPos, { width: 70, align: 'right' });
+                    currentYPos += 20;
                 });
 
                 doc.moveDown();
-                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, yPos).lineTo(550, yPos).stroke();
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, currentYPos).lineTo(550, currentYPos).stroke();
 
-                yPos += 10;
+                currentYPos += 10;
                 doc.fontSize(14).font('Helvetica-Bold')
-                    .text(`Total Amount: ${invoice.currency} ${(parseFloat(invoice.total_amount)).toFixed(2)}`, col1X, yPos, { align: 'right', width: 500 });
+                    .text(`Total Amount: ${invoice.currency} ${(parseFloat(invoice.total_amount)).toFixed(2)}`, col1X, currentYPos, { align: 'right', width: 500 });
 
                 if (invoice.notes) {
                     doc.moveDown(1.5);
@@ -9949,7 +9744,7 @@ app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
 
     try {
         const { rows } = await pool.query(
-            `SELECT company, email, address, city, province, postal_code, country, phone, vat_number, reg_number, company_logo_path
+            `SELECT company, email, address, city, province, postal_code, country, phone, vat_number, company_logo_path
              FROM public.users
              WHERE user_id = $1`,
             [user_id]
