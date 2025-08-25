@@ -9773,7 +9773,151 @@ app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
 });
 
 // In your main server file (e.g., server.ts or routes/customers.ts)
+// server.ts
 
+// server.ts
+
+// POST /api/applications - Create a new customer application
+app.post('/api/applications', authMiddleware, async (req: Request, res: Response) => {
+    const {
+        name, surname, phone, email, address, nationality, gender, date_of_birth, id_number, alt_name, relation_to_member, relation_dob,
+        family_members, plan_options, extended_family,
+        beneficiary_name, beneficiary_surname, beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number, deduction_date, account_type, commencement_date,
+        declaration_signature, declaration_date, call_time, agent_name,
+        connector_name, connector_contact, connector_province, team_leader, team_contact, team_province
+    } = req.body;
+    const user_id = req.user!.parent_user_id;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // Insert into the main applications table
+        const applicationQuery = `
+            INSERT INTO public.applications (
+                user_id, name, surname, phone, email, address, nationality, gender, date_of_birth, id_number,
+                alt_name, relation_to_member, relation_dob, plan_options, beneficiary_name, beneficiary_surname,
+                beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number,
+                deduction_date, account_type, commencement_date, declaration_signature, declaration_date,
+                call_time, agent_name, connector_name, connector_contact, connector_province, team_leader,
+                team_contact, team_province
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)
+            RETURNING id;
+        `;
+        const applicationResult = await client.query(applicationQuery, [
+            user_id, name, surname, phone, email, address, nationality, gender, date_of_birth, id_number,
+            alt_name, relation_to_member, relation_dob, plan_options, beneficiary_name, beneficiary_surname,
+            beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number,
+            deduction_date, account_type, commencement_date, declaration_signature, declaration_date,
+            call_time, agent_name, connector_name, connector_contact, connector_province, team_leader,
+            team_contact, team_province
+        ]);
+        const newApplicationId = applicationResult.rows[0].id;
+
+        // Insert family members
+        if (family_members && family_members.length > 0) {
+            const familyQuery = `INSERT INTO public.family_members (application_id, name, surname, relationship, date_of_birth) VALUES ($1, $2, $3, $4, $5);`;
+            for (const member of family_members) {
+                await client.query(familyQuery, [newApplicationId, member.name, member.surname, member.relationship, member.date_of_birth]);
+            }
+        }
+        
+        // Insert extended family members
+        if (extended_family && extended_family.length > 0) {
+            const extendedFamilyQuery = `INSERT INTO public.extended_family (application_id, name, surname, relationship, date_of_birth, premium) VALUES ($1, $2, $3, $4, $5, $6);`;
+            for (const member of extended_family) {
+                await client.query(extendedFamilyQuery, [newApplicationId, member.name, member.surname, member.relationship, member.date_of_birth, member.premium]);
+            }
+        }
+
+        await client.query('COMMIT');
+        res.status(201).json({ message: 'Application created successfully!', id: newApplicationId });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error creating application:', error);
+        res.status(500).json({ error: 'Failed to create application.', details: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+
+
+// PUT /api/applications/:id - Update an existing application
+app.put('/api/applications/:id', authMiddleware, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const {
+        name, surname, phone, email, address, nationality, gender, date_of_birth, id_number, alt_name, relation_to_member, relation_dob,
+        family_members, plan_options, extended_family,
+        beneficiary_name, beneficiary_surname, beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number, deduction_date, account_type, commencement_date,
+        declaration_signature, declaration_date, call_time, agent_name,
+        connector_name, connector_contact, connector_province, team_leader, team_contact, team_province
+    } = req.body;
+    const user_id = req.user!.parent_user_id;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // Check if the application exists and belongs to the user
+        const checkQuery = await client.query('SELECT 1 FROM public.applications WHERE id = $1 AND user_id = $2', [id, user_id]);
+        if (checkQuery.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Application not found or access denied.' });
+        }
+
+        // Update the main applications table
+        const updateQuery = `
+            UPDATE public.applications
+            SET
+                name = $1, surname = $2, phone = $3, email = $4, address = $5, nationality = $6, gender = $7, date_of_birth = $8,
+                id_number = $9, alt_name = $10, relation_to_member = $11, relation_dob = $12, plan_options = $13,
+                beneficiary_name = $14, beneficiary_surname = $15, beneficiary_contact = $16, pay_options = $17,
+                total_amount = $18, bank = $19, branch_code = $20, account_holder = $21, account_number = $22,
+                deduction_date = $23, account_type = $24, commencement_date = $25, declaration_signature = $26,
+                declaration_date = $27, call_time = $28, agent_name = $29, connector_name = $30,
+                connector_contact = $31, connector_province = $32, team_leader = $33, team_contact = $34,
+                team_province = $35, updated_at = NOW()
+            WHERE id = $36 AND user_id = $37;
+        `;
+        await client.query(updateQuery, [
+            name, surname, phone, email, address, nationality, gender, date_of_birth, id_number, alt_name,
+            relation_to_member, relation_dob, plan_options, beneficiary_name, beneficiary_surname,
+            beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number,
+            deduction_date, account_type, commencement_date, declaration_signature, declaration_date,
+            call_time, agent_name, connector_name, connector_contact, connector_province, team_leader,
+            team_contact, team_province, id, user_id
+        ]);
+
+        // Delete existing family members and re-insert new ones
+        await client.query('DELETE FROM public.family_members WHERE application_id = $1', [id]);
+        if (family_members && family_members.length > 0) {
+            const familyQuery = `INSERT INTO public.family_members (application_id, name, surname, relationship, date_of_birth) VALUES ($1, $2, $3, $4, $5);`;
+            for (const member of family_members) {
+                await client.query(familyQuery, [id, member.name, member.surname, member.relationship, member.date_of_birth]);
+            }
+        }
+        
+        // Delete existing extended family members and re-insert new ones
+        await client.query('DELETE FROM public.extended_family WHERE application_id = $1', [id]);
+        if (extended_family && extended_family.length > 0) {
+            const extendedFamilyQuery = `INSERT INTO public.extended_family (application_id, name, surname, relationship, date_of_birth, premium) VALUES ($1, $2, $3, $4, $5, $6);`;
+            for (const member of extended_family) {
+                await client.query(extendedFamilyQuery, [id, member.name, member.surname, member.relationship, member.date_of_birth, member.premium]);
+            }
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'Application updated successfully!' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error updating application:', error);
+        res.status(500).json({ error: 'Failed to update application.', details: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
 
 
 app.listen(PORT, () => {
