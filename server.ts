@@ -9778,6 +9778,8 @@ app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
 // server.ts
 
 // POST /api/applications - Create a new customer application
+// POST /api/applications - Create a new customer application
+// POST /api/applications - Create a new customer application
 app.post('/api/applications', authMiddleware, async (req: Request, res: Response) => {
     const {
         name, surname, phone, email, address, nationality, gender, date_of_birth, id_number, alt_name, relation_to_member, relation_dob,
@@ -9914,6 +9916,82 @@ app.put('/api/applications/:id', authMiddleware, async (req: Request, res: Respo
         await client.query('ROLLBACK');
         console.error('Error updating application:', error);
         res.status(500).json({ error: 'Failed to update application.', details: error instanceof Error ? error.message : String(error) });
+    } finally {
+        client.release();
+    }
+});
+// GET /api/applications - Get all applications for the authenticated user
+// GET /api/applications - Get all applications for the authenticated user
+app.get('/api/applications', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    const client = await pool.connect();
+
+    try {
+        // Fetch all applications for the user
+        const applicationsQuery = `
+            SELECT 
+                a.id, a.name, a.surname, a.phone, a.email, a.address, a.nationality, a.gender, 
+                a.date_of_birth, a.id_number, a.alt_name, a.relation_to_member, a.relation_dob, 
+                a.plan_options, a.beneficiary_name, a.beneficiary_surname, a.beneficiary_contact, 
+                a.pay_options, a.total_amount, a.bank, a.branch_code, a.account_holder, 
+                a.account_number, a.deduction_date, a.account_type, a.commencement_date, 
+                a.declaration_signature, a.declaration_date, a.call_time, a.agent_name, 
+                a.connector_name, a.connector_contact, a.connector_province, a.team_leader, 
+                a.team_contact, a.team_province
+            FROM public.applications a
+            WHERE a.user_id = $1
+            ORDER BY a.created_at DESC;
+        `;
+        const applicationsResult = await client.query(applicationsQuery, [user_id]);
+        const applications = applicationsResult.rows;
+
+        // Fetch family members for each application
+        const familyMembersQuery = `
+            SELECT id, application_id, name, surname, relationship, date_of_birth
+            FROM public.family_members
+            WHERE application_id = ANY($1::uuid[])
+            ORDER BY id;
+        `;
+        const familyMembersResult = await client.query(familyMembersQuery, [applications.map(a => a.id)]);
+
+        // Fetch extended family members for each application
+        const extendedFamilyQuery = `
+            SELECT id, application_id, name, surname, relationship, date_of_birth, premium
+            FROM public.extended_family
+            WHERE application_id = ANY($1::uuid[])
+            ORDER BY id;
+        `;
+        const extendedFamilyResult = await client.query(extendedFamilyQuery, [applications.map(a => a.id)]);
+
+        // Group family members and extended family members by application_id
+        const familyMembersMap = familyMembersResult.rows.reduce((acc, member) => {
+            if (!acc[member.application_id]) {
+                acc[member.application_id] = [];
+            }
+            acc[member.application_id].push(member);
+            return acc;
+        }, {});
+
+        const extendedFamilyMap = extendedFamilyResult.rows.reduce((acc, member) => {
+            if (!acc[member.application_id]) {
+                acc[member.application_id] = [];
+            }
+            acc[member.application_id].push(member);
+            return acc;
+        }, {});
+
+        // Combine all data into a single array of application objects
+        const combinedApplications = applications.map(app => ({
+            ...app,
+            family_members: familyMembersMap[app.id] || [],
+            extended_family: extendedFamilyMap[app.id] || [],
+        }));
+
+        res.status(200).json(combinedApplications);
+
+    } catch (error) {
+        console.error('Error fetching applications:', error);
+        res.status(500).json({ error: 'Failed to fetch applications.', details: error instanceof Error ? error.message : String(error) });
     } finally {
         client.release();
     }
