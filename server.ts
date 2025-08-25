@@ -1847,31 +1847,52 @@ function formatCurrency(amount: number | string | null | undefined, currency?: s
 
 // ADD THE NEW DELETE ENDPOINT HERE
 app.delete('/transactions/:id', authMiddleware, async (req: Request, res: Response) => {
-  const { id } = req.params;
+    const { id } = req.params;
 
-  // Prefer company scoping, fallback to user_id
-  const user_id = (req.user!.parent_user_id || req.user!.user_id)!;
+    // Prefer company scoping, fallback to user_id
+    const user_id = (req.user!.parent_user_id || req.user!.user_id)!;
 
-  try {
-    const query = `
-      DELETE FROM transactions
-      WHERE id = $1 AND user_id = $2
-      RETURNING id; 
-    `;
-    const result = await pool.query(query, [id, user_id]);
+    // Start a database client for transaction
+    const client = await pool.connect();
 
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Transaction not found or unauthorized' });
+    try {
+        await client.query('BEGIN'); // Start the transaction
+
+        // 1. Delete dependent depreciation entries first
+        const deleteDepreciationQuery = `
+            DELETE FROM depreciation_entries
+            WHERE transaction_id = $1 AND user_id = $2;
+        `;
+        await client.query(deleteDepreciationQuery, [id, user_id]);
+        console.log(`Deleted depreciation entries for transaction ID: ${id}`);
+
+        // 2. Then, delete the transaction itself
+        const deleteTransactionQuery = `
+            DELETE FROM transactions
+            WHERE id = $1 AND user_id = $2
+            RETURNING id; 
+        `;
+        const result = await client.query(deleteTransactionQuery, [id, user_id]);
+
+        if (result.rowCount === 0) {
+            await client.query('ROLLBACK'); // Rollback if transaction not found or unauthorized
+            return res.status(404).json({ error: 'Transaction not found or unauthorized' });
+        }
+
+        await client.query('COMMIT'); // Commit the transaction if both succeeded
+        console.log(`Transaction ID: ${id} and its depreciation entries deleted successfully.`);
+        res.status(204).send(); // 204 No Content is standard for a successful DELETE
+
+    } catch (error: unknown) {
+        await client.query('ROLLBACK'); // Rollback on any error
+        console.error('Error deleting transaction (and associated depreciation entries):', error);
+        res.status(500).json({
+            error: 'Failed to delete transaction',
+            detail: error instanceof Error ? error.message : String(error),
+        });
+    } finally {
+        client.release(); // Always release the client back to the pool
     }
-
-    res.status(204).send(); // 204 No Content is standard for a successful DELETE
-  } catch (error: unknown) {
-    console.error('Error deleting transaction:', error);
-    res.status(500).json({
-      error: 'Failed to delete transaction',
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  }
 });
 
 
