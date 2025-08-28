@@ -976,68 +976,98 @@ async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Prom
         }
         doc.moveDown(2);
         
-        // ... (rest of the code is the same)
-        // Table Header
+        // Line Items table - Matching Invoice Column Definitions
         const tableTop = doc.y;
-        const itemCol = 50;
-        const descCol = 150;
-        const qtyCol = 320;
-        const priceCol = 370;
-        const taxCol = 430;
-        const totalCol = 500;
+        const col1X = 50;  // Description
+        const col2X = 250; // Qty
+        const col3X = 300; // Unit Price
+        const col4X = 400; // Tax Rate
+        const col5X = 470; // Line Total
 
-        doc.font('Helvetica-Bold').fontSize(10);
-        doc.text('Item', itemCol, tableTop);
-        doc.text('Description', descCol, tableTop);
-        doc.text('Qty', qtyCol, tableTop, { width: 50, align: 'right' });
-        doc.text('Unit Price', priceCol, tableTop, { width: 50, align: 'right' });
-        doc.text('Tax', taxCol, tableTop, { width: 50, align: 'right' });
-        doc.text('Line Total', totalCol, tableTop, { width: 50, align: 'right' });
+        doc.fontSize(10).font('Helvetica-Bold')
+            .text('Description', col1X, tableTop)
+            .text('Qty', col2X, tableTop)
+            .text('Unit Price', col3X, tableTop, { width: 70, align: 'right' })
+            .text('Tax Rate', col4X, tableTop, { width: 60, align: 'right' })
+            .text('Line Total', col5X, tableTop, { width: 70, align: 'right' });
 
-        doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(itemCol, tableTop + 15).lineTo(doc.page.width - 50, tableTop + 15).stroke();
-        doc.moveDown();
+        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
 
-        // Table Body
-        doc.font('Helvetica').fontSize(9);
-        let currentY = doc.y;
-        let subtotal = 0;
+        let currentYPos = tableTop + 25;
+        let subtotal = 0; // Subtotal before tax
         let totalTax = 0;
 
         quotationData.line_items.forEach(item => {
-            currentY = doc.y;
+            // Check for page break before drawing item
+            if (currentYPos + 20 > doc.page.height - doc.page.margins.bottom) {
+                doc.addPage();
+                currentYPos = doc.page.margins.top;
+                // Redraw table headers on new page
+                doc.fontSize(10).font('Helvetica-Bold')
+                    .text('Description', col1X, currentYPos)
+                    .text('Qty', col2X, currentYPos)
+                    .text('Unit Price', col3X, currentYPos, { width: 70, align: 'right' })
+                    .text('Tax Rate', col4X, currentYPos, { width: 60, align: 'right' })
+                    .text('Line Total', col5X, currentYPos, { width: 70, align: 'right' });
+                doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, currentYPos + 15).lineTo(550, currentYPos + 15).stroke();
+                currentYPos += 25;
+            }
+
             const itemDescription = item.product_service_name || item.description;
-            const taxAmount = (item.line_total * item.tax_rate);
-            const lineTotalExclTax = item.line_total - taxAmount;
+            const lineTotalWithTax = parseFloat(String(item.line_total)) || 0;
+            const taxRate = parseFloat(String(item.tax_rate)) || 0;
+            const unitPrice = parseFloat(String(item.unit_price)) || 0;
+            const quantity = parseFloat(String(item.quantity)) || 0;
 
-            doc.text(itemDescription, itemCol, currentY, { width: 140 });
-            doc.text(item.description, descCol, currentY, { width: 160 });
-            doc.text(item.quantity.toString(), qtyCol, currentY, { width: 50, align: 'right' });
-            doc.text(formatCurrency(item.unit_price, ''), priceCol, currentY, { width: 50, align: 'right' });
-            doc.text(`${(item.tax_rate * 100).toFixed(0)}%`, taxCol, currentY, { width: 50, align: 'right' });
-            doc.text(formatCurrency(item.line_total, ''), totalCol, currentY, { width: 50, align: 'right' });
+            let calculatedLineTotalExclTax = 0;
+            let calculatedTaxAmount = 0;
 
-            doc.moveDown();
-            subtotal += lineTotalExclTax;
-            totalTax += taxAmount;
+            if (taxRate > 0) {
+                // Assuming line_total includes tax if tax_rate > 0
+                calculatedLineTotalExclTax = lineTotalWithTax / (1 + taxRate);
+                calculatedTaxAmount = lineTotalWithTax - calculatedLineTotalExclTax;
+            } else {
+                calculatedLineTotalExclTax = lineTotalWithTax;
+                calculatedTaxAmount = 0;
+            }
+
+            doc.fontSize(10).font('Helvetica')
+                .text(itemDescription, col1X, currentYPos, { width: 190 }) // Matches invoice width for description
+                .text(item.quantity.toString(), col2X, currentYPos, { width: 40, align: 'right' })
+                .text(formatCurrency(unitPrice, quotationData.currency), col3X, currentYPos, { width: 70, align: 'right' })
+                .text(`${(taxRate * 100).toFixed(2)}%`, col4X, currentYPos, { width: 60, align: 'right' })
+                .text(formatCurrency(lineTotalWithTax, quotationData.currency), col5X, currentYPos, { width: 70, align: 'right' });
+            
+            currentYPos += 20; // Increment Y position for the next line item
+
+            subtotal += calculatedLineTotalExclTax;
+            totalTax += calculatedTaxAmount;
         });
 
-        // Totals
+        // Totals section - Matching Invoice Layout
         doc.moveDown();
-        const totalsY = doc.y;
-        const totalLabelCol = 400;
-        const totalValueCol = 500;
-        doc.font('Helvetica-Bold').fontSize(10);
+        doc.lineWidth(0.5).strokeColor('#cccccc').moveTo(col1X, currentYPos).lineTo(550, currentYPos).stroke();
+        currentYPos += 10; // Space after the line
+
+        // Display Subtotal and Tax similar to invoice if needed,
+        // For now, I'll align the Total Amount as per invoice,
+        // and add Subtotal/Tax above it to the right.
         
-        doc.text('Subtotal:', totalLabelCol, totalsY, { width: 80, align: 'right' });
-        doc.text(formatCurrency(subtotal, quotationData.currency), totalValueCol, totalsY, { width: 50, align: 'right' });
-        doc.moveDown();
+        // Subtotal (Right-aligned under the table)
+        doc.fontSize(10).font('Helvetica')
+           .text('Subtotal:', col4X, currentYPos, { width: 60, align: 'right' });
+        doc.text(formatCurrency(subtotal, quotationData.currency), col5X, currentYPos, { width: 70, align: 'right' });
+        currentYPos += 15; // Move down for next line
 
-        doc.text('Tax:', totalLabelCol, doc.y, { width: 80, align: 'right' });
-        doc.text(formatCurrency(totalTax, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
-        doc.moveDown();
+        // Total Tax (Right-aligned under the table)
+        doc.fontSize(10).font('Helvetica')
+           .text('Tax:', col4X, currentYPos, { width: 60, align: 'right' });
+        doc.text(formatCurrency(totalTax, quotationData.currency), col5X, currentYPos, { width: 70, align: 'right' });
+        currentYPos += 20; // Move down for final total with more space
 
-        doc.fontSize(14).text('Total Amount:', totalLabelCol, doc.y, { width: 80, align: 'right' });
-        doc.text(formatCurrency(quotationData.total_amount, quotationData.currency), totalValueCol, doc.y, { width: 50, align: 'right' });
+        // Final Total Amount (Matches invoice's single line, right-aligned, with full currency)
+        doc.fontSize(14).font('Helvetica-Bold')
+            .text(`Total Amount: ${formatCurrency(quotationData.total_amount, quotationData.currency)}`, col1X, currentYPos, { align: 'right', width: 500 }); // Aligned to col1X, with width 500 to span right
         doc.moveDown(3);
 
         // Notes
