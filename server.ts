@@ -21,7 +21,8 @@ const PDFDocument = require('pdfkit');
 app.use(cors({
   origin: '*',
 }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const supabaseUrl = "https://phoaahdutroiujxiehze.supabase.co";
 const supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBob2FhaGR1dHJvaXVqeGllaHplIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTE3MjU1MSwiZXhwIjoyMDcwNzQ4NTUxfQ.XbnwOjhIil3O9NEmfhXSiORC8jdEOYx4fxQR8AtHKD0";
@@ -78,13 +79,13 @@ declare global {
 
 // AUTHENTICATION MIDDLEWARE (on your backend server)
 const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
- console.log('--- Inside authMiddleware ---');
-console.log('Request Headers:', req.headers); // Log all headers
+// console.log('--- Inside authMiddleware ---');
+//console.log('Request Headers:', req.headers); // Log all headers
   const authHeader = req.headers.authorization;
-console.log('Authorization Header:', authHeader); // Log the Authorization header directly
+//console.log('Authorization Header:', authHeader); // Log the Authorization header directly
 
   const token = authHeader?.split(' ')[1];
-  console.log('Extracted Token:', token ? token.substring(0, 10) + '...' : 'No token extracted'); // Log first 10 chars of token for brevity
+  //console.log('Extracted Token:', token ? token.substring(0, 10) + '...' : 'No token extracted'); // Log first 10 chars of token for brevity
 
   const secret = process.env.JWT_SECRET;
   console.log('JWT_SECRET (first 5 chars):', secret ? secret.substring(0, 5) + '...' : 'NOT DEFINED'); // Log part of secret

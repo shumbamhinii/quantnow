@@ -216,7 +216,7 @@ const EditableTransactionTable = ({ transactions: initialTransactions, accounts,
 // --- Main ChatInterface Component ---
 const ChatInterface = () => {
   const RAIRO_API_BASE_URL = 'https://rairo-stmt-api.hf.space';
-  const API_BASE_URL = 'https://quantnow-cu1v.onrender.com';
+  const API_BASE_URL = 'http://localhost:3000';
 
   const [messages, setMessages] = useState([]);
   const [accounts, setAccounts] = useState([]);
@@ -276,7 +276,7 @@ const ChatInterface = () => {
         addAssistantMessage('Accounts loaded successfully. You can now import transactions.');
       } catch (error) {
         console.error('Failed to fetch accounts', error);
-        addAssistantMessage('Failed to load accounts. Please ensure your backend server is running at `https://quantnow-cu1v.onrender.com`.');
+        addAssistantMessage('Failed to load accounts. Please ensure your backend server is running at `http://localhost:3000`.');
       } finally {
         setIsLoadingAccounts(false); // End loading
       }
