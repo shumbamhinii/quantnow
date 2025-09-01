@@ -9891,40 +9891,67 @@ app.delete("/journal-entries/:id", authMiddleware, async (req: Request, res: Res
 // Income Statement (by period, indirect signs)
 // GET /reports/income-statement?start=YYYY-MM-DD&end=YYYY-MM-DD
 app.get("/reports/income-statement", authMiddleware, async (req: Request, res: Response) => {
-  const userId = req.user!.parent_user_id; // Access user from req.user
+  const userId = req.user!.parent_user_id;
   const start = req.query.start as string;
   const end = req.query.end as string;
   if (!start || !end) return res.status(400).json({ error: "start & end required" });
 
-  // Sum period activity by IS sections with correct sign conventions:
-  // revenue/other_income → credits positive; expenses (cogs/opex/finance_costs) → debits positive
-  const { rows } = await pool.query(
-    `
-    SELECT rc.section,
-           SUM(
-             CASE
-               WHEN rc.section IN ('revenue','other_income')
-                 THEN -(jl.debit - jl.credit)   -- credit balances positive
-               ELSE      (jl.debit - jl.credit) -- expense balances positive
-             END
-           ) AS amount
-      FROM public.journal_lines jl
-      JOIN public.journal_entries je
-        ON je.id = jl.entry_id AND je.user_id = jl.user_id
-      JOIN public.accounts a
-        ON a.id = jl.account_id AND a.user_id = jl.user_id
-      JOIN public.reporting_categories rc
-        ON rc.id = a.reporting_category_id
-     WHERE je.user_id = $1
-       AND rc.statement = 'income_statement'
-       AND je.entry_date BETWEEN $2::date AND $3::date
-     GROUP BY rc.section
-     ORDER BY rc.section
-    `,
-    [userId, start, end]
-  );
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT
+        a.name AS account_name,
+        rc.section AS reporting_section,
+        a.normal_side AS normal_side,
+        SUM(jl.debit - jl.credit) AS balance
+      FROM
+        public.journal_lines jl
+      JOIN
+        public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+      JOIN
+        public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+      JOIN
+        public.reporting_categories rc ON rc.id = a.reporting_category_id
+      WHERE
+        je.user_id = $1
+        AND rc.statement = 'income_statement'
+        AND je.entry_date BETWEEN $2::date AND $3::date
+      GROUP BY
+        a.name, rc.section, a.normal_side
+      ORDER BY
+        rc.section, a.name;
+      `,
+      [userId, start, end]
+    );
 
-  res.json({ period: { start, end }, sections: rows });
+    const sectionMap: Record<string, { section: string; amount: number; accounts: any[] }> = {};
+
+    rows.forEach(row => {
+      const sectionName = row.reporting_section;
+      if (!sectionMap[sectionName]) {
+        sectionMap[sectionName] = {
+          section: sectionName,
+          amount: 0,
+          accounts: []
+        };
+      }
+      
+      const balance = parseFloat(row.balance);
+      const amount = (row.normal_side === 'Credit') ? -balance : balance;
+
+      sectionMap[sectionName].amount += amount;
+      sectionMap[sectionName].accounts.push({
+        name: row.account_name,
+        amount: amount
+      });
+    });
+
+    res.json({ period: { start, end }, sections: Object.values(sectionMap) });
+
+  } catch (error) {
+    console.error("Error fetching income statement:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 // Balance Sheet (as of date)
