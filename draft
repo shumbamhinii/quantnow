@@ -6268,3 +6268,330 @@ app.listen(PORT, () => {
   console.log(`Node server running on http://localhost:${PORT}`);
 });
 
+
+
+
+
+
+// Helper function to calculate previous period dates based on the current period
+const getPreviousPeriodDates = (startDateStr: string, endDateStr: string) => {
+    const startDate = new Date(startDateStr);
+    const endDate = new Date(endDateStr);
+
+    // Calculate the duration of the current period in milliseconds
+    const periodDurationMs = endDate.getTime() - startDate.getTime();
+
+    // The previous period's end date is the day before the current period's start date
+    const prevEndDate = new Date(startDate);
+    prevEndDate.setDate(startDate.getDate() - 1);
+
+    // The previous period's start date is `periodDurationMs` before the prevEndDate
+    const prevStartDate = new Date(prevEndDate.getTime() - periodDurationMs);
+
+    return {
+        prevStartDate: prevStartDate.toISOString().split('T')[0],
+        prevEndDate: prevEndDate.toISOString().split('T')[0],
+    };
+};
+
+// NEW ENDPOINT: GET Revenue Statistics for a period (or all time)
+app.get('/api/stats/revenue', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodValue = 0;
+        let previousPeriodValue = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause
+        if (startDate && endDate) {
+            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period revenue (or all-time if no dates provided)
+        const currentRevenueResult = await pool.query(`
+            SELECT COALESCE(SUM(amount), 0) AS value
+            FROM public.transactions
+            WHERE
+                user_id = $1
+                AND type = 'income'
+                AND category IN ('Revenue', 'Sales Revenue')
+                ${dateFilterClause};
+        `, currentQueryParams);
+
+        currentPeriodValue = parseFloat(currentRevenueResult.rows[0]?.value || 0);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period revenue
+            const previousRevenueResult = await pool.query(`
+                SELECT COALESCE(SUM(amount), 0) AS value
+                FROM public.transactions
+                WHERE
+                    user_id = $1
+                    AND type = 'income'
+                    AND category IN ('Revenue', 'Sales Revenue')
+                    AND date BETWEEN $2 AND $3;
+            `, previousQueryParams);
+
+            previousPeriodValue = parseFloat(previousRevenueResult.rows[0]?.value || 0);
+
+            // Calculate change percentage
+            if (previousPeriodValue !== 0) {
+                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
+                if (changePercentage > 0) {
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodValue > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            value: currentPeriodValue,
+            previousValue: previousPeriodValue,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching revenue stats:', error);
+        res.status(500).json({ error: 'Failed to fetch revenue statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// NEW ENDPOINT: GET Expenses Statistics for a period (or all time)
+app.get('/api/stats/expenses', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodValue = 0;
+        let previousPeriodValue = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause
+        if (startDate && endDate) {
+            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period expenses (or all-time if no dates provided)
+        const currentExpensesResult = await pool.query(`
+            SELECT COALESCE(SUM(amount), 0) AS value
+            FROM public.transactions
+            WHERE
+                user_id = $1
+                AND type = 'expense'
+                ${dateFilterClause};
+        `, currentQueryParams);
+
+        currentPeriodValue = parseFloat(currentExpensesResult.rows[0]?.value || 0);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period expenses
+            const previousExpensesResult = await pool.query(`
+                SELECT COALESCE(SUM(amount), 0) AS value
+                FROM public.transactions
+                WHERE
+                    user_id = $1
+                    AND type = 'expense'
+                    AND date BETWEEN $2 AND $3;
+            `, previousQueryParams);
+
+            previousPeriodValue = parseFloat(previousExpensesResult.rows[0]?.value || 0);
+
+            // Calculate change percentage
+            if (previousPeriodValue !== 0) {
+                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
+                if (changePercentage > 0) { // For expenses, an increase is often seen as a negative trend
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodValue > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            value: currentPeriodValue,
+            previousValue: previousPeriodValue,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching expenses stats:', error);
+        res.status(500).json({ error: 'Failed to fetch expenses statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// Existing /api/stats/clients endpoint, modified to allow all-time view and use public.sales
+app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodCount = 0;
+        let previousPeriodCount = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause for 'created_at'
+        if (startDate && endDate) {
+            dateFilterClause = ` AND created_at BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period client count (or all-time if no dates provided)
+        // Now counting distinct customer_id from public.sales table
+        const currentClientsResult = await pool.query(`
+            SELECT COUNT(DISTINCT customer_id) AS count
+            FROM public.sales
+            WHERE user_id = $1
+            ${dateFilterClause};
+        `, currentQueryParams);
+        currentPeriodCount = parseInt(currentClientsResult.rows[0]?.count || 0, 10);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period client count
+            // Now counting distinct customer_id from public.sales table
+            const previousClientsResult = await pool.query(`
+                SELECT COUNT(DISTINCT customer_id) AS count
+                FROM public.sales
+                WHERE user_id = $1
+                AND created_at BETWEEN $2 AND $3;
+            `, previousQueryParams);
+            previousPeriodCount = parseInt(previousClientsResult.rows[0]?.count || 0, 10);
+
+            // Calculate change percentage
+            if (previousPeriodCount !== 0) {
+                changePercentage = ((currentPeriodCount - previousPeriodCount) / previousPeriodCount) * 100;
+                if (changePercentage > 0) {
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodCount > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            count: currentPeriodCount,
+            previousCount: previousPeriodCount,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching client stats:', error);
+        res.status(500).json({ error: 'Failed to fetch client statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+
+// Add this new endpoint to your server.ts file, e.g., after the quotes endpoint.
+app.get('/api/stats/profitability', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.parent_user_id;
+  const { startDate, endDate } = req.query;
+
+  try {
+    let dateFilter = '';
+    const queryParams: (string | number)[] = [user_id];
+    let paramIndex = 2;
+
+    if (startDate) {
+      dateFilter += ` AND date >= $${paramIndex++}`;
+      queryParams.push(startDate as string);
+    }
+    if (endDate) {
+      dateFilter += ` AND date <= $${paramIndex++}`;
+      queryParams.push(endDate as string);
+    }
+
+    // Get total income
+    const incomeResult = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_income FROM public.transactions WHERE user_id = $1 AND type = 'income' ${dateFilter};`,
+      queryParams
+    );
+    const totalIncome = parseFloat(incomeResult.rows[0]?.total_income || 0);
+
+    // Get total expenses
+    const expensesResult = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_expenses FROM public.transactions WHERE user_id = $1 AND type = 'expense' ${dateFilter};`,
+      queryParams
+    );
+    const totalExpenses = parseFloat(expensesResult.rows[0]?.total_expenses || 0);
+
+    // Get previous period income
+    const { currentStart, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+
+    const previousIncomeResult = await pool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total_income FROM public.transactions WHERE user_id = $1 AND type = 'income' AND date >= $2 AND date < $3;`,
+        [user_id, previousStart, currentStart]
+    );
+    const previousIncome = parseFloat(previousIncomeResult.rows[0]?.total_income || 0);
+
+    // Get previous period expenses
+    const previousExpensesResult = await pool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total_expenses FROM public.transactions WHERE user_id = $1 AND type = 'expense' AND date >= $2 AND date < $3;`,
+        [user_id, previousStart, currentStart]
+    );
+    const previousExpenses = parseFloat(previousExpensesResult.rows[0]?.total_expenses || 0);
+
+
+    const currentProfit = totalIncome - totalExpenses;
+    const previousProfit = previousIncome - previousExpenses;
+    const { changePercentage, changeType } = calculateChange(currentProfit, previousProfit);
+
+    res.status(200).json({
+      value: currentProfit,
+      previousValue: previousProfit,
+      changePercentage,
+      changeType,
+    });
+  } catch (error) {
+    console.error('Error fetching profitability stats:', error);
+    res.status(500).json({ error: 'Failed to fetch profitability stats.' });
+  }
+});

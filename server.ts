@@ -78,16 +78,16 @@ declare global {
 
 // AUTHENTICATION MIDDLEWARE (on your backend server)
 const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
-//  console.log('--- Inside authMiddleware ---');
-//  console.log('Request Headers:', req.headers); // Log all headers
+ console.log('--- Inside authMiddleware ---');
+console.log('Request Headers:', req.headers); // Log all headers
   const authHeader = req.headers.authorization;
-//  console.log('Authorization Header:', authHeader); // Log the Authorization header directly
+console.log('Authorization Header:', authHeader); // Log the Authorization header directly
 
   const token = authHeader?.split(' ')[1];
-  //console.log('Extracted Token:', token ? token.substring(0, 10) + '...' : 'No token extracted'); // Log first 10 chars of token for brevity
+  console.log('Extracted Token:', token ? token.substring(0, 10) + '...' : 'No token extracted'); // Log first 10 chars of token for brevity
 
   const secret = process.env.JWT_SECRET;
-//  console.log('JWT_SECRET (first 5 chars):', secret ? secret.substring(0, 5) + '...' : 'NOT DEFINED'); // Log part of secret
+  console.log('JWT_SECRET (first 5 chars):', secret ? secret.substring(0, 5) + '...' : 'NOT DEFINED'); // Log part of secret
 
   if (!secret) {
     //console.error('❌ JWT_SECRET not defined in .env');
@@ -101,7 +101,7 @@ const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
 
   try {
     const decoded = jwt.verify(token, secret);
-   // console.log('Token Decoded Successfully:', decoded);
+    console.log('Token Decoded Successfully:', decoded);
     req.user = decoded as { user_id: string; parent_user_id: string };
 
     next();
@@ -3881,7 +3881,7 @@ app.post('/api/sales', authMiddleware, async (req: Request, res: Response) => {
     } else if (paymentType === 'Credit') {
       // Find Accounts Receivable ID
       const arAccountRes = await client.query(
-        `SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%Accounts Receivable%' AND type = 'Income' LIMIT 1`,
+        `SELECT id FROM public.accounts WHERE user_id = $1 AND name ILIKE '%Accounts Receivable%' AND type = 'Asset' LIMIT 1`,
         [user_id]
       );
       if (arAccountRes.rows.length === 0) {
@@ -7462,8 +7462,11 @@ const formatDate = (dateStr: string): string => {
 };
 // --- End Helper Functions ---
 
+// Helper function to format date
+
+
 app.get('/generate-financial-document', authMiddleware, async (req: Request, res: Response) => {
-  const { documentType, startDate, endDate, format } = req.query as {
+  const { documentType, startDate, endDate, format: formatParam } = req.query as {
     documentType?: string;
     startDate?: string;
     endDate?: string;
@@ -7476,36 +7479,29 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
 
   // Scope to the company owner (tenant)
   const user_id = req.user!.parent_user_id;
-  const wantJson = String(format || '').toLowerCase() === 'json';
+  const wantJson = String(formatParam || '').toLowerCase() === 'json';
 
   try {
-    let htmlContent = '';
     let filename = '';
-    let apiUrl = '';
 
-    // --- Determine the API URL and Filename based on documentType ---
+    // --- Determine the Filename based on documentType ---
     switch (documentType) {
       case 'income-statement':
-        apiUrl = `/reports/income-statement?start=${startDate}&end=${endDate}`;
         filename = `Income_Statement_${startDate}_to_${endDate}.pdf`;
         break;
       case 'balance-sheet':
-        // Balance sheet is "as of" a date, typically the end date of the period
-        apiUrl = `/reports/balance-sheet?asOf=${endDate}`;
         filename = `Balance_Sheet_As_Of_${endDate}.pdf`;
         break;
       case 'cash-flow-statement':
-        apiUrl = `/reports/cash-flow?start=${startDate}&end=${endDate}`;
         filename = `Cash_Flow_Statement_${startDate}_to_${endDate}.pdf`;
         break;
       case 'trial-balance':
-        apiUrl = `/reports/trial-balance?start=${startDate}&end=${endDate}`;
         filename = `Trial_Balance_${startDate}_to_${endDate}.pdf`;
         break;
       default:
         return res.status(400).json({ error: `Unsupported document type: ${documentType}` });
     }
-    // --- End URL/Filename Determination ---
+    // --- End Filename Determination ---
 
     // --- INTERNAL API CALL to fetch the raw JSON data ---
     // We'll simulate calling the internal endpoint.
@@ -7800,200 +7796,134 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
       return res.json(reportData);
     }
 
-    // --- GENERATE HTML BASED ON THE EXACT JSON STRUCTURE ---
-    // This part converts the fetched JSON data into a styled HTML document.
-    // You can customize the HTML/CSS here to match your desired PDF appearance.
+    // --- Generate PDF using PDFKit ---
+    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    // Explicitly type the chunks array and the 'data' event callback parameter
+    const chunks: Buffer[] = [];
+    
+    // Type the 'chunk' parameter as Buffer
+    doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+    
+    doc.on('end', () => {
+        const pdfBuffer = Buffer.concat(chunks);
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+        res.send(pdfBuffer);
+    });
+    
+    // Type the 'err' parameter as 'Error' (or 'any' if you prefer, but 'Error' is more specific)
+    doc.on('error', (err: Error) => {
+        console.error('Error generating PDF with PDFKit:', err);
+        // Check if headers have already been sent to avoid errors
+        if (!res.headersSent) {
+            return res.status(500).json({ 
+                error: 'Failed to generate PDF document with PDFKit', 
+                detail: err.message || String(err) 
+            });
+        } else {
+             console.error('Headers already sent. Could not send JSON error response.');
+        }
+    });
 
+    // --- Add Content to PDF based on documentType ---
     if (documentType === 'income-statement') {
-        htmlContent = `
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Income Statement</title>
-            <style>
-                body { font-family: Arial, sans-serif; }
-                .header { text-align: center; margin-bottom: 20px; }
-                .title { font-size: 24px; font-weight: bold; }
-                .period { font-size: 16px; margin-bottom: 20px; }
-                table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-                th { background-color: #f2f2f2; }
-                .total-row { font-weight: bold; }
-                .subtotal-row { font-weight: bold; border-top: 2px solid #000; }
-                .amount { text-align: right; }
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <div class="title">Income Statement</div>
-                <div class="period">For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}</div>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Item</th>
-                        <th>Amount (R)</th>
-                    </tr>
-                </thead>
-                <tbody>
-        `;
-        
-        // --- Process data to build lines (similar to frontend logic) ---
+        doc.fontSize(18).text('Income Statement', { align: 'center' });
+        doc.fontSize(12).text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
+        doc.moveDown();
+
         const sectionMap: Record<string, number> = {};
         reportData.sections.forEach((s: any) => {
             sectionMap[s.section] = parseFloat(s.amount) || 0;
         });
 
-        // Build lines based on standard structure (mirroring frontend)
-        htmlContent += `<tr><td>Sales Revenue</td><td class="amount">${formatCurrency(sectionMap['revenue'])}</td></tr>`;
-        const grossProfit = (sectionMap['revenue'] || 0) - 0; // Placeholder for COGS logic if needed
-        htmlContent += `<tr class="subtotal-row"><td>Gross Profit / (Loss)</td><td class="amount">${formatCurrency(grossProfit)}</td></tr>`;
+        doc.fontSize(12).text('Sales Revenue').text(formatCurrency(sectionMap['revenue']), { align: 'right' });
+        const grossProfit = (sectionMap['revenue'] || 0) - 0;
+        doc.moveDown(0.5);
+        doc.fontSize(12).text('Gross Profit / (Loss)').text(formatCurrency(grossProfit), { align: 'right' }).moveDown();
 
-        // Add Other Income sections
         if (sectionMap['other_income'] !== undefined && sectionMap['other_income'] > 0) {
-            htmlContent += `<tr><td>Add: Other Income</td><td class="amount">${formatCurrency(0)}</td></tr>`;
-            htmlContent += `<tr><td>&nbsp;&nbsp;Other Income</td><td class="amount">${formatCurrency(sectionMap['other_income'])}</td></tr>`;
+            doc.text('Add: Other Income').text(formatCurrency(0), { align: 'right' });
+            doc.text(`  Other Income`).text(formatCurrency(sectionMap['other_income']), { align: 'right' });
         }
 
         const grossIncome = grossProfit + (sectionMap['other_income'] || 0);
-        htmlContent += `<tr class="subtotal-row"><td>Gross Income</td><td class="amount">${formatCurrency(grossIncome)}</td></tr>`;
+        doc.moveDown(0.5);
+        doc.fontSize(12).text('Gross Income').text(formatCurrency(grossIncome), { align: 'right' }).moveDown();
 
-        // Add Expenses sections
-        htmlContent += `<tr><td>Less: Expenses</td><td class="amount">${formatCurrency(0)}</td></tr>`;
+        doc.text('Less: Expenses').text(formatCurrency(0), { align: 'right' });
         if (sectionMap['operating_expenses'] !== undefined) {
-            htmlContent += `<tr><td>&nbsp;&nbsp;Operating Expenses</td><td class="amount">${formatCurrency(sectionMap['operating_expenses'])}</td></tr>`;
+            doc.text(`  Operating Expenses`).text(formatCurrency(sectionMap['operating_expenses']), { align: 'right' });
         }
-        // Add other expense sections if they exist in the data
         Object.keys(sectionMap).forEach(key => {
             if (key !== 'revenue' && key !== 'other_income' && key !== 'operating_expenses' && sectionMap[key] > 0) {
-                 htmlContent += `<tr><td>&nbsp;&nbsp;${key.replace(/_/g, ' ')}</td><td class="amount">${formatCurrency(sectionMap[key])}</td></tr>`;
+                 doc.text(`  ${key.replace(/_/g, ' ')}`).text(formatCurrency(sectionMap[key]), { align: 'right' });
             }
         });
 
         const totalExpenses = Object.keys(sectionMap)
             .filter(k => k !== 'revenue' && k !== 'other_income')
             .reduce((sum, k) => sum + sectionMap[k], 0);
-        htmlContent += `<tr class="subtotal-row"><td>Total Expenses</td><td class="amount">${formatCurrency(totalExpenses)}</td></tr>`;
+        doc.moveDown(0.5);
+        doc.fontSize(12).text('Total Expenses').text(formatCurrency(totalExpenses), { align: 'right' }).moveDown();
 
         const netProfitLoss = grossIncome - totalExpenses;
-        htmlContent += `<tr class="total-row"><td>${netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period'}</td><td class="amount">${formatCurrency(Math.abs(netProfitLoss))}</td></tr>`;
+        doc.fontSize(14).text(`${netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period'}`).text(formatCurrency(Math.abs(netProfitLoss)), { align: 'right' });
 
-        htmlContent += `
-                </tbody>
-            </table>
-        </body>
-        </html>
-        `;
     }
     else if (documentType === 'balance-sheet') {
         const totalAssets = (reportData.assets.current || 0) + (reportData.assets.non_current || 0);
         const totalLiabilities = (reportData.liabilities.current || 0) + (reportData.liabilities.non_current || 0);
         const totalEquityAndLiabilities = totalLiabilities + reportData.closingEquity;
 
-        htmlContent = `
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Balance Sheet</title>
-            <style>
-                body { font-family: Arial, sans-serif; }
-                .header { text-align: center; margin-bottom: 20px; }
-                .title { font-size: 24px; font-weight: bold; }
-                .period { font-size: 16px; margin-bottom: 20px; }
-                .section-title { font-size: 18px; font-weight: bold; margin-top: 20px; margin-bottom: 10px; }
-                table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-                th { background-color: #f2f2f2; }
-                .total-row { font-weight: bold; }
-                .subtotal-row { font-weight: bold; border-top: 2px solid #000; }
-                .amount { text-align: right; }
-                .indent { padding-left: 20px; }
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <div class="title">Balance Sheet</div>
-                <div class="period">As of ${formatDate(reportData.asOf)}</div>
-            </div>
-            
-            <div class="section-title">ASSETS</div>
-            <table>
-                <tbody>
-                    <tr><td class="indent">Current Assets</td><td class="amount">${formatCurrency(reportData.assets.current)}</td></tr>
-                    <tr class="subtotal-row"><td>Total Current Assets</td><td class="amount">${formatCurrency(reportData.assets.current)}</td></tr>
-                    
-                    <tr><td class="indent">Non-current Assets</td><td class="amount">${formatCurrency(reportData.assets.non_current)}</td></tr>
-                    <tr class="subtotal-row"><td>Total Non-Current Assets</td><td class="amount">${formatCurrency(reportData.assets.non_current)}</td></tr>
-                    
-                    <tr class="total-row"><td>TOTAL ASSETS</td><td class="amount">${formatCurrency(totalAssets)}</td></tr>
-                </tbody>
-            </table>
-            
-            <div class="section-title">EQUITY AND LIABILITIES</div>
-            <table>
-                <tbody>
-                    <tr><td class="indent">Current Liabilities</td><td class="amount">${formatCurrency(reportData.liabilities.current)}</td></tr>
-                    <tr class="subtotal-row"><td>Total Current Liabilities</td><td class="amount">${formatCurrency(reportData.liabilities.current)}</td></tr>
-                    
-                    <tr><td class="indent">Non-Current Liabilities</td><td class="amount">${formatCurrency(reportData.liabilities.non_current)}</td></tr>
-                    <tr class="subtotal-row"><td>Total Non-Current Liabilities</td><td class="amount">${formatCurrency(reportData.liabilities.non_current)}</td></tr>
-                    
-                    <tr class="subtotal-row"><td>TOTAL LIABILITIES</td><td class="amount">${formatCurrency(totalLiabilities)}</td></tr>
-                    
-                    <tr><td class="indent">Equity</td><td class="amount"></td></tr>
-                    <tr><td class="indent">&nbsp;&nbsp;Opening Balance</td><td class="amount">${formatCurrency(reportData.openingEquity)}</td></tr>
-                    <tr><td class="indent">&nbsp;&nbsp;${reportData.netProfitLoss >= 0 ? 'Net Profit for Period' : 'Net Loss for Period'}</td><td class="amount">${formatCurrency(Math.abs(reportData.netProfitLoss))}</td></tr>
-                    <tr class="subtotal-row"><td>TOTAL EQUITY</td><td class="amount">${formatCurrency(reportData.closingEquity)}</td></tr>
-                    
-                    <tr class="total-row"><td>TOTAL EQUITY AND LIABILITIES</td><td class="amount">${formatCurrency(totalEquityAndLiabilities)}</td></tr>
-                </tbody>
-            </table>
-        </body>
-        </html>
-        `;
+        doc.fontSize(18).text('Balance Sheet', { align: 'center' });
+        doc.fontSize(12).text(`As of ${formatDate(reportData.asOf)}`, { align: 'center' });
+        doc.moveDown();
+
+        doc.fontSize(14).text('ASSETS');
+        doc.moveDown(0.5);
+        doc.fontSize(12).text(`  Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' });
+        doc.text(`Total Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' }).moveDown(0.5);
+        
+        doc.text(`  Non-current Assets`).text(formatCurrency(reportData.assets.non_current), { align: 'right' });
+        doc.text(`Total Non-Current Assets`).text(formatCurrency(reportData.assets.non_current), { align: 'right' }).moveDown(0.5);
+        
+        doc.fontSize(14).text(`TOTAL ASSETS`).text(formatCurrency(totalAssets), { align: 'right' }).moveDown();
+
+        doc.fontSize(14).text('EQUITY AND LIABILITIES');
+        doc.moveDown(0.5);
+        doc.fontSize(12).text(`  Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' });
+        doc.text(`Total Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' }).moveDown(0.5);
+        
+        doc.text(`  Non-Current Liabilities`).text(formatCurrency(reportData.liabilities.non_current), { align: 'right' });
+        doc.text(`Total Non-Current Liabilities`).text(formatCurrency(reportData.liabilities.non_current), { align: 'right' }).moveDown(0.5);
+        
+        doc.text(`TOTAL LIABILITIES`).text(formatCurrency(totalLiabilities), { align: 'right' }).moveDown(0.5);
+        
+        doc.fontSize(12).text(`  Equity`);
+        doc.text(`    Opening Balance`).text(formatCurrency(reportData.openingEquity), { align: 'right' });
+        doc.text(`    ${reportData.netProfitLoss >= 0 ? 'Net Profit for Period' : 'Net Loss for Period'}`).text(formatCurrency(Math.abs(reportData.netProfitLoss)), { align: 'right' });
+        doc.text(`TOTAL EQUITY`).text(formatCurrency(reportData.closingEquity), { align: 'right' }).moveDown(0.5);
+        
+        doc.fontSize(14).text(`TOTAL EQUITY AND LIABILITIES`).text(formatCurrency(totalEquityAndLiabilities), { align: 'right' });
     }
     else if (documentType === 'cash-flow-statement') {
-        htmlContent = `
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Cash Flow Statement</title>
-            <style>
-                body { font-family: Arial, sans-serif; }
-                .header { text-align: center; margin-bottom: 20px; }
-                .title { font-size: 24px; font-weight: bold; }
-                .period { font-size: 16px; margin-bottom: 20px; }
-                .section-title { font-size: 18px; font-weight: bold; margin-top: 20px; margin-bottom: 10px; }
-                table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-                th { background-color: #f2f2f2; }
-                .total-row { font-weight: bold; }
-                .subtotal-row { font-weight: bold; border-top: 2px solid #000; }
-                .amount { text-align: right; }
-                .indent { padding-left: 20px; }
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <div class="title">Cash Flow Statement</div>
-                <div class="period">For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}</div>
-            </div>
-        `;
-        
+        doc.fontSize(18).text('Cash Flow Statement', { align: 'center' });
+        doc.fontSize(12).text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
+        doc.moveDown();
+
         let netChange = 0;
         const categories = ['operating', 'investing', 'financing'];
         
         categories.forEach(cat => {
           const itemsRaw = reportData.sections[cat];
           if (Array.isArray(itemsRaw) && itemsRaw.length > 0) {
-            htmlContent += `<div class="section-title">${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities</div>`;
-            htmlContent += `<table><tbody>`;
+            doc.fontSize(14).text(`${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`).moveDown(0.5);
             
             let sectionTotal = 0;
             itemsRaw.forEach((item: any) => {
               const amount = parseFloat(item.amount.toString());
               sectionTotal += amount;
-              htmlContent += `<tr><td class="indent">${item.line}</td><td class="amount">${formatCurrency(amount)}</td></tr>`;
+              doc.fontSize(12).text(`  ${item.line}`).text(formatCurrency(amount), { align: 'right' });
             });
             
             netChange += sectionTotal;
@@ -8001,133 +7931,56 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
               ? `Net cash from ${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities` 
               : `Net cash used in ${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`;
               
-            htmlContent += `<tr class="subtotal-row"><td>${subtotalLabel}</td><td class="amount">${formatCurrency(sectionTotal)}</td></tr>`;
-            htmlContent += `</tbody></table>`;
+            doc.moveDown(0.5);
+            doc.fontSize(12).text(subtotalLabel).text(formatCurrency(sectionTotal), { align: 'right' }).moveDown();
           }
         });
         
-        htmlContent += `
-            <div class="section-title">Net Increase / (Decrease) in Cash</div>
-            <table>
-                <tbody>
-                    <tr class="total-row"><td>Net Change in Cash</td><td class="amount">${formatCurrency(netChange)}</td></tr>
-                </tbody>
-            </table>
-        </body>
-        </html>
-        `;
+        doc.fontSize(14).text('Net Increase / (Decrease) in Cash').text(formatCurrency(netChange), { align: 'right' });
     }
     else if (documentType === 'trial-balance') {
-        htmlContent = `
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Trial Balance</title>
-            <style>
-                body { font-family: Arial, sans-serif; }
-                .header { text-align: center; margin-bottom: 20px; }
-                .title { font-size: 24px; font-weight: bold; }
-                .period { font-size: 16px; margin-bottom: 20px; }
-                table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-                th { background-color: #f2f2f2; }
-                .total-row { font-weight: bold; }
-                .subtotal-row { font-weight: bold; border-top: 2px solid #000; }
-                .amount { text-align: right; }
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <div class="title">Trial Balance</div>
-                <div class="period">As of ${formatDate(reportData.period.end)}</div>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Account</th>
-                        <th>Debit (R)</th>
-                        <th>Credit (R)</th>
-                    </tr>
-                </thead>
-                <tbody>
-        `;
-        
-        reportData.items.forEach((item: any) => {
-          htmlContent += `
-            <tr>
-              <td>${item.code} - ${item.name}</td>
-              <td class="amount">${formatCurrency(parseFloat(item.balance_debit))}</td>
-              <td class="amount">${formatCurrency(parseFloat(item.balance_credit))}</td>
-            </tr>
-          `;
-        });
-        
-        htmlContent += `
-                  <tr class="total-row">
-                    <td>TOTALS</td>
-                    <td class="amount">${formatCurrency(reportData.totals.balance_debit)}</td>
-                    <td class="amount">${formatCurrency(reportData.totals.balance_credit)}</td>
-                  </tr>
-                </tbody>
-            </table>
-        </body>
-        </html>
-        `;
-    }
-    // --- END HTML GENERATION ---
+        doc.fontSize(18).text('Trial Balance', { align: 'center' });
+        doc.fontSize(12).text(`As of ${formatDate(reportData.period.end)}`, { align: 'center' });
+        doc.moveDown();
 
-    // --- Generate PDF using Puppeteer ---
-    let browser;
-    try {
-      // Launch Puppeteer with appropriate flags for sandboxed environments
-      browser = await puppeteer.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage'
-        ]
-      });
-      
-      const page = await browser.newPage();
-      
-      // Set the generated HTML content
-      await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
-      
-      // Generate the PDF buffer
-      const pdfBuffer = await page.pdf({
-        format: 'A4',
-        printBackground: true,
-        margin: {
-          top: '20px',
-          right: '20px',
-          bottom: '20px',
-          left: '20px'
-        }
-      });
-      
-      // Close the browser instance
-      await browser.close();
-      
-      // Set the correct Content-Type and Content-Disposition headers for PDF download
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-      
-      // Send the PDF buffer to the client
-      res.send(pdfBuffer);
-      
-    } catch (pdfError: any) {
-      console.error('Error generating PDF:', pdfError);
-      // Ensure browser is closed even if an error occurs
-      if (browser) {
-        await browser.close().catch(console.error); // Ignore errors during cleanup
-      }
-      // Return a JSON error response
-      return res.status(500).json({ 
-        error: 'Failed to generate PDF document', 
-        detail: pdfError?.message || String(pdfError) 
-      });
+        // Table Headers
+        const startX = 50;
+        let x = startX;
+        const y = doc.y;
+        const colWidth = 150;
+        doc.fontSize(12).text('Account', x, y);
+        x += colWidth;
+        doc.text('Debit (R)', x, y, { width: colWidth, align: 'right' });
+        x += colWidth;
+        doc.text('Credit (R)', x, y, { width: colWidth, align: 'right' });
+        doc.moveDown();
+
+        // Underline headers
+        doc.moveTo(startX, doc.y).lineTo(startX + colWidth * 3, doc.y).stroke();
+
+        // Table Rows
+        reportData.items.forEach((item: any) => {
+            x = startX;
+            doc.fontSize(10);
+            doc.text(`${item.code} - ${item.name}`, x, doc.y);
+            x += colWidth;
+            doc.text(formatCurrency(parseFloat(item.balance_debit)), x, doc.y, { width: colWidth, align: 'right' });
+            x += colWidth;
+            doc.text(formatCurrency(parseFloat(item.balance_credit)), x, doc.y, { width: colWidth, align: 'right' });
+            doc.moveDown(0.3);
+        });
+
+        // Totals Row
+        x = startX;
+        doc.moveTo(startX, doc.y).lineTo(startX + colWidth * 3, doc.y).stroke(); // Line above totals
+        doc.fontSize(12).text('TOTALS', x, doc.y);
+        x += colWidth;
+        doc.text(formatCurrency(reportData.totals.balance_debit), x, doc.y, { width: colWidth, align: 'right' });
+        x += colWidth;
+        doc.text(formatCurrency(reportData.totals.balance_credit), x, doc.y, { width: colWidth, align: 'right' });
     }
+
+    doc.end();
 
   } catch (err: any) {
     console.error('Error in /generate-financial-document:', err);
@@ -8138,7 +7991,6 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
     });
   }
 });
-
 // Profile endpoints
 // GET /api/profile
 app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
@@ -9234,164 +9086,10 @@ const getPreviousPeriodDates = (startDateStr: string, endDateStr: string) => {
 };
 
 // NEW ENDPOINT: GET Revenue Statistics for a period (or all time)
-app.get('/api/stats/revenue', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id;
-    // startDate and endDate can now be optional
-    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
 
-    try {
-        let currentPeriodValue = 0;
-        let previousPeriodValue = 0;
-        let changePercentage: number | undefined;
-        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
-
-        let dateFilterClause = '';
-        const currentQueryParams: (string | number)[] = [user_id];
-        let currentParamIndex = 2;
-
-        // If both startDate and endDate are provided, build the date filter clause
-        if (startDate && endDate) {
-            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
-            currentQueryParams.push(startDate);
-            currentQueryParams.push(endDate);
-        }
-
-        // Fetch current period revenue (or all-time if no dates provided)
-        const currentRevenueResult = await pool.query(`
-            SELECT COALESCE(SUM(amount), 0) AS value
-            FROM public.transactions
-            WHERE
-                user_id = $1
-                AND type = 'income'
-                AND category IN ('Revenue', 'Sales Revenue')
-                ${dateFilterClause};
-        `, currentQueryParams);
-
-        currentPeriodValue = parseFloat(currentRevenueResult.rows[0]?.value || 0);
-
-        // Only calculate previous period and change if a specific date range was provided
-        if (startDate && endDate) {
-            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
-            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
-
-            // Fetch previous period revenue
-            const previousRevenueResult = await pool.query(`
-                SELECT COALESCE(SUM(amount), 0) AS value
-                FROM public.transactions
-                WHERE
-                    user_id = $1
-                    AND type = 'income'
-                    AND category IN ('Revenue', 'Sales Revenue')
-                    AND date BETWEEN $2 AND $3;
-            `, previousQueryParams);
-
-            previousPeriodValue = parseFloat(previousRevenueResult.rows[0]?.value || 0);
-
-            // Calculate change percentage
-            if (previousPeriodValue !== 0) {
-                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
-                if (changePercentage > 0) {
-                    changeType = 'increase';
-                } else if (changePercentage < 0) {
-                    changeType = 'decrease';
-                }
-            } else if (currentPeriodValue > 0) {
-                changePercentage = 100; // Infinite increase from zero to a positive value
-                changeType = 'increase';
-            }
-        }
-
-        res.json({
-            value: currentPeriodValue,
-            previousValue: previousPeriodValue,
-            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
-            changeType: changeType
-        });
-
-    } catch (error: unknown) {
-        console.error('Error fetching revenue stats:', error);
-        res.status(500).json({ error: 'Failed to fetch revenue statistics', detail: error instanceof Error ? error.message : String(error) });
-    }
-});
 
 // NEW ENDPOINT: GET Expenses Statistics for a period (or all time)
-app.get('/api/stats/expenses', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id;
-    // startDate and endDate can now be optional
-    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
 
-    try {
-        let currentPeriodValue = 0;
-        let previousPeriodValue = 0;
-        let changePercentage: number | undefined;
-        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
-
-        let dateFilterClause = '';
-        const currentQueryParams: (string | number)[] = [user_id];
-        let currentParamIndex = 2;
-
-        // If both startDate and endDate are provided, build the date filter clause
-        if (startDate && endDate) {
-            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
-            currentQueryParams.push(startDate);
-            currentQueryParams.push(endDate);
-        }
-
-        // Fetch current period expenses (or all-time if no dates provided)
-        const currentExpensesResult = await pool.query(`
-            SELECT COALESCE(SUM(amount), 0) AS value
-            FROM public.transactions
-            WHERE
-                user_id = $1
-                AND type = 'expense'
-                ${dateFilterClause};
-        `, currentQueryParams);
-
-        currentPeriodValue = parseFloat(currentExpensesResult.rows[0]?.value || 0);
-
-        // Only calculate previous period and change if a specific date range was provided
-        if (startDate && endDate) {
-            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
-            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
-
-            // Fetch previous period expenses
-            const previousExpensesResult = await pool.query(`
-                SELECT COALESCE(SUM(amount), 0) AS value
-                FROM public.transactions
-                WHERE
-                    user_id = $1
-                    AND type = 'expense'
-                    AND date BETWEEN $2 AND $3;
-            `, previousQueryParams);
-
-            previousPeriodValue = parseFloat(previousExpensesResult.rows[0]?.value || 0);
-
-            // Calculate change percentage
-            if (previousPeriodValue !== 0) {
-                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
-                if (changePercentage > 0) { // For expenses, an increase is often seen as a negative trend
-                    changeType = 'increase';
-                } else if (changePercentage < 0) {
-                    changeType = 'decrease';
-                }
-            } else if (currentPeriodValue > 0) {
-                changePercentage = 100; // Infinite increase from zero to a positive value
-                changeType = 'increase';
-            }
-        }
-
-        res.json({
-            value: currentPeriodValue,
-            previousValue: previousPeriodValue,
-            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
-            changeType: changeType
-        });
-
-    } catch (error: unknown) {
-        console.error('Error fetching expenses stats:', error);
-        res.status(500).json({ error: 'Failed to fetch expenses statistics', detail: error instanceof Error ? error.message : String(error) });
-    }
-});
 
 // Existing /api/stats/clients endpoint, modified to allow all-time view and use public.sales
 app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
@@ -9893,70 +9591,7 @@ app.get('/api/applications', authMiddleware, async (req: Request, res: Response)
 
 
 // Add this new endpoint to your server.ts file, e.g., after the quotes endpoint.
-app.get('/api/stats/profitability', authMiddleware, async (req: Request, res: Response) => {
-  const user_id = req.user!.parent_user_id;
-  const { startDate, endDate } = req.query;
 
-  try {
-    let dateFilter = '';
-    const queryParams: (string | number)[] = [user_id];
-    let paramIndex = 2;
-
-    if (startDate) {
-      dateFilter += ` AND date >= $${paramIndex++}`;
-      queryParams.push(startDate as string);
-    }
-    if (endDate) {
-      dateFilter += ` AND date <= $${paramIndex++}`;
-      queryParams.push(endDate as string);
-    }
-
-    // Get total income
-    const incomeResult = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total_income FROM public.transactions WHERE user_id = $1 AND type = 'income' ${dateFilter};`,
-      queryParams
-    );
-    const totalIncome = parseFloat(incomeResult.rows[0]?.total_income || 0);
-
-    // Get total expenses
-    const expensesResult = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total_expenses FROM public.transactions WHERE user_id = $1 AND type = 'expense' ${dateFilter};`,
-      queryParams
-    );
-    const totalExpenses = parseFloat(expensesResult.rows[0]?.total_expenses || 0);
-
-    // Get previous period income
-    const { currentStart, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
-
-    const previousIncomeResult = await pool.query(
-        `SELECT COALESCE(SUM(amount), 0) AS total_income FROM public.transactions WHERE user_id = $1 AND type = 'income' AND date >= $2 AND date < $3;`,
-        [user_id, previousStart, currentStart]
-    );
-    const previousIncome = parseFloat(previousIncomeResult.rows[0]?.total_income || 0);
-
-    // Get previous period expenses
-    const previousExpensesResult = await pool.query(
-        `SELECT COALESCE(SUM(amount), 0) AS total_expenses FROM public.transactions WHERE user_id = $1 AND type = 'expense' AND date >= $2 AND date < $3;`,
-        [user_id, previousStart, currentStart]
-    );
-    const previousExpenses = parseFloat(previousExpensesResult.rows[0]?.total_expenses || 0);
-
-
-    const currentProfit = totalIncome - totalExpenses;
-    const previousProfit = previousIncome - previousExpenses;
-    const { changePercentage, changeType } = calculateChange(currentProfit, previousProfit);
-
-    res.status(200).json({
-      value: currentProfit,
-      previousValue: previousProfit,
-      changePercentage,
-      changeType,
-    });
-  } catch (error) {
-    console.error('Error fetching profitability stats:', error);
-    res.status(500).json({ error: 'Failed to fetch profitability stats.' });
-  }
-});
 
 
 // New endpoint for Revenue by Product/Service
@@ -11841,6 +11476,857 @@ app.get('/api/products/cluster-data', authMiddleware, async (req: Request, res: 
     res.status(500).json({ error: 'Failed to fetch products with cluster data.' });
   }
 });
+
+// server.ts
+
+// --- NEW ENDPOINT: Migrate Transactions to Journal Entries ---
+app.post('/api/migrate-transactions-to-journal', authMiddleware, async (req: Request, res: Response) => {
+  console.log("[MIGRATION] Starting migration of transactions to journal entries...");
+  
+  const userId = req.user!.parent_user_id;
+  if (!userId) {
+    console.error("[MIGRATION ERROR] User ID not found.");
+    return res.status(400).json({ error: 'User ID not found.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Fetch unmigrated transactions for the user
+    console.log(`[MIGRATION] Fetching unmigrated transactions for user ${userId}...`);
+    const transactionsRes = await client.query(
+      `SELECT id, "type", amount, description, "date", category, account_id, original_text, "source", confirmed, user_id, migrated_to_journal
+       FROM public.transactions
+       WHERE user_id = $1 AND (migrated_to_journal IS NULL OR migrated_to_journal = FALSE)
+       ORDER BY "date", id`,
+      [userId]
+    );
+    const transactions = transactionsRes.rows;
+    console.log(`[MIGRATION] Found ${transactions.length} transactions to migrate.`);
+
+    if (transactions.length === 0) {
+      await client.query('COMMIT');
+      console.log("[MIGRATION] No transactions to migrate.");
+      return res.status(200).json({ message: 'No transactions to migrate.', migrated: 0 });
+    }
+
+    // 2. Find the default Cash/Bank account for the user (you might have a specific way to identify this)
+    console.log(`[MIGRATION] Finding default Cash/Bank account for user ${userId}...`);
+    const cashAccountRes = await client.query(
+      `SELECT id FROM public.accounts 
+       WHERE user_id = $1 AND (name ILIKE '%cash%' OR name ILIKE '%bank%') AND is_active = TRUE AND is_postable = TRUE
+       ORDER BY id LIMIT 1`, // Simple logic: pick the first Cash/Bank account found
+      [userId]
+    );
+    const cashAccountId = cashAccountRes.rows[0]?.id;
+    if (!cashAccountId) {
+      await client.query('ROLLBACK');
+      console.error("[MIGRATION ERROR] No default Cash/Bank account found for user.", userId);
+      return res.status(400).json({ error: 'No default Cash/Bank account found for user. Please create one before migrating.' });
+    }
+    console.log(`[MIGRATION] Using Cash/Bank account ID: ${cashAccountId}`);
+
+    let migratedCount = 0;
+    const errors: string[] = [];
+
+    // 3. Process each transaction
+    console.log(`[MIGRATION] Starting to process ${transactions.length} transactions...`);
+    for (const tx of transactions) {
+      try {
+        const txId = tx.id;
+        const txType = tx.type; // 'income', 'expense', 'transfer', 'adjustment'
+        const txAmount = parseFloat(tx.amount) || 0;
+        const txDescription = tx.description || tx.original_text || 'Migrated Transaction';
+        const txDate = tx.date; // 'YYYY-MM-DD'
+        const txAccountId = tx.account_id; // Primary account
+        
+        console.log(`[MIGRATION] Processing transaction ID ${txId} (${txType}, R${txAmount})...`);
+
+        // Skip if amount is zero or no primary account
+        if (txAmount === 0) {
+          console.warn(`[MIGRATION WARN] Skipping transaction ID ${txId}: Amount is zero.`);
+          errors.push(`Transaction ID ${txId}: Skipped (Amount is zero)`);
+          continue;
+        }
+        if (!txAccountId) {
+          console.warn(`[MIGRATION WARN] Skipping transaction ID ${txId}: No primary account_id.`);
+          errors.push(`Transaction ID ${txId}: Skipped (No primary account)`);
+          continue;
+        }
+
+        // 4. Determine Debit and Credit accounts and amounts
+        let debitAccountId: number | null = null;
+        let creditAccountId: number | null = null;
+        let debitAmount: number = 0;
+        let creditAmount: number = Math.abs(txAmount); // Use absolute value
+
+        if (txType === 'income') {
+          // Income: Dr Cash/Bank, Cr Revenue (Primary Account)
+          debitAccountId = cashAccountId;
+          creditAccountId = txAccountId;
+          debitAmount = creditAmount; // Both sides equal for balanced entry
+        } else if (txType === 'expense') {
+          // Expense: Dr Expense (Primary Account), Cr Cash/Bank
+          debitAccountId = txAccountId;
+          creditAccountId = cashAccountId;
+          debitAmount = creditAmount; // Both sides equal for balanced entry
+        } else {
+          // For 'transfer' or 'adjustment', we might skip or need special logic
+          // Let's skip them for now and log a warning
+          console.warn(`[MIGRATION WARN] Skipping transaction ID ${txId}: Type '${txType}' not supported for automatic migration.`);
+          errors.push(`Transaction ID ${txId}: Skipped (Type '${txType}' not supported)`);
+          continue;
+        }
+
+        // 5. Create Journal Entry
+        const jeRes = await client.query(
+          `INSERT INTO public.journal_entries (entry_date, memo, user_id, source)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id`,
+          [txDate, txDescription, userId, `migration-${tx.source || 'manual'}`]
+        );
+        const journalEntryId = jeRes.rows[0].id;
+        console.log(`[MIGRATION] Created Journal Entry ID ${journalEntryId} for transaction ${txId}.`);
+
+        // 6. Create Journal Lines
+        const lines: Array<{ entryId: number; accountId: number; debit: number; credit: number }> = [];
+        if (debitAccountId) {
+          lines.push({ entryId: journalEntryId, accountId: debitAccountId, debit: debitAmount, credit: 0 });
+        }
+        if (creditAccountId) {
+          lines.push({ entryId: journalEntryId, accountId: creditAccountId, debit: 0, credit: creditAmount });
+        }
+
+        if (lines.length !== 2) {
+            throw new Error(`Failed to create 2 lines for journal entry ${journalEntryId}. Only created ${lines.length}.`);
+        }
+
+        // Bulk insert lines
+        const lineValues: string[] = [];
+        const lineParams: any[] = [];
+        let paramIndex = 1;
+        for (const l of lines) {
+          lineValues.push(`($${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++})`);
+          lineParams.push(l.entryId, l.accountId, userId, l.debit, l.credit);
+        }
+        await client.query(
+          `INSERT INTO public.journal_lines (entry_id, account_id, user_id, debit, credit)
+           VALUES ${lineValues.join(", ")}`,
+          lineParams
+        );
+        console.log(`[MIGRATION] Created ${lines.length} Journal Lines for entry ${journalEntryId}.`);
+
+        // 7. Mark transaction as migrated
+        await client.query(
+          `UPDATE public.transactions SET migrated_to_journal = TRUE WHERE id = $1 AND user_id = $2`,
+          [txId, userId]
+        );
+        console.log(`[MIGRATION] Marked transaction ID ${txId} as migrated.`);
+
+        migratedCount++;
+
+      } catch (txError: any) {
+        console.error(`[MIGRATION ERROR] Failed to migrate transaction ID ${tx.id}:`, txError);
+        errors.push(`Transaction ID ${tx.id}: Failed (${txError.message})`);
+        // Decide whether to continue with other transactions or rollback everything
+        // For now, let's continue to migrate as many as possible
+        // await client.query('ROLLBACK'); // Uncomment if you want to stop on first error
+        // return res.status(500).json({ error: `Migration failed for transaction ID ${tx.id}`, detail: txError.message });
+      }
+    }
+
+    await client.query('COMMIT');
+    console.log(`[MIGRATION] Migration completed. Migrated ${migratedCount} transactions.`);
+    res.json({ 
+      message: `Migration completed. Migrated ${migratedCount} transactions.`, 
+      migrated: migratedCount,
+      errors: errors.length > 0 ? errors : undefined
+    });
+
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('[MIGRATION ERROR] Migration failed:', error);
+    res.status(500).json({ error: 'Migration failed', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+// --- END NEW ENDPOINT ---
+
+
+// Example SQL for Revenue Endpoint (GET /api/stats/revenue?startDate=...&endDate=...)
+// Replace the entire /api/stats/revenue endpoint with this version
+app.get("/api/stats/revenue", authMiddleware, async (req, res) => {
+    const userId = req.user!.parent_user_id;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+
+    try {
+        // --- Current Period Revenue ---
+        let currentQuery = `
+            SELECT COALESCE(SUM(jl.credit), 0)::numeric(14, 2) AS total_revenue
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+            WHERE je.user_id = $1
+              AND rc.statement = 'income_statement'
+              AND rc.section = 'revenue' -- Changed from a.type = 'Income'
+              AND je.entry_date >= $2
+              AND je.entry_date <= $3
+        `;
+        let currentParams: any[] = [userId, '1970-01-01', '9999-12-31']; // Default wide range
+        if (startDate) currentParams[1] = startDate;
+        if (endDate) currentParams[2] = endDate;
+
+        const currentResult = await pool.query(currentQuery, currentParams);
+        const currentRevenue = parseFloat(currentResult.rows[0]?.total_revenue) || 0;
+
+        // --- Previous Period Revenue (for comparison) ---
+        let previousQuery = `
+            SELECT COALESCE(SUM(jl.credit), 0)::numeric(14, 2) AS total_revenue
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+            WHERE je.user_id = $1
+              AND rc.statement = 'income_statement'
+              AND rc.section = 'revenue' -- Changed from a.type = 'Income'
+              AND je.entry_date >= $2
+              AND je.entry_date < $3 -- Use < start to get previous period
+        `;
+        let previousParams: any[] = [userId, '1970-01-01', currentParams[1]]; // Default, previous period ends before current starts
+
+        // Calculate a simple previous period (e.g., same number of days before the current period)
+        if (startDate && endDate) {
+             const start = new Date(startDate);
+             const end = new Date(endDate);
+             const diffTime = Math.abs(end.getTime() - start.getTime());
+             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to make it inclusive like the main period?
+
+             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24); // One day before start
+             const previousStart = new Date(previousEnd.getTime() - diffTime); // Same duration before that
+
+             previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+        } else if (startDate) {
+            // If only start date, maybe compare to a fixed duration before?
+            const start = new Date(startDate);
+            const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+            const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24); // One day before
+            const previousStart = new Date(previousEnd.getTime() - thirtyDaysMs);
+            previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+        }
+
+        const previousResult = await pool.query(previousQuery, previousParams);
+        const previousRevenue = parseFloat(previousResult.rows[0]?.total_revenue) || 0;
+
+        // --- Calculate Change ---
+        let changePercentage = 0;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+        if (previousRevenue !== 0) {
+            changePercentage = ((currentRevenue - previousRevenue) / Math.abs(previousRevenue)) * 100;
+            changeType = changePercentage > 0 ? 'increase' : changePercentage < 0 ? 'decrease' : 'neutral';
+        } else if (currentRevenue > 0) {
+             changeType = 'increase'; // Went from 0 to positive
+        } else if (currentRevenue < 0) {
+             changeType = 'decrease'; // Went from 0 to negative (unlikely for revenue, but possible in accounting)
+        }
+
+        res.json({
+            value: currentRevenue,
+            previousValue: previousRevenue,
+            changePercentage: parseFloat(changePercentage.toFixed(2)),
+            changeType: changeType
+        });
+
+    } catch (err: any) {
+        console.error("Error fetching revenue stats:", err);
+        res.status(500).json({ error: "Failed to fetch revenue statistics.", detail: err.message });
+    }
+});
+
+
+app.get("/api/stats/expenses", authMiddleware, async (req, res) => {
+    const userId = req.user!.parent_user_id;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+
+    try {
+        // --- Current Period Expenses ---
+        let currentQuery = `
+            SELECT COALESCE(SUM(jl.debit), 0)::numeric(14, 2) AS total_expenses
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+            WHERE je.user_id = $1
+              AND rc.statement = 'income_statement'
+              AND rc.section IN ('operating_expenses') -- Include ALL expense sections
+              AND je.entry_date >= $2
+              AND je.entry_date <= $3
+        `;
+        let currentParams: any[] = [userId, '1970-01-01', '9999-12-31'];
+        if (startDate) currentParams[1] = startDate;
+        if (endDate) currentParams[2] = endDate;
+
+        const currentResult = await pool.query(currentQuery, currentParams);
+        const currentExpenses = parseFloat(currentResult.rows[0]?.total_expenses) || 0;
+
+         // --- Previous Period Expenses (for comparison) ---
+        let previousQuery = `
+            SELECT COALESCE(SUM(jl.debit), 0)::numeric(14, 2) AS total_expenses
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+            WHERE je.user_id = $1
+              AND rc.statement = 'income_statement'
+              AND rc.section IN ('operating_expenses')
+              AND je.entry_date >= $2
+              AND je.entry_date < $3
+        `;
+        // Calculate previous period dates (same logic as revenue)
+        let previousParams: any[] = [userId, '1970-01-01', currentParams[1]];
+
+        if (startDate && endDate) {
+             const start = new Date(startDate);
+             const end = new Date(endDate);
+             const diffTime = Math.abs(end.getTime() - start.getTime());
+             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+
+             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
+             const previousStart = new Date(previousEnd.getTime() - diffTime);
+
+             previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+        } else if (startDate) {
+            const start = new Date(startDate);
+            const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+            const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
+            const previousStart = new Date(previousEnd.getTime() - thirtyDaysMs);
+            previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+        }
+
+        const previousResult = await pool.query(previousQuery, previousParams);
+        const previousExpenses = parseFloat(previousResult.rows[0]?.total_expenses) || 0;
+
+        // --- Calculate Change ---
+        let changePercentage = 0;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+        if (previousExpenses !== 0) {
+            changePercentage = ((currentExpenses - previousExpenses) / Math.abs(previousExpenses)) * 100;
+            changeType = changePercentage > 0 ? 'increase' : changePercentage < 0 ? 'decrease' : 'neutral';
+        } else if (currentExpenses > 0) {
+             changeType = 'increase';
+        } else if (currentExpenses < 0) {
+             changeType = 'decrease'; // Unlikely for expenses
+        }
+
+        res.json({
+            value: currentExpenses,
+            previousValue: previousExpenses,
+            changePercentage: parseFloat(changePercentage.toFixed(2)),
+            changeType: changeType
+        });
+
+    } catch (err: any) {
+        console.error("Error fetching expenses stats:", err);
+        res.status(500).json({ error: "Failed to fetch expenses statistics.", detail: err.message });
+    }
+});
+
+// Example SQL for Profitability Endpoint (GET /api/stats/profitability?startDate=...&endDate=...)
+// Example SQL for Profitability Endpoint (GET /api/stats/profitability?startDate=...&endDate=...)
+app.get("/api/stats/profitability", authMiddleware, async (req, res) => {
+    const userId = req.user!.parent_user_id;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+
+    try {
+        // --- Current Period Profitability (Net Income) ---
+        // --- FIXED: Use reporting_categories to filter for specific IS sections ---
+        let currentQuery = `
+            SELECT
+                COALESCE(SUM(CASE
+                    WHEN rc.section = 'revenue' THEN jl.credit -- Only 'revenue' section credits
+                    ELSE 0
+                END), 0)::numeric(14, 2) AS total_revenue,
+                COALESCE(SUM(CASE
+                    WHEN rc.section = 'operating_expenses' THEN jl.debit -- Only 'operating_expenses' section debits (adjust section name if needed)
+                    ELSE 0
+                END), 0)::numeric(14, 2) AS total_expenses
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id -- Added JOIN
+            WHERE je.user_id = $1
+              AND rc.statement = 'income_statement'                           -- Filter for IS
+              AND rc.section IN ('revenue', 'operating_expenses')            -- Specific sections (adjust if needed)
+              AND je.entry_date >= $2
+              AND je.entry_date <= $3
+        `;
+        let currentParams: any[] = [userId, '1970-01-01', '9999-12-31'];
+        if (startDate) currentParams[1] = startDate;
+        if (endDate) currentParams[2] = endDate;
+
+        const currentResult = await pool.query(currentQuery, currentParams);
+        const currentRevenue = parseFloat(currentResult.rows[0]?.total_revenue) || 0;
+        const currentExpenses = parseFloat(currentResult.rows[0]?.total_expenses) || 0;
+        const currentProfit = currentRevenue - currentExpenses;
+
+        // --- Previous Period Profitability (Net Income) ---
+        // --- FIXED: Use reporting_categories for previous period too ---
+        let previousQuery = `
+            SELECT
+                COALESCE(SUM(CASE
+                    WHEN rc.section = 'revenue' THEN jl.credit
+                    ELSE 0
+                END), 0)::numeric(14, 2) AS total_revenue,
+                COALESCE(SUM(CASE
+                    WHEN rc.section = 'operating_expenses' THEN jl.debit -- Adjust section name if needed
+                    ELSE 0
+                END), 0)::numeric(14, 2) AS total_expenses
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id -- Added JOIN
+            WHERE je.user_id = $1
+              AND rc.statement = 'income_statement'                             -- Filter for IS
+              AND rc.section IN ('revenue', 'operating_expenses')              -- Specific sections (adjust if needed)
+              AND je.entry_date >= $2
+              AND je.entry_date < $3
+        `;
+        // Calculate previous period dates
+        let previousParams: any[] = [userId, '1970-01-01', currentParams[1]];
+
+        if (startDate && endDate) {
+             const start = new Date(startDate);
+             const end = new Date(endDate);
+             const diffTime = Math.abs(end.getTime() - start.getTime());
+             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+
+             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
+             const previousStart = new Date(previousEnd.getTime() - diffTime);
+
+             previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+        } else if (startDate) {
+            const start = new Date(startDate);
+            const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+            const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
+            const previousStart = new Date(previousEnd.getTime() - thirtyDaysMs);
+            previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+        }
+
+        const previousResult = await pool.query(previousQuery, previousParams);
+        const previousRevenue = parseFloat(previousResult.rows[0]?.total_revenue) || 0;
+        const previousExpenses = parseFloat(previousResult.rows[0]?.total_expenses) || 0;
+        const previousProfit = previousRevenue - previousExpenses;
+
+        // --- Calculate Change for Profit ---
+        let changePercentage = 0;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+        if (previousProfit !== 0) {
+            changePercentage = ((currentProfit - previousProfit) / Math.abs(previousProfit)) * 100;
+            changeType = changePercentage > 0 ? 'increase' : changePercentage < 0 ? 'decrease' : 'neutral';
+        } else if (currentProfit > 0) {
+             changeType = 'increase';
+        } else if (currentProfit < 0) {
+             changeType = 'decrease';
+        }
+
+        res.json({
+            value: currentProfit, // Net Profit/Loss
+            previousValue: previousProfit,
+            changePercentage: parseFloat(changePercentage.toFixed(2)),
+            changeType: changeType
+        });
+
+    } catch (err: any) {
+        console.error("Error fetching profitability stats:", err);
+        res.status(500).json({ error: "Failed to fetch profitability statistics.", detail: err.message });
+    }
+});
+
+// Helper function to calculate previous period dates based on the current period
+
+
+// NEW ENDPOINT: GET Revenue Statistics for a period (or all time)
+{/*app.get('/api/stats/revenue', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodValue = 0;
+        let previousPeriodValue = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause
+        if (startDate && endDate) {
+            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period revenue (or all-time if no dates provided)
+        const currentRevenueResult = await pool.query(`
+            SELECT COALESCE(SUM(amount), 0) AS value
+            FROM public.transactions
+            WHERE
+                user_id = $1
+                AND type = 'income'
+                AND category IN ('Revenue', 'Sales Revenue')
+                ${dateFilterClause};
+        `, currentQueryParams);
+
+        currentPeriodValue = parseFloat(currentRevenueResult.rows[0]?.value || 0);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period revenue
+            const previousRevenueResult = await pool.query(`
+                SELECT COALESCE(SUM(amount), 0) AS value
+                FROM public.transactions
+                WHERE
+                    user_id = $1
+                    AND type = 'income'
+                    AND category IN ('Revenue', 'Sales Revenue')
+                    AND date BETWEEN $2 AND $3;
+            `, previousQueryParams);
+
+            previousPeriodValue = parseFloat(previousRevenueResult.rows[0]?.value || 0);
+
+            // Calculate change percentage
+            if (previousPeriodValue !== 0) {
+                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
+                if (changePercentage > 0) {
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodValue > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            value: currentPeriodValue,
+            previousValue: previousPeriodValue,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching revenue stats:', error);
+        res.status(500).json({ error: 'Failed to fetch revenue statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// NEW ENDPOINT: GET Expenses Statistics for a period (or all time)
+app.get('/api/stats/expenses', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodValue = 0;
+        let previousPeriodValue = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause
+        if (startDate && endDate) {
+            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period expenses (or all-time if no dates provided)
+        const currentExpensesResult = await pool.query(`
+            SELECT COALESCE(SUM(amount), 0) AS value
+            FROM public.transactions
+            WHERE
+                user_id = $1
+                AND type = 'expense'
+                ${dateFilterClause};
+        `, currentQueryParams);
+
+        currentPeriodValue = parseFloat(currentExpensesResult.rows[0]?.value || 0);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period expenses
+            const previousExpensesResult = await pool.query(`
+                SELECT COALESCE(SUM(amount), 0) AS value
+                FROM public.transactions
+                WHERE
+                    user_id = $1
+                    AND type = 'expense'
+                    AND date BETWEEN $2 AND $3;
+            `, previousQueryParams);
+
+            previousPeriodValue = parseFloat(previousExpensesResult.rows[0]?.value || 0);
+
+            // Calculate change percentage
+            if (previousPeriodValue !== 0) {
+                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
+                if (changePercentage > 0) { // For expenses, an increase is often seen as a negative trend
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodValue > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            value: currentPeriodValue,
+            previousValue: previousPeriodValue,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching expenses stats:', error);
+        res.status(500).json({ error: 'Failed to fetch expenses statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+// Existing /api/stats/clients endpoint, modified to allow all-time view and use public.sales
+app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodCount = 0;
+        let previousPeriodCount = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause for 'created_at'
+        if (startDate && endDate) {
+            dateFilterClause = ` AND created_at BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period client count (or all-time if no dates provided)
+        // Now counting distinct customer_id from public.sales table
+        const currentClientsResult = await pool.query(`
+            SELECT COUNT(DISTINCT customer_id) AS count
+            FROM public.sales
+            WHERE user_id = $1
+            ${dateFilterClause};
+        `, currentQueryParams);
+        currentPeriodCount = parseInt(currentClientsResult.rows[0]?.count || 0, 10);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period client count
+            // Now counting distinct customer_id from public.sales table
+            const previousClientsResult = await pool.query(`
+                SELECT COUNT(DISTINCT customer_id) AS count
+                FROM public.sales
+                WHERE user_id = $1
+                AND created_at BETWEEN $2 AND $3;
+            `, previousQueryParams);
+            previousPeriodCount = parseInt(previousClientsResult.rows[0]?.count || 0, 10);
+
+            // Calculate change percentage
+            if (previousPeriodCount !== 0) {
+                changePercentage = ((currentPeriodCount - previousPeriodCount) / previousPeriodCount) * 100;
+                if (changePercentage > 0) {
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodCount > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            count: currentPeriodCount,
+            previousCount: previousPeriodCount,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching client stats:', error);
+        res.status(500).json({ error: 'Failed to fetch client statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+
+// Add this new endpoint to your server.ts file, e.g., after the quotes endpoint.
+app.get('/api/stats/profitability', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.parent_user_id;
+  const { startDate, endDate } = req.query;
+
+  try {
+    let dateFilter = '';
+    const queryParams: (string | number)[] = [user_id];
+    let paramIndex = 2;
+
+    if (startDate) {
+      dateFilter += ` AND date >= $${paramIndex++}`;
+      queryParams.push(startDate as string);
+    }
+    if (endDate) {
+      dateFilter += ` AND date <= $${paramIndex++}`;
+      queryParams.push(endDate as string);
+    }
+
+    // Get total income
+    const incomeResult = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_income FROM public.transactions WHERE user_id = $1 AND type = 'income' ${dateFilter};`,
+      queryParams
+    );
+    const totalIncome = parseFloat(incomeResult.rows[0]?.total_income || 0);
+
+    // Get total expenses
+    const expensesResult = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_expenses FROM public.transactions WHERE user_id = $1 AND type = 'expense' ${dateFilter};`,
+      queryParams
+    );
+    const totalExpenses = parseFloat(expensesResult.rows[0]?.total_expenses || 0);
+
+    // Get previous period income
+    const { currentStart, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
+
+    const previousIncomeResult = await pool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total_income FROM public.transactions WHERE user_id = $1 AND type = 'income' AND date >= $2 AND date < $3;`,
+        [user_id, previousStart, currentStart]
+    );
+    const previousIncome = parseFloat(previousIncomeResult.rows[0]?.total_income || 0);
+
+    // Get previous period expenses
+    const previousExpensesResult = await pool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total_expenses FROM public.transactions WHERE user_id = $1 AND type = 'expense' AND date >= $2 AND date < $3;`,
+        [user_id, previousStart, currentStart]
+    );
+    const previousExpenses = parseFloat(previousExpensesResult.rows[0]?.total_expenses || 0);
+
+
+    const currentProfit = totalIncome - totalExpenses;
+    const previousProfit = previousIncome - previousExpenses;
+    const { changePercentage, changeType } = calculateChange(currentProfit, previousProfit);
+
+    res.status(200).json({
+      value: currentProfit,
+      previousValue: previousProfit,
+      changePercentage,
+      changeType,
+    });
+  } catch (error) {
+    console.error('Error fetching profitability stats:', error);
+    res.status(500).json({ error: 'Failed to fetch profitability stats.' });
+  }
+});*/}
+
+app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    // startDate and endDate can now be optional
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    try {
+        let currentPeriodCount = 0;
+        let previousPeriodCount = 0;
+        let changePercentage: number | undefined;
+        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
+
+        let dateFilterClause = '';
+        const currentQueryParams: (string | number)[] = [user_id];
+        let currentParamIndex = 2;
+
+        // If both startDate and endDate are provided, build the date filter clause for 'created_at'
+        if (startDate && endDate) {
+            dateFilterClause = ` AND created_at BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
+            currentQueryParams.push(startDate);
+            currentQueryParams.push(endDate);
+        }
+
+        // Fetch current period client count (or all-time if no dates provided)
+        // Now counting distinct customer_id from public.sales table
+        const currentClientsResult = await pool.query(`
+            SELECT COUNT(DISTINCT customer_id) AS count
+            FROM public.sales
+            WHERE user_id = $1
+            ${dateFilterClause};
+        `, currentQueryParams);
+        currentPeriodCount = parseInt(currentClientsResult.rows[0]?.count || 0, 10);
+
+        // Only calculate previous period and change if a specific date range was provided
+        if (startDate && endDate) {
+            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
+            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
+
+            // Fetch previous period client count
+            // Now counting distinct customer_id from public.sales table
+            const previousClientsResult = await pool.query(`
+                SELECT COUNT(DISTINCT customer_id) AS count
+                FROM public.sales
+                WHERE user_id = $1
+                AND created_at BETWEEN $2 AND $3;
+            `, previousQueryParams);
+            previousPeriodCount = parseInt(previousClientsResult.rows[0]?.count || 0, 10);
+
+            // Calculate change percentage
+            if (previousPeriodCount !== 0) {
+                changePercentage = ((currentPeriodCount - previousPeriodCount) / previousPeriodCount) * 100;
+                if (changePercentage > 0) {
+                    changeType = 'increase';
+                } else if (changePercentage < 0) {
+                    changeType = 'decrease';
+                }
+            } else if (currentPeriodCount > 0) {
+                changePercentage = 100; // Infinite increase from zero to a positive value
+                changeType = 'increase';
+            }
+        }
+
+        res.json({
+            count: currentPeriodCount,
+            previousCount: previousPeriodCount,
+            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
+            changeType: changeType
+        });
+
+    } catch (error: unknown) {
+        console.error('Error fetching client stats:', error);
+        res.status(500).json({ error: 'Failed to fetch client statistics', detail: error instanceof Error ? error.message : String(error) });
+    }
+});
+
+
 // --- END NEW ENDPOINT ---
 app.listen(PORT, () => {
   console.log(`Node server running on http://localhost:${PORT}`);
