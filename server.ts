@@ -921,29 +921,7 @@ interface QuotationDetailsForPdf {
 // Generic PDF generation endpoint for invoices and statements
 
 
-// --- Specific Quotation PDF generation endpoint (MUST BE BEFORE generic one) ---
 
-
-
-// Generic PDF generation endpoint for invoices and statements
-
-
-
-// NOTE: This function was commented out because the TypeScript error indicates it is a redeclaration.
-// Please use the other `formatCurrency` function that exists in your `server.ts` file.
-// const formatCurrency = (amount: number, currency: string) => {
-//     return `${currency} ${amount.toFixed(2)}`;
-// };
-
-// The code now assumes a `formatCurrency` function is available in the scope.
-// Function to generate the Quotation PDF
-// Function to generate the Quotation PDF
-// Add this helper function at the top of your server.ts or in a utility file
-// if it's not already defined elsewhere.
-
-
-
-// Add this helper function at the top of your server.ts or in a utility file
 
 
 
@@ -1124,8 +1102,8 @@ async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Prom
         }
 
         // Footer
-        doc.fontSize(10).text(`Thank you for considering our quotation!`, doc.page.width / 2, doc.page.height - 50, {
-            align: 'center',
+        doc.fontSize(10).text(`Thank you for considering our quotation!`, doc.page.width / 1, doc.page.height - 50, {
+            align: 'left',
             width: doc.page.width - 100,
         });
 
@@ -1134,9 +1112,6 @@ async function generateQuotationPdf(quotationData: QuotationDetailsForPdf): Prom
 }
 
 
-
-
-// ... rest of your server.ts code ...
 
 // UPDATE the `/api/quotations/:id/pdf` endpoint
 app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
@@ -1450,6 +1425,8 @@ app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: 
 });
 
 // UPDATE the `/api/quotations/:id/send-pdf-email` endpoint
+// UPDATE the `/api/quotations/:id/send-pdf-email` endpoint
+// UPDATE the `/api/quotations/:id/send-pdf-email` endpoint
 app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), async (req: Request, res: Response) => {
     const { id } = req.params;
     const { recipientEmail, subject, body } = req.body;
@@ -1478,13 +1455,20 @@ app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), as
         }
         const quotation = quotationQueryResult.rows[0];
 
-        // Fetch user's company information
+        // Fetch user's company information AND the logo path
         const userProfileResult = await pool.query(
-            `SELECT company, address, city, province, postal_code, country, phone, email
+            `SELECT company, address, city, province, postal_code, country, phone, email, company_logo_path -- <-- ADDED company_logo_path
              FROM users WHERE user_id = $1`,
             [user_id]
         );
-        const userCompany: UserProfile = userProfileResult.rows[0];
+        const userCompany = userProfileResult.rows[0]; // Use 'any' or define a proper type if needed
+        let companyLogoUrl: string | null = null;
+        if (userCompany && userCompany.company_logo_path) {
+            // <-- GENERATE THE LOGO URL like in the download endpoint
+            const { data } = supabase.storage.from('company-logos').getPublicUrl(userCompany.company_logo_path);
+            companyLogoUrl = data.publicUrl;
+        }
+
 
         const lineItemsResult = await pool.query(
             `SELECT
@@ -1498,7 +1482,7 @@ app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), as
         );
         quotation.line_items = lineItemsResult.rows;
 
-        // Prepare data for PDF generation
+        // Prepare data for PDF generation - INCLUDE companyLogoUrl
         const quotationDataForPdf: QuotationDetailsForPdf = {
             quotation_number: quotation.quotation_number,
             customer_name: quotation.customer_name,
@@ -1527,6 +1511,7 @@ app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), as
             companyEmail: userCompany?.email || null,
             companyVat: userCompany?.vat_number || null,
             companyReg: userCompany?.reg_number || null,
+            companyLogoUrl: companyLogoUrl, // <-- PASS THE LOGO URL
         };
 
         // Generate PDF Buffer using the new function
@@ -8270,6 +8255,49 @@ app.get('/api/projections/baseline-data', authMiddleware, async (req: Request, r
 // and would require separate endpoints to manage user roles.
 // GET /api/users  -> list users for this owner/company
 // === helpers/auth.ts ===
+
+
+// Helper function to manage agent records in the agents table
+// Ensures an agent record exists/doesn't exist based on roles
+export const syncAgentRecord = async (client: PoolClient, userId: string, userRoles: string[], parentUserId: string) => {
+  const isAgent = userRoles.some(role => role.toLowerCase() === 'agent');
+
+  if (isAgent) {
+    // User has 'agent' role, ensure they exist in the agents table
+    try {
+      // Use INSERT ... ON CONFLICT to handle cases where the record might already exist
+      // This assumes user_id is the PRIMARY KEY of the agents table
+      await client.query(
+        `INSERT INTO public.agents (user_id, parent_user_id)
+         VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE
+         SET parent_user_id = EXCLUDED.parent_user_id;`,
+        [userId, parentUserId]
+      );
+      console.log(`[syncAgentRecord] Ensured agent record exists for user_id: ${userId}`);
+    } catch (err) {
+      console.error(`[syncAgentRecord] Error inserting/updating agent record for user_id ${userId}:`, err);
+      throw err; // Re-throw to trigger rollback in calling function
+    }
+  } else {
+    // User does not have 'agent' role, remove them from the agents table if they exist
+    try {
+      const deleteResult = await client.query(
+        'DELETE FROM public.agents WHERE user_id = $1;',
+        [userId]
+      );
+      if (deleteResult.rowCount && deleteResult.rowCount > 0) {
+        console.log(`[syncAgentRecord] Removed agent record for user_id: ${userId}`);
+      } else {
+        console.log(`[syncAgentRecord] No agent record found to remove for user_id: ${userId}`);
+      }
+    } catch (err) {
+      console.error(`[syncAgentRecord] Error deleting agent record for user_id ${userId}:`, err);
+      throw err; // Re-throw to trigger rollback in calling function
+    }
+  }
+};
+
 export const getOwnerId = (req: Request) =>
   (req.user as any)?.parent_user_id || (req.user as any)?.user_id;
 
@@ -8324,10 +8352,11 @@ app.get('/users', authMiddleware, async (req: Request, res: Response) => {
 });
 
 // 2. POST /users - Create a new user within the authenticated user's organization
+// 2. POST /users - Create a new user within the authenticated user's organization
 app.post('/users', authMiddleware, async (req: Request, res: Response) => {
   const { displayName, email, role, password } = req.body;
   const newUserId = uuidv4();
-  const parentUserId = (req as any).user?.user_id;
+  const parentUserId = (req as any).user?.user_id; // This is the creator's user_id, who becomes the parent
 
   if (!displayName || !email || !password || !parentUserId) {
     return res.status(400).json({ error: 'Missing required data' });
@@ -8335,31 +8364,38 @@ app.post('/users', authMiddleware, async (req: Request, res: Response) => {
 
   const userRole = (typeof role === 'string' && role.length > 0) ? role : 'user';
   
+  const client = await pool.connect(); // Use a client for transaction
+
   try {
     const password_hash = await bcrypt.hash(password, 10);
 
-    await pool.query('BEGIN');
+    await client.query('BEGIN');
 
-    const userInsertResult = await pool.query(
+    const userInsertResult = await client.query(
       'INSERT INTO public.users (id, name, email, user_id, password_hash, parent_user_id, role) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name AS "displayName", email, user_id',
       [uuidv4(), displayName, email, newUserId, password_hash, parentUserId, userRole]
     );
 
-    const roleInsertResult = await pool.query('SELECT name FROM public.roles WHERE name = $1', [userRole]);
+    const roleInsertResult = await client.query('SELECT name FROM public.roles WHERE name = $1', [userRole]);
     if (roleInsertResult.rows.length === 0) {
       console.warn(`Role '${userRole}' does not exist and will not be assigned.`);
     } else {
-        await pool.query(
+        await client.query(
           'INSERT INTO public.user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING',
           [newUserId, userRole]
         );
     }
-    
-    await pool.query('COMMIT');
+
+    // --- NEW: Sync agent record based on initial role ---
+    // Pass the initial role as an array to the helper
+    await syncAgentRecord(client, newUserId, [userRole], parentUserId);
+    // --- END NEW ---
+
+    await client.query('COMMIT');
 
     res.status(201).json(userInsertResult.rows[0]);
   } catch (err) {
-    await pool.query('ROLLBACK');
+    await client.query('ROLLBACK');
     console.error('Error adding new user:', err);
     
     if (err instanceof Error) {
@@ -8367,44 +8403,92 @@ app.post('/users', authMiddleware, async (req: Request, res: Response) => {
     } else {
       res.status(500).json({ error: 'Registration failed.' });
     }
+  } finally {
+    client.release(); // Release the client back to the pool
   }
 });
 
 // 3. PUT /users/:id - Update a user's basic details within the authenticated user's organization
-app.put('/users/:id', authMiddleware, async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { displayName, email } = req.body;
-  const parentUserId = (req as any).user?.user_id;
+// 4. PUT /users/:id/roles - Update a user's roles within the authenticated user's organization
+// (Assuming this endpoint exists and looks something like this)
+app.put('/users/:id/roles', authMiddleware, async (req: Request, res: Response) => {
+  const { id: targetUserId } = req.params; // ID of the user whose roles are being changed
+  const { roles: newRoles } = req.body; // Array of new roles
+  const parentUserId = (req as any).user?.user_id; // ID of the user making the request (the parent/super-agent)
 
   if (!parentUserId) {
     return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
   }
 
-  if (!displayName || !email) {
-    return res.status(400).json({ error: 'Missing required data: displayName and email' });
+  if (!Array.isArray(newRoles)) {
+    return res.status(400).json({ error: 'Roles must be an array of strings.' });
   }
+
+  const client = await pool.connect();
 
   try {
-    // Log the parameters to help debug the 404 issue
-    console.log(`[PUT /users/:id] Attempting to update user with id: ${id} under parent user: ${parentUserId}`);
-    
-    const result = await pool.query(
-      'UPDATE public.users SET name = $1, email = $2 WHERE id = $3 AND parent_user_id = $4 RETURNING id, name AS "displayName", email',
-      [displayName, email, id, parentUserId]
+    console.log(`[PUT /users/:id/roles] Attempting to update roles for user with id: ${targetUserId} under parent user: ${parentUserId}`);
+
+    await client.query('BEGIN');
+
+    // --- 1. Verify User Ownership ---
+    // Check if the target user belongs to the parent user's organization
+    const ownershipCheck = await client.query(
+      'SELECT user_id, parent_user_id FROM public.users WHERE id = $1 AND parent_user_id = $2',
+      [targetUserId, parentUserId]
     );
 
-    if (result.rows.length === 0) {
-      console.error(`[PUT /users/:id] User with id: ${id} and parent_user_id: ${parentUserId} not found.`);
+    if (ownershipCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
+      console.error(`[PUT /users/:id/roles] User ${targetUserId} not found or not under parent ${parentUserId}.`);
       return res.status(404).json({ error: 'User not found or not in your organization' });
     }
+    const targetUserActualId = ownershipCheck.rows[0].user_id; // Get the actual user_id string
+    const targetUserParentId = ownershipCheck.rows[0].parent_user_id; // Should match parentUserId
 
-    res.status(200).json(result.rows[0]);
+    // --- 2. Delete Existing Roles ---
+    await client.query('DELETE FROM public.user_roles WHERE user_id = $1', [targetUserActualId]);
+
+    // --- 3. Insert New Roles ---
+    // Filter out empty or non-string roles for safety
+    const validRoles = newRoles.filter(role => typeof role === 'string' && role.trim() !== '');
+    if (validRoles.length > 0) {
+        // Check if roles exist in the roles table (optional but good practice)
+        const placeholders = validRoles.map((_, i) => `$${i + 1}`).join(', ');
+        const checkRolesQuery = `SELECT name FROM public.roles WHERE name IN (${placeholders})`;
+        const checkRolesResult = await client.query(checkRolesQuery, validRoles);
+
+        const existingRoles = checkRolesResult.rows.map(row => row.name);
+        const nonExistentRoles = validRoles.filter(role => !existingRoles.includes(role));
+        if (nonExistentRoles.length > 0) {
+            console.warn(`[PUT /users/:id/roles] The following roles do not exist and will not be assigned: ${nonExistentRoles.join(', ')}`);
+        }
+
+        // Insert only the roles that exist
+        if (existingRoles.length > 0) {
+            const insertPlaceholders = existingRoles.map((_, i) => `($1, $${i + 2})`).join(', ');
+            const insertValues = [targetUserActualId, ...existingRoles];
+            const insertQuery = `INSERT INTO public.user_roles (user_id, role) VALUES ${insertPlaceholders}`;
+            await client.query(insertQuery, insertValues);
+        }
+    }
+
+    // --- 4. NEW: Sync agent record based on updated roles ---
+    await syncAgentRecord(client, targetUserActualId, validRoles, targetUserParentId);
+    // --- END NEW ---
+
+    await client.query('COMMIT');
+
+    console.log(`[PUT /users/:id/roles] Roles successfully updated for user ${targetUserId}.`);
+    res.status(200).json({ message: 'User roles updated successfully.' });
   } catch (err) {
-    console.error('Error updating user:', err);
-    res.status(500).json({ error: 'Update failed.' });
+    await client.query('ROLLBACK');
+    console.error('[PUT /users/:id/roles] Error updating user roles:', err);
+    res.status(500).json({ error: 'Failed to update user roles.', detail: err instanceof Error ? err.message : String(err) });
+  } finally {
+    client.release();
   }
 });
-
 // 4. DELETE /users/:id - Delete a user within the authenticated user's organization
 app.delete('/users/:id', authMiddleware, async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -9373,6 +9457,8 @@ app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
 // POST /api/applications - Create a new customer application
 // POST /api/applications - Create a new customer application
 // POST /api/applications - Create a new customer application
+// POST /api/applications - Create a new customer application
+// POST /api/applications - Create a new customer application
 app.post('/api/applications', authMiddleware, async (req: Request, res: Response) => {
     const {
         name, surname, phone, email, address, nationality, gender, date_of_birth, id_number, alt_name, relation_to_member, relation_dob,
@@ -9381,7 +9467,13 @@ app.post('/api/applications', authMiddleware, async (req: Request, res: Response
         declaration_signature, declaration_date, call_time, agent_name,
         connector_name, connector_contact, connector_province, team_leader, team_contact, team_province
     } = req.body;
-    const user_id = req.user!.parent_user_id;
+
+    // Use parent_user_id to associate the application with the agent's "company/scope"
+    // This assumes the agent's parent_user_id is the Super Agent or managing entity.
+    // If agents own their applications directly, use req.user!.user_id instead.
+    const parentUserId = req.user!.parent_user_id;
+    // Optionally, also store the direct creator (the agent's user_id)
+    const agentUserId = req.user!.user_id;
 
     const client = await pool.connect();
 
@@ -9391,17 +9483,17 @@ app.post('/api/applications', authMiddleware, async (req: Request, res: Response
         // Insert into the main applications table
         const applicationQuery = `
             INSERT INTO public.applications (
-                user_id, name, surname, phone, email, address, nationality, gender, date_of_birth, id_number,
+                user_id, parent_user_id, name, surname, phone, email, address, nationality, gender, date_of_birth, id_number,
                 alt_name, relation_to_member, relation_dob, plan_options, beneficiary_name, beneficiary_surname,
                 beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number,
                 deduction_date, account_type, commencement_date, declaration_signature, declaration_date,
                 call_time, agent_name, connector_name, connector_contact, connector_province, team_leader,
                 team_contact, team_province
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)
             RETURNING id;
         `;
         const applicationResult = await client.query(applicationQuery, [
-            user_id, name, surname, phone, email, address, nationality, gender, date_of_birth, id_number,
+            agentUserId, parentUserId, name, surname, phone, email, address, nationality, gender, date_of_birth, id_number,
             alt_name, relation_to_member, relation_dob, plan_options, beneficiary_name, beneficiary_surname,
             beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number,
             deduction_date, account_type, commencement_date, declaration_signature, declaration_date,
@@ -9411,17 +9503,19 @@ app.post('/api/applications', authMiddleware, async (req: Request, res: Response
         const newApplicationId = applicationResult.rows[0].id;
 
         // Insert family members
-        if (family_members && family_members.length > 0) {
+        if (Array.isArray(family_members) && family_members.length > 0) {
             const familyQuery = `INSERT INTO public.family_members (application_id, name, surname, relationship, date_of_birth) VALUES ($1, $2, $3, $4, $5);`;
             for (const member of family_members) {
+                // Basic validation could be added here if needed
                 await client.query(familyQuery, [newApplicationId, member.name, member.surname, member.relationship, member.date_of_birth]);
             }
         }
-        
+
         // Insert extended family members
-        if (extended_family && extended_family.length > 0) {
+        if (Array.isArray(extended_family) && extended_family.length > 0) {
             const extendedFamilyQuery = `INSERT INTO public.extended_family (application_id, name, surname, relationship, date_of_birth, premium) VALUES ($1, $2, $3, $4, $5, $6);`;
             for (const member of extended_family) {
+                 // Basic validation could be added here if needed
                 await client.query(extendedFamilyQuery, [newApplicationId, member.name, member.surname, member.relationship, member.date_of_birth, member.premium]);
             }
         }
@@ -9437,141 +9531,75 @@ app.post('/api/applications', authMiddleware, async (req: Request, res: Response
     }
 });
 
-
-// PUT /api/applications/:id - Update an existing application
-app.put('/api/applications/:id', authMiddleware, async (req: Request, res: Response) => {
-    const { id } = req.params;
-    const {
-        name, surname, phone, email, address, nationality, gender, date_of_birth, id_number, alt_name, relation_to_member, relation_dob,
-        family_members, plan_options, extended_family,
-        beneficiary_name, beneficiary_surname, beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number, deduction_date, account_type, commencement_date,
-        declaration_signature, declaration_date, call_time, agent_name,
-        connector_name, connector_contact, connector_province, team_leader, team_contact, team_province
-    } = req.body;
-    const user_id = req.user!.parent_user_id;
-
-    const client = await pool.connect();
-
-    try {
-        await client.query('BEGIN');
-
-        // Check if the application exists and belongs to the user
-        const checkQuery = await client.query('SELECT 1 FROM public.applications WHERE id = $1 AND user_id = $2', [id, user_id]);
-        if (checkQuery.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Application not found or access denied.' });
-        }
-
-        // Update the main applications table
-        const updateQuery = `
-            UPDATE public.applications
-            SET
-                name = $1, surname = $2, phone = $3, email = $4, address = $5, nationality = $6, gender = $7, date_of_birth = $8,
-                id_number = $9, alt_name = $10, relation_to_member = $11, relation_dob = $12, plan_options = $13,
-                beneficiary_name = $14, beneficiary_surname = $15, beneficiary_contact = $16, pay_options = $17,
-                total_amount = $18, bank = $19, branch_code = $20, account_holder = $21, account_number = $22,
-                deduction_date = $23, account_type = $24, commencement_date = $25, declaration_signature = $26,
-                declaration_date = $27, call_time = $28, agent_name = $29, connector_name = $30,
-                connector_contact = $31, connector_province = $32, team_leader = $33, team_contact = $34,
-                team_province = $35, updated_at = NOW()
-            WHERE id = $36 AND user_id = $37;
-        `;
-        await client.query(updateQuery, [
-            name, surname, phone, email, address, nationality, gender, date_of_birth, id_number, alt_name,
-            relation_to_member, relation_dob, plan_options, beneficiary_name, beneficiary_surname,
-            beneficiary_contact, pay_options, total_amount, bank, branch_code, account_holder, account_number,
-            deduction_date, account_type, commencement_date, declaration_signature, declaration_date,
-            call_time, agent_name, connector_name, connector_contact, connector_province, team_leader,
-            team_contact, team_province, id, user_id
-        ]);
-
-        // Delete existing family members and re-insert new ones
-        await client.query('DELETE FROM public.family_members WHERE application_id = $1', [id]);
-        if (family_members && family_members.length > 0) {
-            const familyQuery = `INSERT INTO public.family_members (application_id, name, surname, relationship, date_of_birth) VALUES ($1, $2, $3, $4, $5);`;
-            for (const member of family_members) {
-                await client.query(familyQuery, [id, member.name, member.surname, member.relationship, member.date_of_birth]);
-            }
-        }
-        
-        // Delete existing extended family members and re-insert new ones
-        await client.query('DELETE FROM public.extended_family WHERE application_id = $1', [id]);
-        if (extended_family && extended_family.length > 0) {
-            const extendedFamilyQuery = `INSERT INTO public.extended_family (application_id, name, surname, relationship, date_of_birth, premium) VALUES ($1, $2, $3, $4, $5, $6);`;
-            for (const member of extended_family) {
-                await client.query(extendedFamilyQuery, [id, member.name, member.surname, member.relationship, member.date_of_birth, member.premium]);
-            }
-        }
-
-        await client.query('COMMIT');
-        res.status(200).json({ message: 'Application updated successfully!' });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error updating application:', error);
-        res.status(500).json({ error: 'Failed to update application.', details: error instanceof Error ? error.message : String(error) });
-    } finally {
-        client.release();
-    }
-});
-// GET /api/applications - Get all applications for the authenticated user
-// GET /api/applications - Get all applications for the authenticated user
+// GET /api/applications - Get all applications for the authenticated user's scope
 app.get('/api/applications', authMiddleware, async (req: Request, res: Response) => {
+    // Use parent_user_id to fetch applications associated with the agent's scope.
+    // This assumes applications are linked via parent_user_id.
     const user_id = req.user!.parent_user_id;
     const client = await pool.connect();
 
     try {
-        // Fetch all applications for the user
+        // Fetch all applications for the user's scope
         const applicationsQuery = `
-            SELECT 
-                a.id, a.name, a.surname, a.phone, a.email, a.address, a.nationality, a.gender, 
-                a.date_of_birth, a.id_number, a.alt_name, a.relation_to_member, a.relation_dob, 
-                a.plan_options, a.beneficiary_name, a.beneficiary_surname, a.beneficiary_contact, 
-                a.pay_options, a.total_amount, a.bank, a.branch_code, a.account_holder, 
-                a.account_number, a.deduction_date, a.account_type, a.commencement_date, 
-                a.declaration_signature, a.declaration_date, a.call_time, a.agent_name, 
-                a.connector_name, a.connector_contact, a.connector_province, a.team_leader, 
-                a.team_contact, a.team_province
+            SELECT
+                a.id, a.name, a.surname, a.phone, a.email, a.address, a.nationality, a.gender,
+                a.date_of_birth, a.id_number, a.alt_name, a.relation_to_member, a.relation_dob,
+                a.plan_options, a.beneficiary_name, a.beneficiary_surname, a.beneficiary_contact,
+                a.pay_options, a.total_amount, a.bank, a.branch_code, a.account_holder,
+                a.account_number, a.deduction_date, a.account_type, a.commencement_date,
+                a.declaration_signature, a.declaration_date, a.call_time, a.agent_name,
+                a.connector_name, a.connector_contact, a.connector_province, a.team_leader,
+                a.team_contact, a.team_province,
+                a.created_at, a.updated_at -- Include timestamps if needed by frontend
+                -- Add status column if it exists: , a.status
             FROM public.applications a
-            WHERE a.user_id = $1
-            ORDER BY a.created_at DESC;
+            WHERE a.parent_user_id = $1
+            ORDER BY a.created_at DESC; -- Order by creation date, newest first
         `;
         const applicationsResult = await client.query(applicationsQuery, [user_id]);
         const applications = applicationsResult.rows;
 
-        // Fetch family members for each application
+        // Handle case where there are no applications
+        if (applications.length === 0) {
+             res.status(200).json([]); // Return empty array
+             return;
+        }
+
+        // Fetch family members for relevant applications
         const familyMembersQuery = `
             SELECT id, application_id, name, surname, relationship, date_of_birth
             FROM public.family_members
             WHERE application_id = ANY($1::uuid[])
-            ORDER BY id;
+            ORDER BY application_id, id; -- Order for consistency
         `;
         const familyMembersResult = await client.query(familyMembersQuery, [applications.map(a => a.id)]);
 
-        // Fetch extended family members for each application
+        // Fetch extended family members for relevant applications
         const extendedFamilyQuery = `
             SELECT id, application_id, name, surname, relationship, date_of_birth, premium
             FROM public.extended_family
             WHERE application_id = ANY($1::uuid[])
-            ORDER BY id;
+            ORDER BY application_id, id; -- Order for consistency
         `;
         const extendedFamilyResult = await client.query(extendedFamilyQuery, [applications.map(a => a.id)]);
 
-        // Group family members and extended family members by application_id
-        const familyMembersMap = familyMembersResult.rows.reduce((acc, member) => {
-            if (!acc[member.application_id]) {
-                acc[member.application_id] = [];
+        // Group family members by application_id for easier lookup
+        const familyMembersMap: Record<string, any[]> = {};
+        for (const member of familyMembersResult.rows) {
+            if (!familyMembersMap[member.application_id]) {
+                familyMembersMap[member.application_id] = [];
             }
-            acc[member.application_id].push(member);
-            return acc;
-        }, {});
+            familyMembersMap[member.application_id].push(member);
+        }
 
-        const extendedFamilyMap = extendedFamilyResult.rows.reduce((acc, member) => {
-            if (!acc[member.application_id]) {
-                acc[member.application_id] = [];
+        // Group extended family members by application_id for easier lookup
+        const extendedFamilyMap: Record<string, any[]> = {};
+        for (const member of extendedFamilyResult.rows) {
+            if (!extendedFamilyMap[member.application_id]) {
+                extendedFamilyMap[member.application_id] = [];
             }
-            acc[member.application_id].push(member);
-            return acc;
-        }, {});
+            extendedFamilyMap[member.application_id].push(member);
+        }
 
         // Combine all data into a single array of application objects
         const combinedApplications = applications.map(app => ({
@@ -9590,7 +9618,279 @@ app.get('/api/applications', authMiddleware, async (req: Request, res: Response)
     }
 });
 
+// PATCH /api/applications/:id - Update an existing application
+app.patch('/api/applications/:id', authMiddleware, async (req: Request, res: Response) => {
+    const applicationId = req.params.id;
+    if (!applicationId) {
+        return res.status(400).json({ error: 'Application ID is required.' });
+    }
 
+    const updates: Partial<{
+        name: string | null;
+        surname: string | null;
+        phone: string | null;
+        email: string | null;
+        address: string | null;
+        nationality: string | null;
+        gender: string | null;
+        date_of_birth: string | null;
+        id_number: string | null;
+        alt_name: string | null;
+        relation_to_member: string | null;
+        relation_dob: string | null;
+        plan_options: string | null;
+        beneficiary_name: string | null;
+        beneficiary_surname: string | null;
+        beneficiary_contact: string | null;
+        pay_options: string | null;
+        total_amount: number | null;
+        bank: string | null;
+        branch_code: string | null;
+        account_holder: string | null;
+        account_number: string | null;
+        deduction_date: string | null;
+        account_type: string | null;
+        commencement_date: string | null;
+        declaration_signature: string | null;
+        declaration_date: string | null;
+        call_time: string | null;
+        agent_name: string | null;
+        connector_name: string | null;
+        connector_contact: string | null;
+        connector_province: string | null;
+        team_leader: string | null;
+        team_contact: string | null;
+        team_province: string | null;
+        // status: string | null; // Add if you have a status column
+    }> = req.body;
+
+    // Use parent_user_id for ownership check, consistent with GET/POST
+    const userId = req.user!.parent_user_id;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // 1. Verify Application Ownership
+        const ownershipCheck = await client.query(
+            'SELECT id FROM public.applications WHERE id = $1 AND parent_user_id = $2', // Select ID for clarity, though COUNT(1) works too
+            [applicationId, userId]
+        );
+
+        if (ownershipCheck.rowCount === 0 || ownershipCheck.rowCount === null) { // Check for null as well, though unlikely here
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Application not found or access denied.' });
+        }
+
+        // 2. Update Main Application Record
+        const updateFields: string[] = [];
+        const updateValues: any[] = [];
+        let valueIndex = 1;
+
+        const allowedUpdateFields = [
+            'name', 'surname', 'phone', 'email', 'address', 'nationality', 'gender', 'date_of_birth', 'id_number',
+            'alt_name', 'relation_to_member', 'relation_dob', 'plan_options', 'beneficiary_name', 'beneficiary_surname',
+            'beneficiary_contact', 'pay_options', 'total_amount', 'bank', 'branch_code', 'account_holder',
+            'account_number', 'deduction_date', 'account_type', 'commencement_date', 'declaration_signature',
+            'declaration_date', 'call_time', 'agent_name', 'connector_name', 'connector_contact',
+            'connector_province', 'team_leader', 'team_contact', 'team_province'
+            // 'status' // Add if you have a status column
+        ];
+
+        for (const [key, value] of Object.entries(updates)) {
+            if (allowedUpdateFields.includes(key)) {
+                updateFields.push(`${key} = $${valueIndex}`);
+                updateValues.push(value);
+                valueIndex++;
+            }
+        }
+
+        if (updateFields.length > 0) {
+            const updateQuery = `
+                UPDATE public.applications
+                SET ${updateFields.join(', ')}, updated_at = NOW()
+                WHERE id = $${valueIndex}
+            `;
+            updateValues.push(applicationId);
+
+            await client.query(updateQuery, updateValues);
+        } // else, no main fields to update, which is fine
+
+        // 3. Handle Family Members
+        if (Array.isArray(req.body.family_members)) {
+            const providedFamilyMembers = req.body.family_members;
+
+            const existingFamilyResult = await client.query(
+                'SELECT id FROM public.family_members WHERE application_id = $1',
+                [applicationId]
+            );
+            const existingFamilyIds = new Set(existingFamilyResult.rows.map(r => r.id));
+            const providedFamilyIds = new Set<number>();
+            const newFamilyMembers = [];
+            const updatedFamilyMembers = [];
+
+            for (const member of providedFamilyMembers) {
+                // Type guard and check for valid ID
+                if (member.id !== undefined && member.id !== null && typeof member.id === 'number') {
+                    providedFamilyIds.add(member.id);
+                    updatedFamilyMembers.push(member);
+                } else {
+                    // Assume it's a new member if ID is missing, null, or invalid
+                    newFamilyMembers.push(member);
+                }
+            }
+
+            // --- Delete family members not in the provided list ---
+            const idsToDelete = [...existingFamilyIds].filter(id => !providedFamilyIds.has(id));
+            if (idsToDelete.length > 0) {
+                await client.query(
+                    'DELETE FROM public.family_members WHERE id = ANY($1::int[])',
+                    [idsToDelete]
+                );
+            }
+
+            // --- Update existing family members ---
+            for (const member of updatedFamilyMembers) {
+                const checkQuery = 'SELECT 1 FROM public.family_members WHERE id = $1 AND application_id = $2';
+                const checkResult = await client.query(checkQuery, [member.id, applicationId]);
+                // --- FIXED: Check for null rowCount ---
+                if (checkResult.rowCount !== null && checkResult.rowCount > 0) {
+                    const updateFields: string[] = [];
+                    const updateValues: any[] = [];
+                    let idx = 1;
+                    if (member.name !== undefined) { updateFields.push(`name = $${idx++}`); updateValues.push(member.name); }
+                    if (member.surname !== undefined) { updateFields.push(`surname = $${idx++}`); updateValues.push(member.surname); }
+                    if (member.relationship !== undefined) { updateFields.push(`relationship = $${idx++}`); updateValues.push(member.relationship); }
+                    if (member.date_of_birth !== undefined) { updateFields.push(`date_of_birth = $${idx++}`); updateValues.push(member.date_of_birth); }
+
+                    if(updateFields.length > 0) {
+                        const updateQuery = `UPDATE public.family_members SET ${updateFields.join(', ')}, updated_at = NOW() WHERE id = $${idx}`;
+                        updateValues.push(member.id);
+                        await client.query(updateQuery, updateValues);
+                    }
+                } else {
+                    console.warn(`Family member ID ${member.id} not found for application ${applicationId} or does not belong to it. Skipping update.`);
+                    // Optionally, return a 400 error if trying to update a non-existent member ID
+                    // return res.status(400).json({ error: `Family member ID ${member.id} not found for this application.` });
+                }
+            }
+
+            // --- Insert new family members ---
+            if (newFamilyMembers.length > 0) {
+                // Using a transaction-safe multi-row insert
+                const insertQuery = `
+                    INSERT INTO public.family_members (application_id, name, surname, relationship, date_of_birth)
+                    VALUES ($1, $2, $3, $4, $5)
+                `;
+                 // Prepare values for multi-row insert or loop
+                 for (const member of newFamilyMembers) {
+                     await client.query(insertQuery, [
+                         applicationId,
+                         member.name ?? null, // Ensure nulls are passed explicitly if fields are optional
+                         member.surname ?? null,
+                         member.relationship ?? null,
+                         member.date_of_birth ?? null
+                     ]);
+                 }
+            }
+        }
+
+        // 4. Handle Extended Family Members
+        if (Array.isArray(req.body.extended_family)) {
+            const providedExtendedFamilyMembers = req.body.extended_family;
+
+            const existingExtendedFamilyResult = await client.query(
+                'SELECT id FROM public.extended_family WHERE application_id = $1',
+                [applicationId]
+            );
+            const existingExtendedFamilyIds = new Set(existingExtendedFamilyResult.rows.map(r => r.id));
+            const providedExtendedFamilyIds = new Set<number>();
+            const newExtendedFamilyMembers = [];
+            const updatedExtendedFamilyMembers = [];
+
+            for (const member of providedExtendedFamilyMembers) {
+                 // Type guard and check for valid ID
+                if (member.id !== undefined && member.id !== null && typeof member.id === 'number') {
+                    providedExtendedFamilyIds.add(member.id);
+                    updatedExtendedFamilyMembers.push(member);
+                } else {
+                    // Assume it's a new member if ID is missing, null, or invalid
+                    newExtendedFamilyMembers.push(member);
+                }
+            }
+
+            // --- Delete extended family members not in the provided list ---
+            const idsToDelete = [...existingExtendedFamilyIds].filter(id => !providedExtendedFamilyIds.has(id));
+            if (idsToDelete.length > 0) {
+                await client.query(
+                    'DELETE FROM public.extended_family WHERE id = ANY($1::int[])',
+                    [idsToDelete]
+                );
+            }
+
+            // --- Update existing extended family members ---
+            for (const member of updatedExtendedFamilyMembers) {
+                const checkQuery = 'SELECT 1 FROM public.extended_family WHERE id = $1 AND application_id = $2';
+                const checkResult = await client.query(checkQuery, [member.id, applicationId]);
+                // --- FIXED: Check for null rowCount ---
+                if (checkResult.rowCount !== null && checkResult.rowCount > 0) {
+                    const updateFields: string[] = [];
+                    const updateValues: any[] = [];
+                    let idx = 1;
+                    if (member.name !== undefined) { updateFields.push(`name = $${idx++}`); updateValues.push(member.name); }
+                    if (member.surname !== undefined) { updateFields.push(`surname = $${idx++}`); updateValues.push(member.surname); }
+                    if (member.relationship !== undefined) { updateFields.push(`relationship = $${idx++}`); updateValues.push(member.relationship); }
+                    if (member.date_of_birth !== undefined) { updateFields.push(`date_of_birth = $${idx++}`); updateValues.push(member.date_of_birth); }
+                    if (member.premium !== undefined) { updateFields.push(`premium = $${idx++}`); updateValues.push(member.premium); }
+
+                    if(updateFields.length > 0) {
+                        const updateQuery = `UPDATE public.extended_family SET ${updateFields.join(', ')}, updated_at = NOW() WHERE id = $${idx}`;
+                        updateValues.push(member.id);
+                        await client.query(updateQuery, updateValues);
+                    }
+                } else {
+                    console.warn(`Extended family member ID ${member.id} not found for application ${applicationId} or does not belong to it. Skipping update.`);
+                    // Optionally, return a 400 error if trying to update a non-existent member ID
+                    // return res.status(400).json({ error: `Extended family member ID ${member.id} not found for this application.` });
+                }
+            }
+
+            // --- Insert new extended family members ---
+            if (newExtendedFamilyMembers.length > 0) {
+                 const insertQuery = `
+                    INSERT INTO public.extended_family (application_id, name, surname, relationship, date_of_birth, premium)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                `;
+                for (const member of newExtendedFamilyMembers) {
+                    await client.query(insertQuery, [
+                        applicationId,
+                        member.name ?? null,
+                        member.surname ?? null,
+                        member.relationship ?? null,
+                        member.date_of_birth ?? null,
+                        member.premium ?? null // Handle potential null/undefined premium
+                    ]);
+                }
+            }
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'Application updated successfully!', id: applicationId });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error updating application:', error);
+        // Provide more specific error messages where possible
+        if (error instanceof Error && error.message.includes('duplicate key value violates unique constraint')) {
+             res.status(409).json({ error: 'Conflict: Duplicate entry found.', details: error.message });
+        } else {
+             res.status(500).json({ error: 'Failed to update application.', details: error instanceof Error ? error.message : String(error) });
+        }
+    } finally {
+        client.release();
+    }
+});
 // Add this new endpoint to your server.ts file, e.g., after the quotes endpoint.
 
 
@@ -9741,8 +10041,6 @@ app.post("/journal-entries", authMiddleware, async (req: Request, res: Response)
 app.get("/journal-entries", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id; // Access user from req.user
   const { start, end, q } = req.query as any;
-  const page = Math.max(parseInt((req.query.page as string) || "1"), 1);
-  const pageSize = Math.min(Math.max(parseInt((req.query.pageSize as string) || "50"), 1), 200);
 
   const params: any[] = [userId];
   const where: string[] = ["je.user_id = $1"];
@@ -9759,13 +10057,14 @@ app.get("/journal-entries", authMiddleware, async (req: Request, res: Response) 
   LEFT JOIN public.journal_lines jl ON jl.entry_id = je.id AND jl.user_id = je.user_id
       WHERE ${where.join(" AND ")}
    GROUP BY je.id
-   ORDER BY je.entry_date DESC, je.id DESC
-   LIMIT $${params.length+1} OFFSET $${params.length+2}`,
-    [...params, pageSize, (page - 1) * pageSize]
+   ORDER BY je.entry_date DESC, je.id DESC`,
+    params // No longer passing pageSize or offset
   );
 
-  res.json({ page, pageSize, items: rows.rows });
+  // The response now simply returns all items found, without pagination details.
+  res.json({ items: rows.rows });
 });
+
 
 // Get one
 app.get("/journal-entries/:id", authMiddleware, async (req: Request, res: Response) => {
@@ -12356,6 +12655,573 @@ app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response
 
 
 // --- END NEW ENDPOINT ---
+// GET /api/my-agents - Fetch all users with the 'agent' role directly under the authenticated user
+// GET /api/my-agents - Fetch agents with core user info and some agent-specific info
+app.get('/api/my-agents', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id; // ID of the logged-in Super Agent
+
+  try {
+    // Join users, user_roles, roles (for filtering) and agents (for specific data)
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name AS "displayName", u.email, u.user_id,
+              COALESCE(json_agg(DISTINCT r.name) FILTER (WHERE r.name IS NOT NULL), '[]') AS roles,
+              a.commission_rate, a.territory, a.agent_code -- Example agent-specific fields
+       FROM public.users u
+       LEFT JOIN public.user_roles ur ON u.user_id = ur.user_id
+       LEFT JOIN public.roles r ON ur.role = r.name
+       LEFT JOIN public.agents a ON u.user_id = a.user_id -- Join with agents table
+       WHERE u.parent_user_id = $1
+         AND LOWER(r.name) = 'agent'
+       GROUP BY u.id, u.name, u.email, u.user_id, a.commission_rate, a.territory, a.agent_code -- Include agent fields in GROUP BY
+       ORDER BY u.name`,
+      [superAgentUserId]
+    );
+    res.json(rows);
+  } catch (error: unknown) {
+    console.error('Error fetching agents:', error);
+    res.status(500).json({ error: 'Failed to fetch agents.', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+
+// EDIT/UPDATE AGENT ENDPOINT
+// EDIT/UPDATE AGENT ENDPOINT
+// EDIT/UPDATE AGENT ENDPOINT
+app.patch('/api/agents/:user_id', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id; // ID of the logged-in Super Agent
+  const targetUserId = req.params.user_id; // User ID of the agent to update
+  const updates = req.body; // Fields to update
+
+  try {
+    // First, verify that the agent belongs to this super agent
+    const agentCheck = await pool.query(
+      `SELECT 1 FROM public.users 
+       WHERE user_id = $1 AND parent_user_id = $2`,
+      [targetUserId, superAgentUserId]
+    );
+
+    if (agentCheck.rowCount === 0) {
+      return res.status(403).json({ 
+        error: 'Access denied. Agent does not belong to you.' 
+      });
+    }
+
+    // Start transaction
+    await pool.query('BEGIN');
+
+    // Update user information (name, email)
+    if (updates.displayName || updates.email) {
+      const userUpdates: string[] = [];
+      const userValues: any[] = [];
+      let userValueIndex = 1;
+
+      if (updates.displayName) {
+        userUpdates.push(`name = $${userValueIndex}`);
+        userValues.push(updates.displayName);
+        userValueIndex++;
+      }
+
+      if (updates.email) {
+        userUpdates.push(`email = $${userValueIndex}`);
+        userValues.push(updates.email);
+        userValueIndex++;
+      }
+
+      userValues.push(targetUserId);
+
+      await pool.query(
+        `UPDATE public.users 
+         SET ${userUpdates.join(', ')} 
+         WHERE user_id = $${userValueIndex}`,
+        userValues
+      );
+    }
+
+    // Update agent-specific information
+    if (
+      updates.commission_rate !== undefined || 
+      updates.territory !== undefined || 
+      updates.agent_code !== undefined ||
+      updates.target_monthly_registrations !== undefined ||
+      updates.target_monthly_sales !== undefined ||
+      updates.performance_score !== undefined
+    ) {
+      // First, check if agent record exists
+      const agentExists = await pool.query(
+        'SELECT user_id FROM public.agents WHERE user_id = $1',
+        [targetUserId]
+      );
+
+      if (agentExists && agentExists.rowCount && agentExists.rowCount > 0) {
+        // Update existing agent record
+        const agentUpdates: string[] = [];
+        const agentValues: any[] = [];
+        let agentValueIndex = 1;
+
+        if (updates.commission_rate !== undefined) {
+          agentUpdates.push(`commission_rate = $${agentValueIndex}`);
+          agentValues.push(updates.commission_rate);
+          agentValueIndex++;
+        }
+
+        if (updates.territory !== undefined) {
+          agentUpdates.push(`territory = $${agentValueIndex}`);
+          agentValues.push(updates.territory);
+          agentValueIndex++;
+        }
+
+        if (updates.agent_code !== undefined) {
+          agentUpdates.push(`agent_code = $${agentValueIndex}`);
+          agentValues.push(updates.agent_code);
+          agentValueIndex++;
+        }
+
+        if (updates.target_monthly_registrations !== undefined) {
+          agentUpdates.push(`target_monthly_registrations = $${agentValueIndex}`);
+          agentValues.push(updates.target_monthly_registrations);
+          agentValueIndex++;
+        }
+
+        if (updates.target_monthly_sales !== undefined) {
+          agentUpdates.push(`target_monthly_sales = $${agentValueIndex}`);
+          agentValues.push(updates.target_monthly_sales);
+          agentValueIndex++;
+        }
+
+        if (updates.performance_score !== undefined) {
+          agentUpdates.push(`performance_score = $${agentValueIndex}`);
+          agentValues.push(updates.performance_score);
+          agentValueIndex++;
+        }
+
+        // Don't update parent_user_id as it should remain unchanged
+        agentValues.push(targetUserId);
+
+        if (agentUpdates.length > 0) {
+          await pool.query(
+            `UPDATE public.agents 
+             SET ${agentUpdates.join(', ')} 
+             WHERE user_id = $${agentValueIndex}`,
+            agentValues
+          );
+        }
+      } else {
+        // Insert new agent record - but we need to get the parent_user_id
+        // The parent_user_id should be the superAgentUserId
+        const agentFields: string[] = ['user_id', 'parent_user_id'];
+        const agentValues: any[] = [targetUserId, superAgentUserId];
+        let agentValueIndex = 3; // Starting from 3 since we already have 2 values
+
+        if (updates.commission_rate !== undefined) {
+          agentFields.push('commission_rate');
+          agentValues.push(updates.commission_rate);
+          agentValueIndex++;
+        }
+
+        if (updates.territory !== undefined) {
+          agentFields.push('territory');
+          agentValues.push(updates.territory);
+          agentValueIndex++;
+        }
+
+        if (updates.agent_code !== undefined) {
+          agentFields.push('agent_code');
+          agentValues.push(updates.agent_code);
+          agentValueIndex++;
+        }
+
+        if (updates.target_monthly_registrations !== undefined) {
+          agentFields.push('target_monthly_registrations');
+          agentValues.push(updates.target_monthly_registrations);
+          agentValueIndex++;
+        }
+
+        if (updates.target_monthly_sales !== undefined) {
+          agentFields.push('target_monthly_sales');
+          agentValues.push(updates.target_monthly_sales);
+          agentValueIndex++;
+        }
+
+        if (updates.performance_score !== undefined) {
+          agentFields.push('performance_score');
+          agentValues.push(updates.performance_score);
+          agentValueIndex++;
+        }
+
+        const placeholders = agentValues.map((_, i) => `$${i + 1}`).join(', ');
+        
+        await pool.query(
+          `INSERT INTO public.agents (${agentFields.join(', ')}) 
+           VALUES (${placeholders})`,
+          agentValues
+        );
+      }
+    }
+
+    // Commit transaction
+    await pool.query('COMMIT');
+
+    res.json({ message: 'Agent updated successfully' });
+  } catch (error: unknown) {
+    // Rollback transaction on error
+    await pool.query('ROLLBACK');
+    console.error('Error updating agent:', error);
+    res.status(500).json({ 
+      error: 'Failed to update agent.', 
+      detail: error instanceof Error ? error.message : String(error) 
+    });
+  }
+});
+
+// DELETE AGENT ENDPOINT
+app.delete('/api/agents/:user_id', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id; // ID of the logged-in Super Agent
+  const targetUserId = req.params.user_id; // User ID of the agent to delete
+
+  try {
+    // Verify that the agent belongs to this super agent
+    const agentCheck = await pool.query(
+      `SELECT 1 FROM public.users 
+       WHERE user_id = $1 AND parent_user_id = $2`,
+      [targetUserId, superAgentUserId]
+    );
+
+    if (agentCheck.rowCount === 0) {
+      return res.status(403).json({ 
+        error: 'Access denied. Agent does not belong to you.' 
+      });
+    }
+
+    // Start transaction
+    await pool.query('BEGIN');
+
+    // Delete from agents table first (foreign key constraint)
+    await pool.query('DELETE FROM public.agents WHERE user_id = $1', [targetUserId]);
+
+    // Delete from user_roles table
+    await pool.query('DELETE FROM public.user_roles WHERE user_id = $1', [targetUserId]);
+
+    // Delete from users table
+    await pool.query('DELETE FROM public.users WHERE user_id = $1', [targetUserId]);
+
+    // Commit transaction
+    await pool.query('COMMIT');
+
+    res.json({ message: 'Agent deleted successfully' });
+  } catch (error: unknown) {
+    // Rollback transaction on error
+    await pool.query('ROLLBACK');
+    console.error('Error deleting agent:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete agent.', 
+      detail: error instanceof Error ? error.message : String(error) 
+    });
+  }
+});
+// server.ts or your routes file
+// server.ts or your routes file
+// GET /api/super-agent/dashboard/stats - Fetch dashboard statistics for the super agent
+// server.ts or your routes file
+// GET /api/super-agent/dashboard/stats - Fetch dashboard statistics for the super agent
+app.get('/api/super-agent/dashboard/stats', authMiddleware, async (req: Request, res: Response) => {
+  // Use req.user!.user_id to get the ID of the currently logged-in Super Agent
+  const superAgentUserId = req.user!.user_id;
+
+  if (!superAgentUserId) {
+      return res.status(401).json({ error: 'Unauthorized: Super Agent User ID not found.' });
+  }
+
+  try {
+    // --- Fetch Dashboard Statistics ---
+
+    // 1. Total Agents (users with role 'agent' and parent_user_id = superAgentUserId)
+    // Using LOWER for case-insensitive comparison as per previous discussions
+    const agentCountResult = await pool.query(
+      `SELECT COUNT(*) AS count FROM public.users u
+       JOIN public.user_roles ur ON u.user_id = ur.user_id
+       WHERE u.parent_user_id = $1 AND LOWER(ur.role) = 'agent'`,
+      [superAgentUserId]
+    );
+    const totalAgents = parseInt(agentCountResult.rows[0]?.count || '0', 10);
+
+    // 2. Total Registrations (applications where parent_user_id = superAgentUserId)
+    // Using the newly added parent_user_id column for efficient lookup
+    const regCountResult = await pool.query(
+       `SELECT COUNT(*) AS count FROM public.applications a
+        WHERE a.parent_user_id = $1`,
+       [superAgentUserId]
+    );
+    const totalRegistrations = parseInt(regCountResult.rows[0]?.count || '0', 10);
+
+    // 3. Total Successful Payments
+    // Based on sales table schema: Any record with a payment_type is considered an attempt.
+    // Adjust condition if you have a stricter definition (e.g., exclude certain types or check amounts).
+    const successfulPaymentsResult = await pool.query(
+       `SELECT COUNT(*) AS count FROM public.sales s
+        JOIN public.users u ON s.teller_id = u.user_id
+        WHERE u.parent_user_id = $1 AND s.payment_type IN ('Cash', 'Bank', 'Credit')`, // Use payment_type
+       [superAgentUserId]
+    );
+    const totalSuccessfulPayments = parseInt(successfulPaymentsResult.rows[0]?.count || '0', 10);
+
+    // 4. Total Commission Earned
+    // Example: Calculate 5% commission on total_amount for successful sales.
+    // Adjust calculation logic and percentage as needed.
+    const commissionResult = await pool.query(
+       `SELECT COALESCE(SUM(s.total_amount * 0.05), 0)::numeric(14, 2) AS total_commission FROM public.sales s
+        JOIN public.users u ON s.teller_id = u.user_id
+        WHERE u.parent_user_id = $1 AND s.payment_type IN ('Cash', 'Bank', 'Credit')`, // Use payment_type
+       [superAgentUserId]
+    );
+    const totalCommissionEarned = parseFloat(commissionResult.rows[0]?.total_commission || '0');
+
+    // 5. Pending Payments
+    // Example logic: Credit sales with remaining amount.
+    // Adjust based on your business definition of "pending".
+    const pendingPaymentsResult = await pool.query(
+       `SELECT COUNT(*) AS count FROM public.sales s
+        JOIN public.users u ON s.teller_id = u.user_id
+        WHERE u.parent_user_id = $1 AND s.payment_type = 'Credit' AND COALESCE(s.remaining_credit_amount, 0) > 0`,
+       [superAgentUserId]
+    );
+    const totalPendingPayments = parseInt(pendingPaymentsResult.rows[0]?.count || '0', 10);
+
+    // 6. Failed Payments
+    // The sales table doesn't explicitly track failed payments.
+    // Placeholder query that returns 0. You need to define what constitutes "failed"
+    // based on your application logic (e.g., separate table, specific flags).
+    const failedPaymentsResult = await pool.query(
+       `SELECT COUNT(*) AS count FROM public.sales s
+        JOIN public.users u ON s.teller_id = u.user_id
+        WHERE u.parent_user_id = $1 AND 1=0`, // Always false, returns 0 count
+       [superAgentUserId]
+    );
+    const totalFailedPayments = parseInt(failedPaymentsResult.rows[0]?.count || '0', 10);
+
+    // --- End Fetching Statistics ---
+
+    res.json({
+      totalAgents,
+      totalRegistrations,
+      totalSuccessfulPayments,
+      totalPendingPayments,
+      totalFailedPayments,
+      totalCommissionEarned,
+      // ... other stats
+    });
+  } catch (error: unknown) {
+    console.error('Error fetching super agent dashboard stats:', error);
+    res.status(500).json({
+      error: 'Failed to fetch dashboard statistics.',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+
+
+// GET /api/super-agent/dashboard/chart-data - Fetch chart data for the super agent dashboard
+app.get('/api/super-agent/dashboard/chart-data', authMiddleware, async (req: Request, res: Response) => {
+  // Use req.user!.user_id to get the ID of the currently logged-in Super Agent
+  const superAgentUserId = req.user!.user_id;
+  const period = req.query.period as string | undefined;
+
+  if (!superAgentUserId) {
+      return res.status(401).json({ error: 'Unauthorized: Super Agent User ID not found.' });
+  }
+
+  // Validate period parameter if needed (e.g., only allow 'last_5_months')
+  if (period !== 'last_5_months') { // Example validation
+     // You could also provide a default or handle other periods
+     return res.status(400).json({ error: 'Invalid or unsupported period parameter.' });
+  }
+
+  try {
+    // --- Logic to fetch and aggregate chart data ---
+
+    // Dynamically calculate the last 5 months labels
+    const last5MonthsLabels: string[] = [];
+    const now = new Date();
+    for (let i = 4; i >= 0; i--) {
+      const monthDate = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      // Format to short month name (e.g., "Oct")
+      last5MonthsLabels.push(monthDate.toLocaleString('default', { month: 'short' }));
+    }
+
+    // Initialize data arrays
+    const monthlyRegistrations: number[] = new Array(5).fill(0);
+    const monthlyPayments: number[] = new Array(5).fill(0); // Initialize with 5 elements
+
+    // --- Fetch and Aggregate Data ---
+
+    // 1. Fetch Registration Data (Grouped by Month)
+    // Using the parent_user_id column in applications
+    const regTrendQuery = `
+      SELECT
+        EXTRACT(MONTH FROM a.created_at) as month_num,
+        EXTRACT(YEAR FROM a.created_at) as year_num,
+        COUNT(*) as count
+      FROM public.applications a
+      WHERE a.parent_user_id = $1
+        AND a.created_at >= CURRENT_DATE - INTERVAL '5 months'
+      GROUP BY year_num, month_num
+      ORDER BY year_num, month_num
+    `;
+    const regTrendResult = await pool.query(regTrendQuery, [superAgentUserId]);
+
+    // Map registration results to the correct month index in our array
+    regTrendResult.rows.forEach(row => {
+        const dataYear = parseInt(row.year_num, 10);
+        const dataMonthZeroBased = parseInt(row.month_num, 10) - 1; // JS months are 0-based
+        const dataDate = new Date(dataYear, dataMonthZeroBased, 1);
+
+        // Find the index in our last5MonthsLabels array
+        for (let i = 0; i < 5; i++) {
+            const labelDate = new Date(now.getFullYear(), now.getMonth() - (4 - i), 1);
+            if (dataDate.getFullYear() === labelDate.getFullYear() &&
+                dataDate.getMonth() === labelDate.getMonth()) {
+                monthlyRegistrations[i] = parseInt(row.count, 10);
+                break; // Found the month, exit the loop
+            }
+        }
+    });
+
+    // 2. Fetch Payment Data (Grouped by Month)
+    // Example using 'sales' table with 'teller_id' and 'payment_type'
+    // Counts sales with any valid payment_type for the trend.
+    const paymentTrendQuery = `
+      SELECT
+        EXTRACT(MONTH FROM s.created_at) as month_num,
+        EXTRACT(YEAR FROM s.created_at) as year_num,
+        COUNT(*) as count -- Or SUM(total_amount) if you want total value
+      FROM public.sales s
+      JOIN public.users u ON s.teller_id = u.user_id -- Join to filter by agent hierarchy
+      WHERE u.parent_user_id = $1
+        AND s.payment_type IN ('Cash', 'Bank', 'Credit') -- Use payment_type
+        AND s.created_at >= CURRENT_DATE - INTERVAL '5 months'
+      GROUP BY year_num, month_num
+      ORDER BY year_num, month_num
+    `;
+    const paymentTrendResult = await pool.query(paymentTrendQuery, [superAgentUserId]);
+
+     // Map payment results to the correct month index in our array
+    paymentTrendResult.rows.forEach(row => {
+        const dataYear = parseInt(row.year_num, 10);
+        const dataMonthZeroBased = parseInt(row.month_num, 10) - 1; // JS months are 0-based
+        const dataDate = new Date(dataYear, dataMonthZeroBased, 1);
+
+        // Find the index in our last5MonthsLabels array
+        for (let i = 0; i < 5; i++) {
+            const labelDate = new Date(now.getFullYear(), now.getMonth() - (4 - i), 1);
+            if (dataDate.getFullYear() === labelDate.getFullYear() &&
+                dataDate.getMonth() === labelDate.getMonth()) {
+                monthlyPayments[i] = parseInt(row.count, 10); // Or parseFloat for SUM(total_amount)
+                break; // Found the month, exit the loop
+            }
+        }
+    });
+
+    // --- Format data for the frontend ---
+    // Combine labels with data points
+    const chartDataFormatted: { month: string; registrations: number; payments: number }[] = last5MonthsLabels.map((label, index) => ({
+      month: label,
+      registrations: monthlyRegistrations[index] || 0,
+      payments: monthlyPayments[index] || 0,
+    }));
+
+    // --- End Logic ---
+    res.json(chartDataFormatted);
+  } catch (error: unknown) {
+    console.error('Error fetching super agent dashboard chart data:', error);
+    res.status(500).json({
+      error: 'Failed to fetch dashboard chart data.',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.get('/api/clients', authMiddleware, async (req: Request, res: Response) => {
+  // Query params
+  const rawStatus = (req.query.status as string) || 'all';
+  const status = rawStatus.toLowerCase(); // normalize
+  const dateRange = (req.query.dateRange as string) || 'all_time';
+  const search = req.query.search;
+
+  // From auth middleware (make sure middleware sets req.user properly)
+  const agentId = req.user?.parent_user_id; // or req.user?.user_id if that’s how you stored apps
+  if (!agentId) {
+    return res.status(401).json({ error: 'Unauthenticated or missing parent_user_id on token.' });
+  }
+
+  let clientConn: PoolClient | null = null;
+  try {
+    clientConn = await pool.connect();
+
+    const values: any[] = [agentId];
+    let query = `
+      SELECT id, name, surname, created_at,  total_amount, id_number
+      FROM applications
+      WHERE parent_user_id = $1
+    `;
+
+    // Date range filter (skip for all_time)
+    if (dateRange === 'this_week') {
+      query += ` AND created_at >= date_trunc('week', now())`;
+    } else if (dateRange === 'this_month') {
+      query += ` AND created_at >= date_trunc('month', now())`;
+    } else if (dateRange === 'last_month') {
+      query += ` AND created_at >= date_trunc('month', now()) - INTERVAL '1 month'
+                AND created_at <  date_trunc('month', now())`;
+    } else if (dateRange === 'last_3_months') {
+      query += ` AND created_at >= date_trunc('month', now()) - INTERVAL '3 months'`;
+    }
+    // else all_time → no date filter
+
+    // Status filter (only when != 'all')
+    if (status !== 'all') {
+      values.push(status);
+      query += ` AND LOWER(status) = $${values.length}`;
+    }
+
+    // Search filter (name, surname, id_number)
+    let searchString = '';
+    if (typeof search === 'string') searchString = search;
+    else if (Array.isArray(search) && typeof search[0] === 'string') searchString = search[0];
+
+    if (searchString) {
+      const term = `%${searchString.toLowerCase()}%`;
+      // we can reuse the same placeholder index 3x or push it 3 times; reuse is fine
+      values.push(term);
+      const idx = values.length;
+      query += ` AND (LOWER(name) LIKE $${idx} OR LOWER(surname) LIKE $${idx} OR LOWER(id_number) LIKE $${idx})`;
+    }
+
+    query += ` ORDER BY created_at DESC`;
+
+    const result = await clientConn.query(query, values);
+
+    const formatted = result.rows.map((row: any) => ({
+      id: row.id,
+      clientId: row.id_number || 'N/A',
+      name: `${row.name ?? ''} ${row.surname ?? ''}`.trim(),
+      date: row.created_at ? new Date(row.created_at).toLocaleDateString() : '',
+      status: (row.status ?? '').charAt(0).toUpperCase() + (row.status ?? '').slice(1), // e.g. "pending" -> "Pending"
+      amount: row.total_amount == null ? 0 : Number(row.total_amount),
+    }));
+
+    res.json(formatted);
+  } catch (error: any) {
+    console.error('Error fetching clients data:', error);
+    res.status(500).json({ error: 'Failed to fetch clients data.', detail: error.message });
+  } finally {
+    clientConn?.release();
+  }
+});
+
+
+
+
+
 app.listen(PORT, () => {
   console.log(`Node server running on http://localhost:${PORT}`);
 });
