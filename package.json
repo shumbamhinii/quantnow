@@ -30,12 +30,14 @@
     "uuid": "^11.1.0"
   },
   "devDependencies": {
+    "@types/blob-stream": "^0.1.33",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.0.0",
     "@types/node": "^24.0.13",
     "@types/nodemailer": "^6.4.17",
+    "@types/pdfkit": "^0.17.2",
     "@types/pg": "^8.15.4",
     "nodemon": "^3.1.10",
     "ts-node": "^10.9.2",

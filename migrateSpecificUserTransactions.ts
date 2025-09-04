@@ -12,7 +12,7 @@ const pool = new Pool({
 // --- END DIRECT DATABASE CONNECTION ---
 
 // --- Target User ID ---
-const TARGET_USER_ID = '12a058d5-a523-4534-b198-3307be40da04';
+const TARGET_USER_ID = 'ee9af963-30ca-44d8-9536-83ddf87e7be3';
 // --- END Target User ID ---
 
 async function migrateUserTransactions() {

@@ -1207,7 +1207,7 @@ app.get('/api/quotations/:id/pdf', authMiddleware, async (req: Request, res: Res
 
 
 // UPDATE the `/api/:documentType/:id/pdf` endpoint to include the logo
-// UPDATE the `/api/:documentType/:id/pdf` endpoint to include the logo
+
 app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: Response) => {
     const { documentType, id } = req.params;
     const { startDate, endDate } = req.query;
@@ -1425,8 +1425,7 @@ app.get('/api/:documentType/:id/pdf', authMiddleware, async (req: Request, res: 
 });
 
 // UPDATE the `/api/quotations/:id/send-pdf-email` endpoint
-// UPDATE the `/api/quotations/:id/send-pdf-email` endpoint
-// UPDATE the `/api/quotations/:id/send-pdf-email` endpoint
+
 app.post('/api/quotations/:id/send-pdf-email', authMiddleware, upload.none(), async (req: Request, res: Response) => {
     const { id } = req.params;
     const { recipientEmail, subject, body } = req.body;
@@ -7451,532 +7450,662 @@ const formatDate = (dateStr: string): string => {
 // Helper function to format date
 
 
+// Make sure you have these imports at the top of your file
+// import PDFDocument from 'pdfkit';
+// import { authMiddleware } from './middleware/auth'; // Adjust path as needed
+// import axios from 'axios'; // Needed if you want to fetch the logo via URL like in quotations
+
 app.get('/generate-financial-document', authMiddleware, async (req: Request, res: Response) => {
-  const { documentType, startDate, endDate, format: formatParam } = req.query as {
-    documentType?: string;
-    startDate?: string;
-    endDate?: string;
-    format?: string; // 'json' to return data
-  };
+    const { documentType, startDate, endDate, format: formatParam } = req.query as {
+        documentType?: string;
+        startDate?: string;
+        endDate?: string;
+        format?: string; // 'json' to return data
+    };
 
-  if (!documentType || !startDate || !endDate) {
-    return res.status(400).json({ error: 'documentType, startDate, and endDate are required.' });
-  }
-
-  // Scope to the company owner (tenant)
-  const user_id = req.user!.parent_user_id;
-  const wantJson = String(formatParam || '').toLowerCase() === 'json';
-
-  try {
-    let filename = '';
-
-    // --- Determine the Filename based on documentType ---
-    switch (documentType) {
-      case 'income-statement':
-        filename = `Income_Statement_${startDate}_to_${endDate}.pdf`;
-        break;
-      case 'balance-sheet':
-        filename = `Balance_Sheet_As_Of_${endDate}.pdf`;
-        break;
-      case 'cash-flow-statement':
-        filename = `Cash_Flow_Statement_${startDate}_to_${endDate}.pdf`;
-        break;
-      case 'trial-balance':
-        filename = `Trial_Balance_${startDate}_to_${endDate}.pdf`;
-        break;
-      default:
-        return res.status(400).json({ error: `Unsupported document type: ${documentType}` });
+    if (!documentType || !startDate || !endDate) {
+        return res.status(400).json({ error: 'documentType, startDate, and endDate are required.' });
     }
-    // --- End Filename Determination ---
 
-    // --- INTERNAL API CALL to fetch the raw JSON data ---
-    // We'll simulate calling the internal endpoint.
-    // In a real scenario, you might want to factor out the data-fetching logic
-    // from the /reports/... endpoints into reusable service functions.
-    // For now, we'll replicate the core logic here to get the exact JSON structure.
+    // Scope to the company owner (tenant)
+    const user_id = req.user!.parent_user_id;
+    const wantJson = String(formatParam || '').toLowerCase() === 'json';
 
-    let reportData: any = null;
+    try {
+        let filename = '';
 
-    if (documentType === 'income-statement') {
-      const userId = user_id;
-      const start = startDate!;
-      const end = endDate!;
-      const { rows } = await pool.query(
-        `
-        SELECT rc.section,
-               SUM(
-                 CASE
-                   WHEN rc.section IN ('revenue','other_income')
-                     THEN -(jl.debit - jl.credit)   -- credit balances positive
-                   ELSE      (jl.debit - jl.credit) -- expense balances positive
-                 END
-               ) AS amount
-          FROM public.journal_lines jl
-          JOIN public.journal_entries je
-            ON je.id = jl.entry_id AND je.user_id = jl.user_id
-          JOIN public.accounts a
-            ON a.id = jl.account_id AND a.user_id = jl.user_id
-          JOIN public.reporting_categories rc
-            ON rc.id = a.reporting_category_id
-         WHERE je.user_id = $1
-           AND rc.statement = 'income_statement'
-           AND je.entry_date BETWEEN $2::date AND $3::date
-         GROUP BY rc.section
-         ORDER BY rc.section
-        `,
-        [userId, start, end]
-      );
-      reportData = { period: { start, end }, sections: rows };
-    }
-    else if (documentType === 'balance-sheet') {
-      const userId = user_id;
-      const asOf = endDate!; // Use endDate as the "as of" date
-      const client = await pool.connect();
-      try {
-        const profitLossResult = await client.query(
-          `
-          SELECT 
-            SUM(CASE 
-              WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit) -- Revenue/Income
-              ELSE -(jl.debit - jl.credit) -- Expenses (negate to subtract from income)
-            END) AS net_profit_loss
-          FROM public.journal_lines jl
-          JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-          JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-          JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
-          WHERE je.user_id = $1
-            AND rc.statement = 'income_statement'
-            AND je.entry_date <= $2::date
-          `,
-          [userId, asOf]
+        // --- Determine the Filename based on documentType ---
+        switch (documentType) {
+            case 'income-statement':
+                filename = `Income_Statement_${startDate}_to_${endDate}.pdf`;
+                break;
+            case 'balance-sheet':
+                filename = `Balance_Sheet_As_Of_${endDate}.pdf`;
+                break;
+            case 'cash-flow-statement':
+                filename = `Cash_Flow_Statement_${startDate}_to_${endDate}.pdf`;
+                break;
+            case 'trial-balance':
+                filename = `Trial_Balance_${startDate}_to_${endDate}.pdf`;
+                break;
+            default:
+                return res.status(400).json({ error: `Unsupported document type: ${documentType}` });
+        }
+        // --- End Filename Determination ---
+
+        // --- Fetch Company Details (Like in quotations/invoices) ---
+        const userProfileResult = await pool.query(
+            `SELECT company, address, city, province, postal_code, country, phone, email, company_logo_path
+             FROM users WHERE user_id = $1`,
+            [user_id]
         );
-        const netProfitLoss = parseFloat(profitLossResult.rows[0]?.net_profit_loss) || 0;
+        const userCompany = userProfileResult.rows[0];
+        const companyName = userCompany?.company || 'Your Company';
+        // Dynamically construct the full company address string
+        const companyFullAddressParts = [
+            userCompany?.address,
+            userCompany?.city,
+            userCompany?.province,
+            userCompany?.postal_code,
+            userCompany?.country
+        ].filter(part => part); // Remove falsy values
+        const companyFullAddress = companyFullAddressParts.length > 0 ? companyFullAddressParts.join(', ') : null;
 
-        const { rows: balanceSheetSections } = await client.query(
-          `
-          SELECT rc.section,
-                 SUM(CASE a.normal_side
-                       WHEN 'Debit'   THEN (jl.debit - jl.credit)
-                       ELSE            -(jl.debit - jl.credit)
-                     END) AS value
-            FROM public.journal_lines jl
-            JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-            JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
-           WHERE je.user_id = $1
-             AND rc.statement = 'balance_sheet'
-             AND je.entry_date <= $2::date
-           GROUP BY rc.section
-           ORDER BY rc.section
-          `,
-          [userId, asOf]
-        );
+        const companyPhone = userCompany?.phone || null;
+        const companyEmail = userCompany?.email || null;
+        const companyVat = userCompany?.vat_number || null;
+        const companyReg = userCompany?.reg_number || null;
 
-        const obeAccountResult = await client.query(
-          `SELECT id FROM public.accounts WHERE user_id = $1 AND name = 'Opening Balance Equity' LIMIT 1`,
-          [userId]
-        );
-        let openingBalanceEquityValue = 0;
-        if (obeAccountResult.rows.length > 0) {
-          const obeAccountId = obeAccountResult.rows[0].id;
-          const obeBalanceResult = await client.query(
-            `
-            SELECT 
-              SUM(CASE a.normal_side
-                    WHEN 'Debit' THEN (jl.debit - jl.credit)
-                    ELSE          -(jl.debit - jl.credit)
-                  END) AS balance
-            FROM public.journal_lines jl
-            JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-            JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-            WHERE jl.user_id = $1
-              AND jl.account_id = $2
-              AND je.entry_date <= $3::date
-            `,
-            [userId, obeAccountId, asOf]
-          );
-          openingBalanceEquityValue = parseFloat(obeBalanceResult.rows[0]?.balance) || 0;
+        let companyLogoBuffer: Buffer | null = null;
+        if (userCompany?.company_logo_path) {
+            try {
+                // 1. Get the public URL from Supabase Storage
+                const { data } = supabase.storage.from('company-logos').getPublicUrl(userCompany.company_logo_path);
+                const companyLogoUrl = data.publicUrl;
+                console.log(`[DEBUG] Generated logo URL: ${companyLogoUrl}`);
+
+                // 2. Fetch the image data from the public URL using axios
+                // Ensure responseType is 'arraybuffer' for binary data
+                const logoResponse = await axios.get(companyLogoUrl, { responseType: 'arraybuffer' });
+                companyLogoBuffer = Buffer.from(logoResponse.data, 'binary'); // Convert to Buffer
+                console.log(`[DEBUG] Fetched logo buffer, size: ${companyLogoBuffer?.length} bytes`);
+            } catch (logoFetchError) {
+                // 3. Handle errors during fetching or conversion
+                console.warn(`[WARN] Failed to fetch or process logo from URL ${userCompany.company_logo_path}:`, logoFetchError);
+                // companyLogoBuffer remains null, so the logo will be skipped in the PDF
+            }
         }
 
-        const sectionsMap: Record<string, number> = {};
-        balanceSheetSections.forEach(s => {
-            sectionsMap[s.section] = parseFloat(s.value) || 0;
-        });
 
-        const closingEquity = openingBalanceEquityValue + netProfitLoss; 
+        // --- INTERNAL API CALL to fetch the raw JSON data ---
+        let reportData: any = null;
 
-        reportData = { 
-          asOf, 
-          sections: balanceSheetSections,
-          openingEquity: openingBalanceEquityValue,
-          netProfitLoss: netProfitLoss,
-          closingEquity: closingEquity,
-          assets: {
-            current: sectionsMap['current_assets'] || 0,
-            non_current: sectionsMap['non_current_assets'] || 0
-          },
-          liabilities: {
-            current: sectionsMap['current_liabilities'] || 0,
-            non_current: sectionsMap['non_current_liabilities'] || 0
-          }
-        };
-      } finally {
-        client.release();
-      }
-    }
-    else if (documentType === 'cash-flow-statement') {
-      const userId = user_id;
-      const start = startDate!;
-      const end = endDate!;
-      const { rows } = await pool.query(
-        `
-        WITH cash_changes AS (
-          SELECT 
-            'operating' as section,
-            'Net Income' as line,
-            SUM(CASE 
-              WHEN a.normal_side = 'Debit' THEN (jl.credit - jl.debit)
-              ELSE (jl.debit - jl.credit)
-            END) as amount
-          FROM public.journal_lines jl
-          JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-          JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-          JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
-          WHERE je.user_id = $1
-            AND rc.statement = 'income_statement'
-            AND je.entry_date BETWEEN $2::date AND $3::date
-        
-          UNION ALL
-        
-          SELECT 
-            'operating' as section,
-            'Depreciation' as line,
-            SUM(CASE 
-              WHEN a.normal_side = 'Debit' THEN (jl.debit - jl.credit)
-              ELSE (jl.credit - jl.debit)
-            END) as amount
-          FROM public.journal_lines jl
-          JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-          JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-          WHERE je.user_id = $1
-            AND a.name ILIKE '%depreciation%'
-            AND je.entry_date BETWEEN $2::date AND $3::date
-        
-          UNION ALL
-        
-          SELECT 
-            'investing' as section,
-            'Purchase of Assets' as line,
-            SUM(CASE 
-              WHEN a.normal_side = 'Debit' THEN (jl.debit - jl.credit)
-              ELSE (jl.credit - jl.debit)
-            END) as amount
-          FROM public.journal_lines jl
-          JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-          JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-          WHERE je.user_id = $1
-            AND a.type = 'Asset'
-            AND je.entry_date BETWEEN $2::date AND $3::date
-        
-          UNION ALL
-        
-          SELECT 
-            'financing' as section,
-            'Loan Proceeds' as line,
-            SUM(CASE 
-              WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit)
-              ELSE (jl.debit - jl.credit)
-            END) as amount
-          FROM public.journal_lines jl
-          JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-          JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-          WHERE je.user_id = $1
-            AND a.type = 'Liability'
-            AND je.entry_date BETWEEN $2::date AND $3::date
-        )
-        
-        SELECT section, line, COALESCE(amount, 0) as amount
-        FROM cash_changes
-        WHERE amount != 0
-        ORDER BY section, line
-        `,
-        [userId, start, end]
-      );
+        if (documentType === 'income-statement') {
+            const userId = user_id;
+            const start = startDate!;
+            const end = endDate!;
+            const { rows } = await pool.query(
+                `SELECT
+                    a.name AS account_name,
+                    rc.section AS reporting_section,
+                    a.normal_side AS normal_side,
+                    SUM(jl.debit - jl.credit) AS balance
+                FROM
+                    public.journal_lines jl
+                JOIN
+                    public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+                JOIN
+                    public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+                JOIN
+                    public.reporting_categories rc ON rc.id = a.reporting_category_id
+                WHERE
+                    je.user_id = $1
+                    AND rc.statement = 'income_statement'
+                    AND je.entry_date BETWEEN $2::date AND $3::date
+                GROUP BY
+                    a.name, rc.section, a.normal_side
+                ORDER BY
+                    rc.section, a.name;`,
+                [userId, start, end]
+            );
 
-      const grouped: Record<string, { line: string; amount: string | number }[]> = {};
-      for (const r of rows) {
-        grouped[r.section] = grouped[r.section] || [];
-        grouped[r.section].push({ line: r.line, amount: parseFloat(r.amount.toString()) });
-      }
-      
-      reportData = { period: { start, end }, sections: grouped };
-    }
-    else if (documentType === 'trial-balance') {
-      const userId = user_id;
-      const start = startDate!;
-      const end = endDate!;
-      const includeZero = false; // Match default behavior of endpoint
+            const sectionMap: Record<string, { section: string; amount: number; accounts: any[] }> = {};
 
-      const { rows } = await pool.query(
-        `
-        WITH period AS (
-          SELECT
-            a.id   AS account_id,
-            a.code,
-            a.name,
-            a.type,
-            COALESCE(SUM(jl.debit),  0)::numeric(18,2) AS total_debit,
-            COALESCE(SUM(jl.credit), 0)::numeric(18,2) AS total_credit
-          FROM public.accounts a
-          LEFT JOIN public.journal_lines jl
-            ON jl.account_id = a.id
-           AND jl.user_id    = a.user_id
-          LEFT JOIN public.journal_entries je
-            ON je.id      = jl.entry_id
-           AND je.user_id = jl.user_id
-          WHERE a.user_id = $1
-            AND (je.entry_date BETWEEN $2::date AND $3::date OR je.entry_date IS NULL)
-          GROUP BY a.id, a.code, a.name, a.type
-        )
-        SELECT
-          account_id, code, name, type,
-          total_debit,
-          total_credit,
-          GREATEST(total_debit - total_credit, 0)::numeric(18,2) AS balance_debit,
-          GREATEST(total_credit - total_debit, 0)::numeric(18,2) AS balance_credit
-        FROM period
-        ORDER BY code::text, name::text;
-        `,
-        [userId, start, end]
-      );
+            rows.forEach(row => {
+                const sectionName = row.reporting_section;
+                if (!sectionMap[sectionName]) {
+                    sectionMap[sectionName] = {
+                        section: sectionName,
+                        amount: 0,
+                        accounts: []
+                    };
+                }
 
-      const items = includeZero
-        ? rows
-        : rows.filter(r =>
-            Number(r.total_debit) !== 0 ||
-            Number(r.total_credit) !== 0 ||
-            Number(r.balance_debit) !== 0 ||
-            Number(r.balance_credit) !== 0
-          );
+                const balance = parseFloat(row.balance);
+                // Adjust sign based on normal side for Income Statement logic
+                const amount = (row.normal_side === 'Credit') ? -balance : balance;
 
-      const totals = items.reduce(
-        (t, r) => {
-          t.total_debit += Number(r.total_debit);
-          t.total_credit += Number(r.total_credit);
-          t.balance_debit += Number(r.balance_debit);
-          t.balance_credit += Number(r.balance_credit);
-          return t;
-        },
-        { total_debit: 0, total_credit: 0, balance_debit: 0, balance_credit: 0 }
-      );
-
-      reportData = {
-        period: { start, end },
-        totals,
-        items
-      };
-    }
-    // --- END INTERNAL API CALL SIMULATION ---
-
-    if (wantJson) {
-      return res.json(reportData);
-    }
-
-    // --- Generate PDF using PDFKit ---
-    const doc = new PDFDocument({ size: 'A4', margin: 50 });
-    // Explicitly type the chunks array and the 'data' event callback parameter
-    const chunks: Buffer[] = [];
-    
-    // Type the 'chunk' parameter as Buffer
-    doc.on('data', (chunk: Buffer) => chunks.push(chunk));
-    
-    doc.on('end', () => {
-        const pdfBuffer = Buffer.concat(chunks);
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-        res.send(pdfBuffer);
-    });
-    
-    // Type the 'err' parameter as 'Error' (or 'any' if you prefer, but 'Error' is more specific)
-    doc.on('error', (err: Error) => {
-        console.error('Error generating PDF with PDFKit:', err);
-        // Check if headers have already been sent to avoid errors
-        if (!res.headersSent) {
-            return res.status(500).json({ 
-                error: 'Failed to generate PDF document with PDFKit', 
-                detail: err.message || String(err) 
+                sectionMap[sectionName].amount += amount;
+                sectionMap[sectionName].accounts.push({
+                    name: row.account_name,
+                    amount: amount
+                });
             });
-        } else {
-             console.error('Headers already sent. Could not send JSON error response.');
+
+            reportData = { period: { start, end }, sections: Object.values(sectionMap) };
         }
-    });
+        else if (documentType === 'balance-sheet') {
+            const userId = user_id;
+            const asOf = endDate!; // Use endDate as the "as of" date
+            const client = await pool.connect();
+            try {
+                const profitLossResult = await client.query(
+                    `
+                    SELECT
+                        SUM(CASE
+                            WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit) -- Revenue/Income
+                            ELSE -(jl.debit - jl.credit) -- Expenses (negate to subtract from income)
+                        END) AS net_profit_loss
+                    FROM public.journal_lines jl
+                    JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+                    JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+                    JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+                    WHERE je.user_id = $1
+                        AND rc.statement = 'income_statement'
+                        AND je.entry_date <= $2::date
+                    `,
+                    [userId, asOf]
+                );
+                const netProfitLoss = parseFloat(profitLossResult.rows[0]?.net_profit_loss) || 0;
 
-    // --- Add Content to PDF based on documentType ---
-    if (documentType === 'income-statement') {
-        doc.fontSize(18).text('Income Statement', { align: 'center' });
-        doc.fontSize(12).text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
-        doc.moveDown();
+                const { rows: balanceSheetSections } = await client.query(
+                    `
+                    SELECT rc.section,
+                        SUM(CASE a.normal_side
+                                WHEN 'Debit' THEN (jl.debit - jl.credit)
+                                ELSE -(jl.debit - jl.credit)
+                            END) AS value
+                        FROM public.journal_lines jl
+                        JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+                        JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+                        JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+                        WHERE je.user_id = $1
+                        AND rc.statement = 'balance_sheet'
+                        AND je.entry_date <= $2::date
+                        GROUP BY rc.section
+                        ORDER BY rc.section
+                    `,
+                    [userId, asOf]
+                );
 
-        const sectionMap: Record<string, number> = {};
-        reportData.sections.forEach((s: any) => {
-            sectionMap[s.section] = parseFloat(s.amount) || 0;
+                const obeAccountResult = await client.query(
+                    `SELECT id FROM public.accounts WHERE user_id = $1 AND name = 'Opening Balance Equity' LIMIT 1`,
+                    [userId]
+                );
+                let openingBalanceEquityValue = 0;
+                if (obeAccountResult.rows.length > 0) {
+                    const obeAccountId = obeAccountResult.rows[0].id;
+                    const obeBalanceResult = await client.query(
+                        `
+                        SELECT
+                        SUM(CASE a.normal_side
+                                WHEN 'Debit' THEN (jl.debit - jl.credit)
+                                ELSE -(jl.debit - jl.credit)
+                            END) AS balance
+                        FROM public.journal_lines jl
+                        JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+                        JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+                        WHERE jl.user_id = $1
+                            AND jl.account_id = $2
+                            AND je.entry_date <= $3::date
+                        `,
+                        [userId, obeAccountId, asOf]
+                    );
+                    openingBalanceEquityValue = parseFloat(obeBalanceResult.rows[0]?.balance) || 0;
+                }
+
+                const sectionsMap: Record<string, number> = {};
+                balanceSheetSections.forEach(s => {
+                    sectionsMap[s.section] = parseFloat(s.value) || 0;
+                });
+
+                const closingEquity = openingBalanceEquityValue + netProfitLoss;
+
+                reportData = {
+                    asOf,
+                    sections: balanceSheetSections,
+                    openingEquity: openingBalanceEquityValue,
+                    netProfitLoss: netProfitLoss,
+                    closingEquity: closingEquity,
+                    assets: {
+                        current: sectionsMap['current_assets'] || 0,
+                        non_current: sectionsMap['non_current_assets'] || 0
+                    },
+                    liabilities: {
+                        current: sectionsMap['current_liabilities'] || 0,
+                        non_current: sectionsMap['non_current_liabilities'] || 0
+                    }
+                };
+            } finally {
+                client.release();
+            }
+        }
+        else if (documentType === 'cash-flow-statement') {
+            const userId = user_id;
+            const start = startDate!;
+            const end = endDate!;
+            const { rows } = await pool.query(
+                `
+                WITH cash_changes AS (
+                SELECT
+                    'operating' as section,
+                    'Net Income' as line,
+                    SUM(CASE
+                        WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit)
+                        ELSE (jl.debit - jl.credit)
+                    END) as amount
+                FROM public.journal_lines jl
+                JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+                JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+                JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+                WHERE je.user_id = $1
+                    AND rc.statement = 'income_statement'
+                    AND je.entry_date BETWEEN $2::date AND $3::date
+
+                UNION ALL
+
+                SELECT
+                    'operating' as section,
+                    'Depreciation' as line,
+                    SUM(CASE
+                        WHEN a.normal_side = 'Debit' THEN (jl.debit - jl.credit)
+                        ELSE (jl.credit - jl.debit)
+                    END) as amount
+                FROM public.journal_lines jl
+                JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+                JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+                WHERE je.user_id = $1
+                    AND a.name ILIKE '%depreciation%'
+                    AND je.entry_date BETWEEN $2::date AND $3::date
+
+                UNION ALL
+
+                SELECT
+                    'investing' as section,
+                    'Purchase of Assets' as line,
+                    SUM(CASE
+                        WHEN a.normal_side = 'Debit' THEN (jl.debit - jl.credit)
+                        ELSE (jl.credit - jl.debit)
+                    END) as amount
+                FROM public.journal_lines jl
+                JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+                JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+                WHERE je.user_id = $1
+                    AND a.type = 'Asset'
+                    AND je.entry_date BETWEEN $2::date AND $3::date
+
+                UNION ALL
+
+                SELECT
+                    'financing' as section,
+                    'Loan Proceeds' as line,
+                    SUM(CASE
+                        WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit)
+                        ELSE (jl.debit - jl.credit)
+                    END) as amount
+                FROM public.journal_lines jl
+                JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+                JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+                WHERE je.user_id = $1
+                    AND a.type = 'Liability'
+                    AND je.entry_date BETWEEN $2::date AND $3::date
+                )
+
+                SELECT section, line, COALESCE(amount, 0) as amount
+                FROM cash_changes
+                WHERE amount != 0
+                ORDER BY section, line
+                `,
+                [userId, start, end]
+            );
+
+            const grouped: Record<string, { line: string; amount: string | number }[]> = {};
+            for (const r of rows) {
+                grouped[r.section] = grouped[r.section] || [];
+                grouped[r.section].push({ line: r.line, amount: parseFloat(r.amount.toString()) });
+            }
+
+            reportData = { period: { start, end }, sections: grouped };
+        }
+        else if (documentType === 'trial-balance') {
+            const userId = user_id;
+            const start = startDate!;
+            const end = endDate!;
+            const includeZero = false; // Match default behavior of endpoint
+
+            const { rows } = await pool.query(
+                `
+                WITH period AS (
+                SELECT
+                    a.id AS account_id,
+                    a.code,
+                    a.name,
+                    a.type,
+                    COALESCE(SUM(jl.debit), 0)::numeric(18,2) AS total_debit,
+                    COALESCE(SUM(jl.credit), 0)::numeric(18,2) AS total_credit
+                FROM public.accounts a
+                LEFT JOIN public.journal_lines jl
+                    ON jl.account_id = a.id
+                    AND jl.user_id = a.user_id
+                LEFT JOIN public.journal_entries je
+                    ON je.id = jl.entry_id
+                    AND je.user_id = jl.user_id
+                WHERE a.user_id = $1
+                    AND (je.entry_date BETWEEN $2::date AND $3::date OR je.entry_date IS NULL)
+                GROUP BY a.id, a.code, a.name, a.type
+                )
+                SELECT
+                account_id, code, name, type,
+                total_debit,
+                total_credit,
+                GREATEST(total_debit - total_credit, 0)::numeric(18,2) AS balance_debit,
+                GREATEST(total_credit - total_debit, 0)::numeric(18,2) AS balance_credit
+                FROM period
+                ORDER BY code::text, name::text;
+                `,
+                [userId, start, end]
+            );
+
+            const items = includeZero
+                ? rows
+                : rows.filter(r =>
+                    Number(r.total_debit) !== 0 ||
+                    Number(r.total_credit) !== 0 ||
+                    Number(r.balance_debit) !== 0 ||
+                    Number(r.balance_credit) !== 0
+                );
+
+            const totals = items.reduce(
+                (t, r) => {
+                    t.total_debit += Number(r.total_debit);
+                    t.total_credit += Number(r.total_credit);
+                    t.balance_debit += Number(r.balance_debit);
+                    t.balance_credit += Number(r.balance_credit);
+                    return t;
+                },
+                { total_debit: 0, total_credit: 0, balance_debit: 0, balance_credit: 0 }
+            );
+
+            reportData = {
+                period: { start, end },
+                totals,
+                items
+            };
+        }
+        // --- END INTERNAL API CALL SIMULATION ---
+
+        if (wantJson) {
+            return res.json(reportData);
+        }
+
+        // --- Generate PDF using PDFKit ---
+        const doc = new PDFDocument({ size: 'A4', margin: 50 });
+        const chunks: Buffer[] = [];
+
+        doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+
+        doc.on('end', () => {
+            const pdfBuffer = Buffer.concat(chunks);
+            res.setHeader('Content-Type', 'application/pdf');
+            res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+            res.send(pdfBuffer);
         });
 
-        doc.fontSize(12).text('Sales Revenue').text(formatCurrency(sectionMap['revenue']), { align: 'right' });
-        const grossProfit = (sectionMap['revenue'] || 0) - 0;
-        doc.moveDown(0.5);
-        doc.fontSize(12).text('Gross Profit / (Loss)').text(formatCurrency(grossProfit), { align: 'right' }).moveDown();
-
-        if (sectionMap['other_income'] !== undefined && sectionMap['other_income'] > 0) {
-            doc.text('Add: Other Income').text(formatCurrency(0), { align: 'right' });
-            doc.text(`  Other Income`).text(formatCurrency(sectionMap['other_income']), { align: 'right' });
-        }
-
-        const grossIncome = grossProfit + (sectionMap['other_income'] || 0);
-        doc.moveDown(0.5);
-        doc.fontSize(12).text('Gross Income').text(formatCurrency(grossIncome), { align: 'right' }).moveDown();
-
-        doc.text('Less: Expenses').text(formatCurrency(0), { align: 'right' });
-        if (sectionMap['operating_expenses'] !== undefined) {
-            doc.text(`  Operating Expenses`).text(formatCurrency(sectionMap['operating_expenses']), { align: 'right' });
-        }
-        Object.keys(sectionMap).forEach(key => {
-            if (key !== 'revenue' && key !== 'other_income' && key !== 'operating_expenses' && sectionMap[key] > 0) {
-                 doc.text(`  ${key.replace(/_/g, ' ')}`).text(formatCurrency(sectionMap[key]), { align: 'right' });
+        doc.on('error', (err: Error) => {
+            console.error('Error generating PDF with PDFKit:', err);
+            if (!res.headersSent) {
+                return res.status(500).json({
+                    error: 'Failed to generate PDF document with PDFKit',
+                    detail: err.message || String(err)
+                });
+            } else {
+                console.error('Headers already sent. Could not send JSON error response.');
             }
         });
 
-        const totalExpenses = Object.keys(sectionMap)
-            .filter(k => k !== 'revenue' && k !== 'other_income')
-            .reduce((sum, k) => sum + sectionMap[k], 0);
-        doc.moveDown(0.5);
-        doc.fontSize(12).text('Total Expenses').text(formatCurrency(totalExpenses), { align: 'right' }).moveDown();
+        // --- Draw Header with Company Info and Logo ---
+        const drawHeader = () => {
+            const top = 70;
+            const rightAlign = doc.page.width - 50;
+            let y = top;
+            const logoMaxWidth = 100; // Maximum width for the logo
+            const logoMaxHeight = 50; // Maximum height for the logo
 
-        const netProfitLoss = grossIncome - totalExpenses;
-        doc.fontSize(14).text(`${netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period'}`).text(formatCurrency(Math.abs(netProfitLoss)), { align: 'right' });
+            // Add Logo (if exists and buffer is valid)
+            if (companyLogoBuffer) {
+                try {
+                    // Use the 'fit' option to scale the image proportionally within the specified dimensions
+                    doc.image(companyLogoBuffer, rightAlign - logoMaxWidth, top, {
+                        fit: [logoMaxWidth, logoMaxHeight],
+                        align: 'right',
+                        valign: 'top'
+                    });
+                    console.log("[DEBUG] Logo added to PDF from buffer");
+                } catch (logoDrawError) {
+                    console.warn(`[WARN] Failed to draw logo buffer to PDF:`, logoDrawError);
+                    // Continue without logo if drawing fails
+                }
+            }
 
-    }
-    else if (documentType === 'balance-sheet') {
-        const totalAssets = (reportData.assets.current || 0) + (reportData.assets.non_current || 0);
-        const totalLiabilities = (reportData.liabilities.current || 0) + (reportData.liabilities.non_current || 0);
-        const totalEquityAndLiabilities = totalLiabilities + reportData.closingEquity;
+            // Add Company Info (aligned to the left)
+            doc.fontSize(16).font('Helvetica-Bold').text(companyName, 50, y); // Align left
+            y += 20;
+            if (companyFullAddress) {
+                doc.fontSize(10).font('Helvetica').text(companyFullAddress, 50, y);
+                y += 15;
+            }
+            // Optional: Add Phone, Email, VAT, Reg if desired
+            const contactInfoParts = [];
+            if (companyPhone) contactInfoParts.push(`Phone: ${companyPhone}`);
+            if (companyEmail) contactInfoParts.push(`Email: ${companyEmail}`);
+            if (contactInfoParts.length > 0) {
+                doc.fontSize(10).text(contactInfoParts.join(' | '), 50, y);
+                y += 15;
+            }
+            if (companyVat) {
+                doc.fontSize(10).text(`VAT: ${companyVat}`, 50, y);
+                y += 15;
+            }
+            if (companyReg) {
+                doc.fontSize(10).text(`Reg: ${companyReg}`, 50, y);
+                y += 15;
+            }
 
-        doc.fontSize(18).text('Balance Sheet', { align: 'center' });
-        doc.fontSize(12).text(`As of ${formatDate(reportData.asOf)}`, { align: 'center' });
-        doc.moveDown();
+            // Draw a line separator
+            doc.moveTo(50, y).lineTo(rightAlign, y).stroke();
+            doc.moveDown(1); // Add space after header
+        };
 
-        doc.fontSize(14).text('ASSETS');
-        doc.moveDown(0.5);
-        doc.fontSize(12).text(`  Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' });
-        doc.text(`Total Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' }).moveDown(0.5);
-        
-        doc.text(`  Non-current Assets`).text(formatCurrency(reportData.assets.non_current), { align: 'right' });
-        doc.text(`Total Non-Current Assets`).text(formatCurrency(reportData.assets.non_current), { align: 'right' }).moveDown(0.5);
-        
-        doc.fontSize(14).text(`TOTAL ASSETS`).text(formatCurrency(totalAssets), { align: 'right' }).moveDown();
+        // Call the drawHeader function only for the first page
+        drawHeader();
 
-        doc.fontSize(14).text('EQUITY AND LIABILITIES');
-        doc.moveDown(0.5);
-        doc.fontSize(12).text(`  Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' });
-        doc.text(`Total Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' }).moveDown(0.5);
-        
-        doc.text(`  Non-Current Liabilities`).text(formatCurrency(reportData.liabilities.non_current), { align: 'right' });
-        doc.text(`Total Non-Current Liabilities`).text(formatCurrency(reportData.liabilities.non_current), { align: 'right' }).moveDown(0.5);
-        
-        doc.text(`TOTAL LIABILITIES`).text(formatCurrency(totalLiabilities), { align: 'right' }).moveDown(0.5);
-        
-        doc.fontSize(12).text(`  Equity`);
-        doc.text(`    Opening Balance`).text(formatCurrency(reportData.openingEquity), { align: 'right' });
-        doc.text(`    ${reportData.netProfitLoss >= 0 ? 'Net Profit for Period' : 'Net Loss for Period'}`).text(formatCurrency(Math.abs(reportData.netProfitLoss)), { align: 'right' });
-        doc.text(`TOTAL EQUITY`).text(formatCurrency(reportData.closingEquity), { align: 'right' }).moveDown(0.5);
-        
-        doc.fontSize(14).text(`TOTAL EQUITY AND LIABILITIES`).text(formatCurrency(totalEquityAndLiabilities), { align: 'right' });
-    }
-    else if (documentType === 'cash-flow-statement') {
-        doc.fontSize(18).text('Cash Flow Statement', { align: 'center' });
-        doc.fontSize(12).text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
-        doc.moveDown();
+        // --- Add Content to PDF based on documentType ---
+        if (documentType === 'income-statement') {
+            doc.fontSize(18).font('Helvetica-Bold').text('Income Statement', { align: 'center' });
+            doc.fontSize(12).font('Helvetica').text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
+            doc.moveDown();
 
-        let netChange = 0;
-        const categories = ['operating', 'investing', 'financing'];
-        
-        categories.forEach(cat => {
-          const itemsRaw = reportData.sections[cat];
-          if (Array.isArray(itemsRaw) && itemsRaw.length > 0) {
-            doc.fontSize(14).text(`${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`).moveDown(0.5);
-            
-            let sectionTotal = 0;
-            itemsRaw.forEach((item: any) => {
-              const amount = parseFloat(item.amount.toString());
-              sectionTotal += amount;
-              doc.fontSize(12).text(`  ${item.line}`).text(formatCurrency(amount), { align: 'right' });
+            const sectionsToPrint = [
+                { id: 'revenue', title: 'Revenue' },
+                { id: 'other_income', title: 'Other Income' },
+                { id: 'cost_of_goods_sold', title: 'Cost of Goods Sold' },
+                { id: 'operating_expenses', title: 'Operating Expenses' },
+                { id: 'other_expenses', title: 'Other Expenses' },
+            ];
+
+            // Re-calculate totals more explicitly for clarity
+            let totalRevenue = 0;
+            let totalExpenses = 0;
+
+            sectionsToPrint.forEach(sectionMeta => {
+                const sectionData = reportData.sections.find((s: any) => s.section === sectionMeta.id);
+
+                if (sectionData) {
+                    doc.fontSize(14).font('Helvetica-Bold').text(sectionMeta.title).moveDown(0.5);
+
+                    sectionData.accounts.forEach((account: any) => {
+                        doc.fontSize(12).font('Helvetica').text(`  ${account.name}`).text(formatCurrency(account.amount), { align: 'right' });
+                    });
+
+                    // Add to appropriate total (expenses are already negative in calculation)
+                    if (['revenue', 'other_income'].includes(sectionMeta.id)) {
+                        totalRevenue += sectionData.amount;
+                    } else {
+                        totalExpenses += sectionData.amount;
+                    }
+
+                    doc.moveDown(0.5);
+                    const subtotalLabel = `Total ${sectionMeta.title}`;
+                    doc.fontSize(12).font('Helvetica').text(subtotalLabel).text(formatCurrency(sectionData.amount), { align: 'right' }).moveDown();
+                }
             });
-            
-            netChange += sectionTotal;
-            const subtotalLabel = sectionTotal >= 0 
-              ? `Net cash from ${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities` 
-              : `Net cash used in ${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`;
-              
+
+            // The net profit is the total revenue minus the total expenses
+            const netProfitLoss = totalRevenue - totalExpenses; // Expenses are negative, so subtraction adds them correctly
+
+            doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).stroke().moveDown(0.5);
+            doc.fontSize(14).font('Helvetica-Bold').text(`${netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period'}`).text(formatCurrency(Math.abs(netProfitLoss)), { align: 'right' });
+        }
+        else if (documentType === 'balance-sheet') {
+            const totalAssets = (reportData.assets.current || 0) + (reportData.assets.non_current || 0);
+            const totalLiabilities = (reportData.liabilities.current || 0) + (reportData.liabilities.non_current || 0);
+            const totalEquityAndLiabilities = totalLiabilities + reportData.closingEquity;
+
+            doc.fontSize(18).font('Helvetica-Bold').text('Balance Sheet', { align: 'center' });
+            doc.fontSize(12).font('Helvetica').text(`As of ${formatDate(reportData.asOf)}`, { align: 'center' });
+            doc.moveDown();
+
+            doc.fontSize(14).font('Helvetica-Bold').text('ASSETS');
             doc.moveDown(0.5);
-            doc.fontSize(12).text(subtotalLabel).text(formatCurrency(sectionTotal), { align: 'right' }).moveDown();
-          }
-        });
-        
-        doc.fontSize(14).text('Net Increase / (Decrease) in Cash').text(formatCurrency(netChange), { align: 'right' });
-    }
-    else if (documentType === 'trial-balance') {
-        doc.fontSize(18).text('Trial Balance', { align: 'center' });
-        doc.fontSize(12).text(`As of ${formatDate(reportData.period.end)}`, { align: 'center' });
-        doc.moveDown();
+            doc.fontSize(12).font('Helvetica').text(`  Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' });
+            doc.text(`Total Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' }).moveDown(0.5);
 
-        // Table Headers
-        const startX = 50;
-        let x = startX;
-        const y = doc.y;
-        const colWidth = 150;
-        doc.fontSize(12).text('Account', x, y);
-        x += colWidth;
-        doc.text('Debit (R)', x, y, { width: colWidth, align: 'right' });
-        x += colWidth;
-        doc.text('Credit (R)', x, y, { width: colWidth, align: 'right' });
-        doc.moveDown();
+            doc.text(`  Non-current Assets`).text(formatCurrency(reportData.assets.non_current), { align: 'right' });
+            doc.text(`Total Non-Current Assets`).text(formatCurrency(reportData.assets.non_current), { align: 'right' }).moveDown(0.5);
 
-        // Underline headers
-        doc.moveTo(startX, doc.y).lineTo(startX + colWidth * 3, doc.y).stroke();
+            doc.fontSize(14).font('Helvetica-Bold').text(`TOTAL ASSETS`).text(formatCurrency(totalAssets), { align: 'right' }).moveDown();
 
-        // Table Rows
-        reportData.items.forEach((item: any) => {
+            doc.fontSize(14).font('Helvetica-Bold').text('EQUITY AND LIABILITIES');
+            doc.moveDown(0.5);
+            doc.fontSize(12).font('Helvetica').text(`  Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' });
+            doc.text(`Total Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' }).moveDown(0.5);
+
+            doc.text(`  Non-Current Liabilities`).text(formatCurrency(reportData.liabilities.non_current), { align: 'right' });
+            doc.text(`Total Non-Current Liabilities`).text(formatCurrency(reportData.liabilities.non_current), { align: 'right' }).moveDown(0.5);
+
+            doc.text(`TOTAL LIABILITIES`).text(formatCurrency(totalLiabilities), { align: 'right' }).moveDown(0.5);
+
+            doc.fontSize(12).font('Helvetica').text(`  Equity`);
+            doc.text(`    Opening Balance`).text(formatCurrency(reportData.openingEquity), { align: 'right' });
+            doc.text(`    ${reportData.netProfitLoss >= 0 ? 'Net Profit for Period' : 'Net Loss for Period'}`).text(formatCurrency(Math.abs(reportData.netProfitLoss)), { align: 'right' });
+            doc.text(`TOTAL EQUITY`).text(formatCurrency(reportData.closingEquity), { align: 'right' }).moveDown(0.5);
+
+            doc.fontSize(14).font('Helvetica-Bold').text(`TOTAL EQUITY AND LIABILITIES`).text(formatCurrency(totalEquityAndLiabilities), { align: 'right' });
+        }
+        else if (documentType === 'cash-flow-statement') {
+            doc.fontSize(18).font('Helvetica-Bold').text('Cash Flow Statement', { align: 'center' });
+            doc.fontSize(12).font('Helvetica').text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
+            doc.moveDown();
+
+            let netChange = 0;
+            const categories = ['operating', 'investing', 'financing'];
+
+            categories.forEach(cat => {
+                const itemsRaw = reportData.sections[cat];
+                if (Array.isArray(itemsRaw) && itemsRaw.length > 0) {
+                    doc.fontSize(14).font('Helvetica-Bold').text(`${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`).moveDown(0.5);
+
+                    let sectionTotal = 0;
+                    itemsRaw.forEach((item: any) => {
+                        const amount = parseFloat(item.amount.toString());
+                        sectionTotal += amount;
+                        doc.fontSize(12).font('Helvetica').text(`  ${item.line}`).text(formatCurrency(amount), { align: 'right' });
+                    });
+
+                    netChange += sectionTotal;
+                    const subtotalLabel = sectionTotal >= 0
+                        ? `Net cash from ${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`
+                        : `Net cash used in ${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`;
+
+                    doc.moveDown(0.5);
+                    doc.fontSize(12).font('Helvetica-Bold').text(subtotalLabel).text(formatCurrency(sectionTotal), { align: 'right' }).moveDown();
+                }
+            });
+
+            doc.fontSize(14).font('Helvetica-Bold').text('Net Increase / (Decrease) in Cash').text(formatCurrency(netChange), { align: 'right' });
+        }
+        else if (documentType === 'trial-balance') {
+            doc.fontSize(18).font('Helvetica-Bold').text('Trial Balance', { align: 'center' });
+            doc.fontSize(12).font('Helvetica').text(`As of ${formatDate(reportData.period.end)}`, { align: 'center' });
+            doc.moveDown();
+
+            // Table Headers
+            const startX = 50;
+            let x = startX;
+            const y = doc.y;
+            const colWidth = 150;
+            doc.fontSize(12).font('Helvetica-Bold').text('Account', x, y);
+            x += colWidth;
+            doc.text('Debit', x, y, { width: colWidth, align: 'right' }); // Simplified label
+            x += colWidth;
+            doc.text('Credit', x, y, { width: colWidth, align: 'right' }); // Simplified label
+            doc.moveDown();
+
+            // Underline headers
+            doc.moveTo(startX, doc.y).lineTo(startX + colWidth * 3, doc.y).stroke();
+
+            // Table Rows
+            reportData.items.forEach((item: any) => {
+                x = startX;
+                doc.fontSize(10).font('Helvetica');
+                doc.text(`${item.code} - ${item.name}`, x, doc.y);
+                x += colWidth;
+                doc.text(formatCurrency(parseFloat(item.balance_debit)), x, doc.y, { width: colWidth, align: 'right' });
+                x += colWidth;
+                doc.text(formatCurrency(parseFloat(item.balance_credit)), x, doc.y, { width: colWidth, align: 'right' });
+                doc.moveDown(0.3);
+            });
+
+            // Totals Row
             x = startX;
-            doc.fontSize(10);
-            doc.text(`${item.code} - ${item.name}`, x, doc.y);
+            doc.moveTo(startX, doc.y).lineTo(startX + colWidth * 3, doc.y).stroke(); // Line above totals
+            doc.fontSize(12).font('Helvetica-Bold').text('TOTALS', x, doc.y);
             x += colWidth;
-            doc.text(formatCurrency(parseFloat(item.balance_debit)), x, doc.y, { width: colWidth, align: 'right' });
+            doc.text(formatCurrency(reportData.totals.balance_debit), x, doc.y, { width: colWidth, align: 'right' });
             x += colWidth;
-            doc.text(formatCurrency(parseFloat(item.balance_credit)), x, doc.y, { width: colWidth, align: 'right' });
-            doc.moveDown(0.3);
+            doc.text(formatCurrency(reportData.totals.balance_credit), x, doc.y, { width: colWidth, align: 'right' });
+        }
+
+        // Optional: Add Footer
+        const addFooter = () => {
+            const bottom = doc.page.height - 50;
+            doc.fontSize(10).font('Helvetica').text(`${companyName} | Generated on ${new Date().toLocaleDateString('en-ZA')}`, 50, bottom, { align: 'center', width: doc.page.width - 100 });
+        };
+        addFooter();
+
+        doc.end();
+
+    } catch (err: any) {
+        console.error('Error in /generate-financial-document:', err);
+        // Return a generic error response
+        res.status(500).json({
+            error: 'Failed to generate financial document',
+            detail: err?.message || String(err)
         });
-
-        // Totals Row
-        x = startX;
-        doc.moveTo(startX, doc.y).lineTo(startX + colWidth * 3, doc.y).stroke(); // Line above totals
-        doc.fontSize(12).text('TOTALS', x, doc.y);
-        x += colWidth;
-        doc.text(formatCurrency(reportData.totals.balance_debit), x, doc.y, { width: colWidth, align: 'right' });
-        x += colWidth;
-        doc.text(formatCurrency(reportData.totals.balance_credit), x, doc.y, { width: colWidth, align: 'right' });
     }
-
-    doc.end();
-
-  } catch (err: any) {
-    console.error('Error in /generate-financial-document:', err);
-    // Return a generic error response
-    res.status(500).json({ 
-      error: 'Failed to generate financial document', 
-      detail: err?.message || String(err) 
-    });
-  }
 });
+
+
 // Profile endpoints
 // GET /api/profile
 app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
@@ -8354,58 +8483,59 @@ app.get('/users', authMiddleware, async (req: Request, res: Response) => {
 // 2. POST /users - Create a new user within the authenticated user's organization
 // 2. POST /users - Create a new user within the authenticated user's organization
 app.post('/users', authMiddleware, async (req: Request, res: Response) => {
-  const { displayName, email, role, password } = req.body;
-  const newUserId = uuidv4();
-  const parentUserId = (req as any).user?.user_id; // This is the creator's user_id, who becomes the parent
+  const { displayName, email, role, password, officeCode } = req.body;
+  const newUserId = uuidv4();
+  const parentUserId = (req as any).user?.user_id; // This is the creator's user_id, who becomes the parent
 
-  if (!displayName || !email || !password || !parentUserId) {
-    return res.status(400).json({ error: 'Missing required data' });
-  }
+  if (!displayName || !email || !password || !parentUserId) {
+    return res.status(400).json({ error: 'Missing required data' });
+  }
 
-  const userRole = (typeof role === 'string' && role.length > 0) ? role : 'user';
-  
-  const client = await pool.connect(); // Use a client for transaction
+  const userRole = (typeof role === 'string' && role.length > 0) ? role : 'user';
+  
+  const client = await pool.connect(); // Use a client for transaction
 
-  try {
-    const password_hash = await bcrypt.hash(password, 10);
+  try {
+    const password_hash = await bcrypt.hash(password, 10);
 
-    await client.query('BEGIN');
+    await client.query('BEGIN');
 
-    const userInsertResult = await client.query(
-      'INSERT INTO public.users (id, name, email, user_id, password_hash, parent_user_id, role) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name AS "displayName", email, user_id',
-      [uuidv4(), displayName, email, newUserId, password_hash, parentUserId, userRole]
-    );
+    // Correctly include the office_code in the INSERT statement
+    const userInsertResult = await client.query(
+      'INSERT INTO public.users (id, name, email, user_id, password_hash, parent_user_id, role, office_code) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, name AS "displayName", email, user_id, office_code',
+      [uuidv4(), displayName, email, newUserId, password_hash, parentUserId, userRole, officeCode]
+    );
 
-    const roleInsertResult = await client.query('SELECT name FROM public.roles WHERE name = $1', [userRole]);
-    if (roleInsertResult.rows.length === 0) {
-      console.warn(`Role '${userRole}' does not exist and will not be assigned.`);
-    } else {
-        await client.query(
-          'INSERT INTO public.user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-          [newUserId, userRole]
-        );
-    }
+    const roleInsertResult = await client.query('SELECT name FROM public.roles WHERE name = $1', [userRole]);
+    if (roleInsertResult.rows.length === 0) {
+      console.warn(`Role '${userRole}' does not exist and will not be assigned.`);
+    } else {
+        await client.query(
+          'INSERT INTO public.user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [newUserId, userRole]
+        );
+    }
 
-    // --- NEW: Sync agent record based on initial role ---
-    // Pass the initial role as an array to the helper
-    await syncAgentRecord(client, newUserId, [userRole], parentUserId);
-    // --- END NEW ---
+    // --- NEW: Sync agent record based on initial role ---
+    // Pass the initial role as an array to the helper
+    await syncAgentRecord(client, newUserId, [userRole], parentUserId);
+    // --- END NEW ---
 
-    await client.query('COMMIT');
+    await client.query('COMMIT');
 
-    res.status(201).json(userInsertResult.rows[0]);
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Error adding new user:', err);
-    
-    if (err instanceof Error) {
-        res.status(500).json({ error: err.message || 'Registration failed.' });
-    } else {
-      res.status(500).json({ error: 'Registration failed.' });
-    }
-  } finally {
-    client.release(); // Release the client back to the pool
-  }
+    res.status(201).json(userInsertResult.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error adding new user:', err);
+    
+    if (err instanceof Error) {
+        res.status(500).json({ error: err.message || 'Registration failed.' });
+    } else {
+      res.status(500).json({ error: 'Registration failed.' });
+    }
+  } finally {
+    client.release(); // Release the client back to the pool
+  }
 });
 
 // 3. PUT /users/:id - Update a user's basic details within the authenticated user's organization
@@ -8491,32 +8621,62 @@ app.put('/users/:id/roles', authMiddleware, async (req: Request, res: Response) 
 });
 // 4. DELETE /users/:id - Delete a user within the authenticated user's organization
 app.delete('/users/:id', authMiddleware, async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const parentUserId = (req as any).user?.user_id;
+  const { id } = req.params;
+  const parentUserId = (req as any).user?.user_id;
 
-  if (!parentUserId) {
-    return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
-  }
+  if (!parentUserId) {
+    return res.status(401).json({ error: 'Unauthorized: User ID not found.' });
+  }
 
-  try {
-    console.log(`[DELETE /users/:id] Attempting to delete user with id: ${id} under parent user: ${parentUserId}`);
-    // Delete from user_roles first due to foreign key constraints
-    await pool.query('DELETE FROM public.user_roles WHERE user_id = (SELECT id FROM public.users WHERE id = $1 AND parent_user_id = $2)', [id, parentUserId]);
-    
-    // Then delete the user
-    const result = await pool.query('DELETE FROM public.users WHERE id = $1 AND parent_user_id = $2 RETURNING id', [id, parentUserId]);
+  try {
+    console.log(`[DELETE /users/:id] Attempting to delete user with id: ${id} under parent user: ${parentUserId}`);
+    
+    // Use a transaction to ensure all related records are deleted or none are.
+    const client = await pool.connect();
+    await client.query('BEGIN');
+    
+    try {
+      // First, find the user_id using the public-facing 'id' and 'parent_user_id'
+      // Use '::uuid' to explicitly cast the input strings to UUID type.
+      const userLookupResult = await client.query('SELECT user_id FROM public.users WHERE id = $1::uuid AND parent_user_id = $2::uuid', [id, parentUserId]);
+      
+      if (userLookupResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        console.error(`[DELETE /users/:id] User with id: ${id} and parent_user_id: ${parentUserId} not found.`);
+        return res.status(404).json({ error: 'User not found or not in your organization' });
+      }
+      const targetUserUUID = userLookupResult.rows[0].user_id;
 
-    if (result.rows.length === 0) {
-      console.error(`[DELETE /users/:id] User with id: ${id} and parent_user_id: ${parentUserId} not found.`);
-      return res.status(404).json({ error: 'User not found or not in your organization' });
-    }
+      // Delete from user_roles first due to foreign key constraints.
+      await client.query('DELETE FROM public.user_roles WHERE user_id = $1::uuid', [targetUserUUID]);
+      
+      // Next, delete the agent record if one exists.
+      await client.query('DELETE FROM public.agents WHERE user_id = $1::uuid', [targetUserUUID]);
 
-    res.status(200).json({ message: 'User deleted successfully' });
-  } catch (err) {
-    console.error('Error deleting user:', err);
-    res.status(500).json({ error: 'Deletion failed.' });
-  }
+      // Finally, delete the user record itself.
+      // Use '::uuid' for casting here as well.
+      const result = await client.query('DELETE FROM public.users WHERE id = $1::uuid AND parent_user_id = $2::uuid RETURNING id', [id, parentUserId]);
+      
+      if (result.rows.length === 0) {
+        // This should ideally not be reached if the user was found in the first step
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'User not found or not in your organization' });
+      }
+
+      await client.query('COMMIT');
+      res.status(200).json({ message: 'User deleted successfully' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err; // Re-throw to be caught by the outer catch block
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Error deleting user:', err);
+    res.status(500).json({ error: 'Deletion failed.' });
+  }
 });
+
 
 // New endpoint to update user roles
 app.put('/users/:id/roles', authMiddleware, async (req: Request, res: Response) => {
@@ -9421,7 +9581,7 @@ app.get('/api/profile', authMiddleware, async (req: Request, res: Response) => {
 
     try {
         const { rows } = await pool.query(
-            `SELECT company, email, address, city, province, postal_code, country, phone, vat_number, company_logo_path
+            `SELECT company, email, address, city, province, postal_code, country, phone,  company_logo_path
              FROM public.users
              WHERE user_id = $1`,
             [user_id]
@@ -9468,11 +9628,8 @@ app.post('/api/applications', authMiddleware, async (req: Request, res: Response
         connector_name, connector_contact, connector_province, team_leader, team_contact, team_province
     } = req.body;
 
-    // Use parent_user_id to associate the application with the agent's "company/scope"
-    // This assumes the agent's parent_user_id is the Super Agent or managing entity.
-    // If agents own their applications directly, use req.user!.user_id instead.
+    // The code correctly identifies the parent and agent user IDs
     const parentUserId = req.user!.parent_user_id;
-    // Optionally, also store the direct creator (the agent's user_id)
     const agentUserId = req.user!.user_id;
 
     const client = await pool.connect();
@@ -9515,7 +9672,7 @@ app.post('/api/applications', authMiddleware, async (req: Request, res: Response
         if (Array.isArray(extended_family) && extended_family.length > 0) {
             const extendedFamilyQuery = `INSERT INTO public.extended_family (application_id, name, surname, relationship, date_of_birth, premium) VALUES ($1, $2, $3, $4, $5, $6);`;
             for (const member of extended_family) {
-                 // Basic validation could be added here if needed
+                   // Basic validation could be added here if needed
                 await client.query(extendedFamilyQuery, [newApplicationId, member.name, member.surname, member.relationship, member.date_of_birth, member.premium]);
             }
         }
@@ -9533,13 +9690,12 @@ app.post('/api/applications', authMiddleware, async (req: Request, res: Response
 
 // GET /api/applications - Get all applications for the authenticated user's scope
 app.get('/api/applications', authMiddleware, async (req: Request, res: Response) => {
-    // Use parent_user_id to fetch applications associated with the agent's scope.
-    // This assumes applications are linked via parent_user_id.
-    const user_id = req.user!.parent_user_id;
+    // This now fetches applications associated with the direct agent's user_id
+    const user_id = req.user!.user_id;
     const client = await pool.connect();
 
     try {
-        // Fetch all applications for the user's scope
+        // Fetch applications created by the logged-in agent
         const applicationsQuery = `
             SELECT
                 a.id, a.name, a.surname, a.phone, a.email, a.address, a.nationality, a.gender,
@@ -9550,40 +9706,35 @@ app.get('/api/applications', authMiddleware, async (req: Request, res: Response)
                 a.declaration_signature, a.declaration_date, a.call_time, a.agent_name,
                 a.connector_name, a.connector_contact, a.connector_province, a.team_leader,
                 a.team_contact, a.team_province,
-                a.created_at, a.updated_at -- Include timestamps if needed by frontend
-                -- Add status column if it exists: , a.status
+                a.created_at, a.updated_at
             FROM public.applications a
-            WHERE a.parent_user_id = $1
-            ORDER BY a.created_at DESC; -- Order by creation date, newest first
+            WHERE a.user_id = $1
+            ORDER BY a.created_at DESC;
         `;
         const applicationsResult = await client.query(applicationsQuery, [user_id]);
         const applications = applicationsResult.rows;
 
-        // Handle case where there are no applications
         if (applications.length === 0) {
-             res.status(200).json([]); // Return empty array
+             res.status(200).json([]);
              return;
         }
 
-        // Fetch family members for relevant applications
         const familyMembersQuery = `
             SELECT id, application_id, name, surname, relationship, date_of_birth
             FROM public.family_members
             WHERE application_id = ANY($1::uuid[])
-            ORDER BY application_id, id; -- Order for consistency
+            ORDER BY application_id, id;
         `;
         const familyMembersResult = await client.query(familyMembersQuery, [applications.map(a => a.id)]);
 
-        // Fetch extended family members for relevant applications
         const extendedFamilyQuery = `
             SELECT id, application_id, name, surname, relationship, date_of_birth, premium
             FROM public.extended_family
             WHERE application_id = ANY($1::uuid[])
-            ORDER BY application_id, id; -- Order for consistency
+            ORDER BY application_id, id;
         `;
         const extendedFamilyResult = await client.query(extendedFamilyQuery, [applications.map(a => a.id)]);
 
-        // Group family members by application_id for easier lookup
         const familyMembersMap: Record<string, any[]> = {};
         for (const member of familyMembersResult.rows) {
             if (!familyMembersMap[member.application_id]) {
@@ -9592,7 +9743,6 @@ app.get('/api/applications', authMiddleware, async (req: Request, res: Response)
             familyMembersMap[member.application_id].push(member);
         }
 
-        // Group extended family members by application_id for easier lookup
         const extendedFamilyMap: Record<string, any[]> = {};
         for (const member of extendedFamilyResult.rows) {
             if (!extendedFamilyMap[member.application_id]) {
@@ -9601,7 +9751,6 @@ app.get('/api/applications', authMiddleware, async (req: Request, res: Response)
             extendedFamilyMap[member.application_id].push(member);
         }
 
-        // Combine all data into a single array of application objects
         const combinedApplications = applications.map(app => ({
             ...app,
             family_members: familyMembersMap[app.id] || [],
@@ -9892,6 +10041,46 @@ app.patch('/api/applications/:id', authMiddleware, async (req: Request, res: Res
     }
 });
 // Add this new endpoint to your server.ts file, e.g., after the quotes endpoint.
+// --- NEW ENDPOINT: GET MY CLIENTS & SALES DATA ---
+app.get('/api/my-clients', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.user_id;
+  const client = await pool.connect();
+
+  try {
+    const myClientsQuery = `
+      SELECT
+          a.name AS client_name,
+          a.surname AS client_surname,
+          a.created_at AS application_date,
+          s.total_amount AS sales_amount
+      FROM
+          public.applications AS a
+      JOIN
+          public.sales AS s ON a.agent_name = s.branch
+      WHERE
+          a.user_id = $1
+      ORDER BY
+          a.created_at DESC;
+    `;
+    
+    const result = await client.query(myClientsQuery, [user_id]);
+    
+    // Format the data for the frontend
+    const myClientsData = result.rows.map(row => ({
+      clientName: `${row.client_name ?? ''} ${row.client_surname ?? ''}`.trim(),
+      applicationDate: new Date(row.application_date).toLocaleDateString(),
+      salesAmount: row.sales_amount ? parseFloat(row.sales_amount) : 0,
+    }));
+
+    res.status(200).json(myClientsData);
+
+  } catch (error) {
+    console.error('Error fetching my clients data:', error);
+    res.status(500).json({ error: 'Failed to fetch clients and sales data.' });
+  } finally {
+    client.release();
+  }
+});
 
 
 
