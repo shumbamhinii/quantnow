@@ -2155,6 +2155,199 @@ app.post('/api/invoices/:id/send-pdf-email', authMiddleware, async (req: Request
     }
 });
 
+type JELine = { account_id: number; debit?: number; credit?: number };
+
+async function postJournalEntry(
+  client: any,
+  userId: string,
+  entry_date: string,  // 'YYYY-MM-DD'
+  memo: string,
+  lines: JELine[]
+) {
+  const d = (n?: number) => Number(n ?? 0);
+  const totalDebit  = lines.reduce((s,l)=>s + d(l.debit), 0);
+  const totalCredit = lines.reduce((s,l)=>s + d(l.credit), 0);
+  if (Math.abs(totalDebit - totalCredit) > 0.005) {
+    throw new Error(`Unbalanced JE: debit=${totalDebit} credit=${totalCredit}`);
+  }
+  const je = await client.query(
+    `INSERT INTO public.journal_entries (user_id, entry_date, memo)
+     VALUES ($1,$2,$3) RETURNING id`,
+    [userId, entry_date, memo || null]
+  );
+  const entryId = je.rows[0].id;
+  for (const l of lines) {
+    await client.query(
+      `INSERT INTO public.journal_lines (entry_id, account_id, debit, credit, user_id)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [entryId, l.account_id, d(l.debit), d(l.credit), userId]
+    );
+  }
+  return entryId;
+}
+
+function endOfMonth(d: Date)   { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
+function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+
+function monthsInclusive(startDate: Date, endDate: Date) {
+  // counts full calendar months from startMonth to endMonth inclusive
+  const s = startOfMonth(startDate);
+  const e = startOfMonth(endDate);
+  const m = (e.getFullYear() - s.getFullYear()) * 12 + (e.getMonth() - s.getMonth()) + 1;
+  return Math.max(0, m);
+}
+
+// Month-based straight-line depreciation, capped to remaining depreciable base
+function calcStraightLineForPeriod(
+  cost: number,
+  salvageValue: number,
+  usefulLifeYears: number,
+  accumulatedToDate: number,
+  periodStart: Date,
+  periodEnd: Date
+) {
+  if (!usefulLifeYears || usefulLifeYears <= 0) return 0;
+  const base = Math.max(0, Number(cost) - Number(salvageValue || 0));
+  const remaining = Math.max(0, base - Number(accumulatedToDate || 0));
+  if (remaining <= 0) return 0;
+
+  const months = monthsInclusive(periodStart, periodEnd);
+  if (months <= 0) return 0;
+
+  const monthly = base / (usefulLifeYears * 12);
+  const amount = Math.min(remaining, monthly * months);
+  return Math.round(amount * 100) / 100; // 2dp
+}
+
+// Runs depreciation for all eligible assets up to endDate (inclusive, normalized to month-end).
+// Idempotent via last_depreciation_date (only posts NEW months).
+async function runDepreciationForUser(client: any, user_id: string, endDateISO: string) {
+  const calculationEndDate = endOfMonth(new Date(endDateISO)); // normalize to month end
+  const endISO = calculationEndDate.toISOString().slice(0,10);
+
+  // 1) Required accounts
+  const expenseAccountRes = await client.query(
+    `SELECT id FROM accounts
+     WHERE user_id=$1 AND (name ILIKE 'Depreciation Expense' OR name ILIKE 'Other Expenses')
+     LIMIT 1`,
+    [user_id]
+  );
+  if (!expenseAccountRes.rows.length) throw new Error('No depreciation expense account for this user.');
+  const depExpenseId = expenseAccountRes.rows[0].id;
+
+  // Accumulated Depreciation (contra asset). Create if missing.
+  let accDepRes = await client.query(
+    `SELECT id FROM accounts WHERE user_id=$1 AND name ILIKE 'Accumulated Depreciation%' LIMIT 1`,
+    [user_id]
+  );
+  let accDepId: number;
+  if (!accDepRes.rows.length) {
+    const rc = await client.query(
+      `SELECT id FROM reporting_categories
+       WHERE statement='balance_sheet'
+         AND section IN ('Non-Current Assets','Non Current Assets')
+       LIMIT 1`
+    );
+    if (!rc.rows.length) throw new Error('Missing reporting category for Non-Current Assets.');
+    const create = await client.query(
+      `INSERT INTO accounts (user_id, code, name, type, normal_side, reporting_category_id)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [user_id, '1700', 'Accumulated Depreciation', 'Asset', 'Credit', rc.rows[0].id]
+    );
+    accDepId = create.rows[0].id;
+  } else {
+    accDepId = accDepRes.rows[0].id;
+  }
+
+  // 2) Assets needing catch-up to end date
+  const assetsResult = await client.query(
+    `SELECT id, name, cost, useful_life_years, salvage_value,
+            date_received, accumulated_depreciation, last_depreciation_date
+       FROM assets
+      WHERE user_id=$1
+        AND depreciation_method='straight-line'
+        AND useful_life_years IS NOT NULL AND useful_life_years > 0
+        AND (last_depreciation_date IS NULL OR last_depreciation_date < $2::date)
+      ORDER BY date_received`,
+    [user_id, endISO]
+  );
+
+  const results: Array<{ assetId:number; amount:number; entryId:number; transactionId:number|null }> = [];
+  let total = 0;
+
+  for (const a of assetsResult.rows) {
+    const cost = Number(a.cost);
+    const salvage = Number(a.salvage_value || 0);
+    const lifeY = Number(a.useful_life_years);
+    const accToDate = Number(a.accumulated_depreciation || 0);
+
+    const received = new Date(a.date_received);
+    const last = a.last_depreciation_date ? new Date(a.last_depreciation_date) : null;
+
+    // start from next month after last run, or from the asset month
+    const start = last ? new Date(last.getFullYear(), last.getMonth()+1, 1) : startOfMonth(received);
+
+    // stop at useful life end
+    const lifeEnd = endOfMonth(new Date(received.getFullYear()+lifeY, received.getMonth(), 1));
+    const effectiveEnd = calculationEndDate <= lifeEnd ? calculationEndDate : lifeEnd;
+
+    if (start > effectiveEnd) continue;
+
+    const amount = calcStraightLineForPeriod(cost, salvage, lifeY, accToDate, start, effectiveEnd);
+    if (amount <= 0) continue;
+
+    const depDateISO = effectiveEnd.toISOString().slice(0,10);
+
+    // 2.1 Update asset summary
+    await client.query(
+      `UPDATE assets
+          SET accumulated_depreciation = accumulated_depreciation + $1,
+              last_depreciation_date   = $2
+        WHERE id=$3 AND user_id=$4`,
+      [amount, depDateISO, a.id, user_id]
+    );
+
+    // 2.2 Post JE (Dr expense / Cr accumulated depreciation)
+    const entryId = await postJournalEntry(
+      client, user_id, depDateISO,
+      `Depreciation for ${a.name} (asset ${a.id})`,
+      [
+        { account_id: Number(depExpenseId), debit:  amount },
+        { account_id: Number(accDepId),     credit: amount }
+      ]
+    );
+
+    // 2.3 (Optional) also create a simple transactions row for your UI lists, if you use them
+    let transactionId: number | null = null;
+    try {
+      const t = await client.query(
+        `INSERT INTO transactions (type, amount, description, date, category, account_id, user_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        ['expense', amount, `Depreciation Expense for ${a.name} (asset ${a.id})`, depDateISO,
+         'Depreciation Expense', depExpenseId, user_id]
+      );
+      transactionId = t.rows[0].id;
+    } catch { /* if you don't have 'transactions', ignore */ }
+
+    // 2.4 Detail row
+    try {
+      await client.query(
+        `INSERT INTO depreciation_entries (asset_id, depreciation_date, amount, transaction_id, user_id)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [a.id, depDateISO, amount, transactionId, user_id]
+      );
+    } catch { /* if you don't have this table, ignore */ }
+
+    total += amount;
+    results.push({ assetId: a.id, amount, entryId, transactionId });
+  }
+
+  return { total, results };
+}
+
+
+
+
 /* --- Assets API --- */
 
 // Updated Asset Interface to include depreciation fields
@@ -2204,49 +2397,75 @@ app.get('/assets', authMiddleware, async (req: Request, res: Response) => { // A
   }
 });
 
-app.post('/assets', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
+app.post('/assets', authMiddleware, async (req: Request, res: Response) => {
   const {
     type, name, number, cost, date_received, account_id,
-    depreciation_method, useful_life_years, salvage_value
+    depreciation_method, useful_life_years, salvage_value,
+    paid_from_account_id,             // NEW optional (bank/cash account id)
+    financed_liability_account_id     // NEW optional (loan/AP account id)
   } = req.body;
-  const user_id = req.user!.parent_user_id; // Get user_id from req.user
+
+  const user_id = req.user!.parent_user_id;
 
   if (!type || !name || cost == null || !date_received || !account_id) {
     return res.status(400).json({ error: 'Missing required asset fields: type, name, cost, date_received, account_id' });
   }
 
+  const client = await pool.connect();
   try {
-    const insert = await pool.query(
+    await client.query('BEGIN');
+
+    // 1) insert asset record as before
+    const insert = await client.query(
       `INSERT INTO assets (
         type, name, number, cost, date_received, account_id,
-        depreciation_method, useful_life_years, salvage_value, accumulated_depreciation, last_depreciation_date, user_id
+        depreciation_method, useful_life_years, salvage_value,
+        accumulated_depreciation, last_depreciation_date, user_id
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`, // ADDED user_id
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       RETURNING id`,
       [
         type, name, number || null, cost, date_received, account_id,
         depreciation_method || null, useful_life_years || null, salvage_value || null,
-        0.00, // Initialize accumulated_depreciation to 0
-        null,  // Initialize last_depreciation_date to null
-        user_id // ADDED user_id
+        0, null, user_id
       ]
     );
-    const insertedId = insert.rows[0].id;
+    const assetId = insert.rows[0].id;
 
-    const fullAsset = await pool.query(`
-      SELECT
-        a.id, a.type, a.name, a.number, a.cost, a.date_received, a.account_id, acc.name AS account_name,
-        a.depreciation_method, a.useful_life_years, a.salvage_value, a.accumulated_depreciation, a.last_depreciation_date
+    // 2) OPTIONAL capitalization JE: Dr Asset / Cr Bank OR Cr Liability
+    const creditAccountId = paid_from_account_id || financed_liability_account_id;
+    if (creditAccountId) {
+      await postJournalEntry(
+        client, user_id, date_received,
+        `Capitalize asset: ${name} (#${assetId})`,
+        [
+          { account_id: Number(account_id),      debit:  Number(cost) },
+          { account_id: Number(creditAccountId), credit: Number(cost) }
+        ]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    const fullAsset = await client.query(`
+      SELECT a.id,a.type,a.name,a.number,a.cost,a.date_received,a.account_id,acc.name AS account_name,
+             a.depreciation_method,a.useful_life_years,a.salvage_value,a.accumulated_depreciation,a.last_depreciation_date
       FROM assets a
       JOIN accounts acc ON a.account_id = acc.id
-      WHERE a.id = $1 AND a.user_id = $2 -- ADDED user_id filter
-    `, [insertedId, user_id]);
+      WHERE a.id = $1 AND a.user_id = $2`,
+      [assetId, user_id]
+    );
 
     res.json(fullAsset.rows[0]);
-  } catch (error: unknown) {
+  } catch (error:any) {
+    await client.query('ROLLBACK');
     console.error('Error adding asset:', error);
-    res.status(500).json({ error: 'Failed to add asset', detail: error instanceof Error ? error.message : String(error) });
+    res.status(500).json({ error: 'Failed to add asset', detail: error.message ?? String(error) });
+  } finally {
+    client.release();
   }
 });
+
 
 app.put('/assets/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
   const { id } = req.params;
@@ -2312,6 +2531,10 @@ app.delete('/assets/:id', authMiddleware, async (req: Request, res: Response) =>
 
 
 /* --- Depreciation API --- */
+// ===== Depreciation + Journal helpers =====
+
+
+
 
 // Helper function to calculate straight-line depreciation for a period
 const calculateDepreciation = (
@@ -2340,140 +2563,31 @@ const calculateDepreciation = (
 };
 
 
-app.post('/api/depreciation/run', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const { endDate } = req.body; // endDate: The date up to which depreciation should be calculated
-  const user_id = req.user!.parent_user_id; // Get user_id from req.user
+// POST /api/depreciation/run  { endDate: 'YYYY-MM-DD' }
+app.post('/api/depreciation/run', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.parent_user_id;
+  const { endDate } = req.body;
+  if (!endDate) return res.status(400).json({ error: 'endDate is required' });
 
-  if (!endDate) {
-    return res.status(400).json({ error: 'endDate is required for depreciation calculation.' });
-  }
-
-  const calculationEndDate = new Date(endDate);
   const client = await pool.connect();
-
   try {
     await client.query('BEGIN');
-
-    // Fetch all assets that are depreciable and haven't been depreciated up to the endDate
-    const assetsResult = await client.query(`
-      SELECT
-        id, cost, useful_life_years, salvage_value, date_received, accumulated_depreciation, last_depreciation_date
-      FROM assets
-      WHERE
-        user_id = $1 AND -- ADDED user_id filter
-        depreciation_method = 'straight-line' AND useful_life_years IS NOT NULL AND useful_life_years > 0
-        AND (last_depreciation_date IS NULL OR last_depreciation_date < $2)
-    `, [user_id, calculationEndDate.toISOString().split('T')[0]]); // Compare only date part
-
-    const depreciatedAssets: { assetId: number; amount: number; transactionId: number }[] = [];
-    let totalDepreciationExpense = 0;
-    let defaultExpenseAccountId: number | null = null;
-
-    // Try to find a suitable account for depreciation expense (e.g., 'Depreciation Expense' or 'Other Expenses')
-    const expenseAccountResult = await client.query(
-      `SELECT id FROM accounts WHERE (name ILIKE 'Depreciation Expense' OR name ILIKE 'Other Expenses') AND user_id = $1 LIMIT 1`, // ADDED user_id filter
-      [user_id]
-    );
-    if (expenseAccountResult.rows.length > 0) {
-      defaultExpenseAccountId = expenseAccountResult.rows[0].id;
-    } else {
-      await client.query('ROLLBACK');
-      return res.status(500).json({ error: 'Could not find a suitable expense account for depreciation for this user.' });
-    }
-
-    for (const asset of assetsResult.rows) {
-      const assetCost = parseFloat(asset.cost);
-      const assetSalvageValue = parseFloat(asset.salvage_value || 0);
-      const assetUsefulLifeYears = parseInt(asset.useful_life_years, 10);
-      const assetDateReceived = new Date(asset.date_received);
-      const assetLastDepreciationDate = asset.last_depreciation_date ? new Date(asset.last_depreciation_date) : null;
-
-      // Determine the start date for this depreciation calculation
-      // It's either the day after last_depreciation_date, or date_received if no prior depreciation
-      let depreciationStartDate = assetLastDepreciationDate
-        ? new Date(assetLastDepreciationDate.getFullYear(), assetLastDepreciationDate.getMonth(), assetLastDepreciationDate.getDate() + 1)
-        : assetDateReceived;
-
-      // Ensure depreciation doesn't start before the asset was received
-      if (depreciationStartDate < assetDateReceived) {
-        depreciationStartDate = assetDateReceived;
-      }
-
-      // Ensure we don't depreciate beyond the useful life
-      const usefulLifeEndDate = new Date(assetDateReceived.getFullYear() + assetUsefulLifeYears, assetDateReceived.getMonth(), assetDateReceived.getDate());
-      if (depreciationStartDate >= usefulLifeEndDate) {
-          console.log(`Asset ${asset.id} has reached end of useful life or already fully depreciated.`);
-          continue; // Skip if already fully depreciated or beyond useful life
-      }
-
-      // Adjust calculationEndDate if it's beyond the useful life end date
-      let effectiveCalculationEndDate = calculationEndDate;
-      if (effectiveCalculationEndDate > usefulLifeEndDate) {
-          effectiveCalculationEndDate = usefulLifeEndDate;
-      }
-
-      // Calculate depreciation only if the period is valid
-      if (depreciationStartDate <= effectiveCalculationEndDate) {
-        const depreciationAmount = calculateDepreciation(
-          assetCost,
-          assetSalvageValue,
-          assetUsefulLifeYears,
-          depreciationStartDate,
-          effectiveCalculationEndDate
-        );
-
-        if (depreciationAmount > 0) {
-          // 1. Update accumulated_depreciation on the asset
-          const newAccumulatedDepreciation = parseFloat(asset.accumulated_depreciation) + depreciationAmount;
-          await client.query(
-            `UPDATE assets SET accumulated_depreciation = $1, last_depreciation_date = $2 WHERE id = $3 AND user_id = $4`, // ADDED user_id filter
-            [newAccumulatedDepreciation, effectiveCalculationEndDate.toISOString().split('T')[0], asset.id, user_id]
-          );
-
-          // 2. Create a transaction for depreciation expense
-          const transactionResult = await client.query(
-            `INSERT INTO transactions (type, amount, description, date, category, account_id, user_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, // ADDED user_id
-            [
-              'expense',
-              depreciationAmount,
-              `Depreciation Expense for ${asset.name} (ID: ${asset.id})`,
-              effectiveCalculationEndDate.toISOString().split('T')[0], // Use end date of calculation period
-              'Depreciation Expense', // Use a specific category for depreciation
-              defaultExpenseAccountId, // Link to a general expense account
-              user_id // ADDED user_id
-            ]
-          );
-          const transactionId = transactionResult.rows[0].id;
-
-          // 3. Record the depreciation entry
-          await client.query(
-            `INSERT INTO depreciation_entries (asset_id, depreciation_date, amount, transaction_id, user_id)
-             VALUES ($1, $2, $3, $4, $5)`, // ADDED user_id
-            [asset.id, effectiveCalculationEndDate.toISOString().split('T')[0], depreciationAmount, transactionId, user_id]
-          );
-
-          totalDepreciationExpense += depreciationAmount;
-          depreciatedAssets.push({ assetId: asset.id, amount: depreciationAmount, transactionId: transactionId });
-        }
-      }
-    }
-
+    const out = await runDepreciationForUser(client, user_id, endDate);
     await client.query('COMMIT');
     res.json({
-      message: 'Depreciation calculated and recorded successfully.',
-      totalDepreciationExpense: totalDepreciationExpense,
-      depreciatedAssets: depreciatedAssets
+      message: 'Depreciation posted.',
+      totalDepreciationExpense: out.total,
+      depreciatedAssets: out.results
     });
-
-  } catch (error: unknown) {
+  } catch (e:any) {
     await client.query('ROLLBACK');
-    console.error('Error running depreciation:', error);
-    res.status(500).json({ error: 'Failed to run depreciation', detail: error instanceof Error ? error.message : String(error) });
+    console.error('Error running depreciation:', e);
+    res.status(500).json({ error: 'Failed to run depreciation', detail: e.message ?? String(e) });
   } finally {
     client.release();
   }
 });
+
 
 
 /* --- Expenses API --- */
@@ -10379,185 +10493,170 @@ app.delete("/journal-entries/:id", authMiddleware, async (req: Request, res: Res
 
 // Income Statement (by period, indirect signs)
 // GET /reports/income-statement?start=YYYY-MM-DD&end=YYYY-MM-DD
+// Income Statement (by period)
+// GET /reports/income-statement?start=YYYY-MM-DD&end=YYYY-MM-DD[&autoDepreciate=true]
 app.get("/reports/income-statement", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id;
   const start = req.query.start as string;
-  const end = req.query.end as string;
+  const end   = req.query.end   as string;
+  const auto  = String(req.query.autoDepreciate || 'false').toLowerCase() === 'true';
   if (!start || !end) return res.status(400).json({ error: "start & end required" });
 
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query(
+    if (auto) { await client.query('BEGIN'); await runDepreciationForUser(client, userId, end); await client.query('COMMIT'); }
+
+    const { rows } = await client.query(
       `
       SELECT
         a.name AS account_name,
         rc.section AS reporting_section,
         a.normal_side AS normal_side,
         SUM(jl.debit - jl.credit) AS balance
-      FROM
-        public.journal_lines jl
-      JOIN
-        public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-      JOIN
-        public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-      JOIN
-        public.reporting_categories rc ON rc.id = a.reporting_category_id
-      WHERE
-        je.user_id = $1
+      FROM public.journal_lines jl
+      JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+      JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
+      JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+      WHERE je.user_id = $1
         AND rc.statement = 'income_statement'
         AND je.entry_date BETWEEN $2::date AND $3::date
-      GROUP BY
-        a.name, rc.section, a.normal_side
-      ORDER BY
-        rc.section, a.name;
+      GROUP BY a.name, rc.section, a.normal_side
+      ORDER BY rc.section, a.name;
       `,
       [userId, start, end]
     );
 
     const sectionMap: Record<string, { section: string; amount: number; accounts: any[] }> = {};
-
     rows.forEach(row => {
       const sectionName = row.reporting_section;
-      if (!sectionMap[sectionName]) {
-        sectionMap[sectionName] = {
-          section: sectionName,
-          amount: 0,
-          accounts: []
-        };
-      }
-      
+      if (!sectionMap[sectionName]) sectionMap[sectionName] = { section: sectionName, amount: 0, accounts: [] };
       const balance = parseFloat(row.balance);
-      const amount = (row.normal_side === 'Credit') ? -balance : balance;
-
+      const amount  = (row.normal_side === 'Credit') ? -balance : balance;
       sectionMap[sectionName].amount += amount;
-      sectionMap[sectionName].accounts.push({
-        name: row.account_name,
-        amount: amount
-      });
+      sectionMap[sectionName].accounts.push({ name: row.account_name, amount });
     });
 
     res.json({ period: { start, end }, sections: Object.values(sectionMap) });
-
   } catch (error) {
     console.error("Error fetching income statement:", error);
     res.status(500).json({ error: "Internal server error" });
+  } finally {
+    client.release();
   }
 });
 
-// Balance Sheet (as of date)
-// GET /reports/balance-sheet?asOf=YYYY-MM-DD
-// server.ts
 
+
+// Balance Sheet (as of date, optional start for period P&L)
+// GET /reports/balance-sheet?asOf=YYYY-MM-DD[&start=YYYY-MM-DD][&autoDepreciate=true]
 app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id;
   const asOf = req.query.asOf as string;
+  const start = (req.query.start as string) || null; // optional for period P&L display
+  const auto  = String(req.query.autoDepreciate || 'false').toLowerCase() === 'true';
   if (!asOf) return res.status(400).json({ error: "asOf required" });
 
   const client = await pool.connect();
   try {
-    // --- 1. Calculate Net Profit/Loss for the period up to 'asOf' ---
-    // This query sums all income statement items (revenue/other_income are credits, expenses are debits)
-    // Using the correct sign based on normal side to get the final profit/loss figure.
+    if (auto) { await client.query('BEGIN'); await runDepreciationForUser(client, userId, asOf); await client.query('COMMIT'); }
+
+    const normalize = (s: string | null): string =>
+      (s || "").trim().toLowerCase().replace(/[^a-z]+/g, "_");
+
+    // Net profit for [start, asOf] (from IS accounts)
     const profitLossResult = await client.query(
       `
-      SELECT 
-        SUM(CASE 
-          WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit) -- Revenue/Income
-          ELSE -(jl.debit - jl.credit) -- Expenses (negate to subtract from income)
-        END) AS net_profit_loss
+      SELECT COALESCE(SUM(
+        CASE
+          WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit)
+          ELSE                      - (jl.debit  - jl.credit)
+        END
+      ),0) AS net_profit_loss
       FROM public.journal_lines jl
       JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-      JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+      JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
       JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
       WHERE je.user_id = $1
         AND rc.statement = 'income_statement'
-        AND je.entry_date <= $2::date
+        AND je.entry_date BETWEEN COALESCE($2::date, '1900-01-01') AND $3::date
       `,
-      [userId, asOf]
+      [userId, start, asOf]
     );
-    const netProfitLoss = parseFloat(profitLossResult.rows[0]?.net_profit_loss) || 0;
-    // --- End Net Profit Calculation ---
+    const netProfitLoss = Number(profitLossResult.rows[0]?.net_profit_loss || 0);
 
-    // --- 2. Get the standard Balance Sheet sections (Assets, Liabilities, base Equity) ---
-    const { rows: balanceSheetSections } = await client.query(
+    // BS sections as-of
+    const { rows: bsRows } = await client.query(
       `
       SELECT rc.section,
-             SUM(CASE a.normal_side
-                   WHEN 'Debit'   THEN (jl.debit - jl.credit)
-                   ELSE            -(jl.debit - jl.credit)
-                 END) AS value
-        FROM public.journal_lines jl
-        JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-        JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-        JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
-       WHERE je.user_id = $1
-         AND rc.statement = 'balance_sheet'
-         AND je.entry_date <= $2::date
-       GROUP BY rc.section
-       ORDER BY rc.section
+             COALESCE(SUM(
+               CASE a.normal_side
+                 WHEN 'Debit'  THEN (jl.debit - jl.credit)
+                 ELSE               -(jl.debit - jl.credit)
+               END
+             ),0) AS value
+      FROM public.journal_lines jl
+      JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+      JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
+      JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+      WHERE je.user_id = $1
+        AND rc.statement = 'balance_sheet'
+        AND je.entry_date <= $2::date
+      GROUP BY rc.section
+      ORDER BY rc.section
       `,
       [userId, asOf]
     );
-    // --- End Standard Sections ---
 
-    // --- 3. Get the Opening Balance Equity specifically ---
-    // Find the account ID for 'Opening Balance Equity'
-    const obeAccountResult = await client.query(
+    const sectionsMap: Record<string, number> = {};
+    for (const r of bsRows) sectionsMap[normalize(r.section)] = Number(r.value || 0);
+
+    // Opening Balance Equity (as-of)
+    const obeIdRes = await client.query(
       `SELECT id FROM public.accounts WHERE user_id = $1 AND name = 'Opening Balance Equity' LIMIT 1`,
       [userId]
     );
     let openingBalanceEquityValue = 0;
-    if (obeAccountResult.rows.length > 0) {
-      const obeAccountId = obeAccountResult.rows[0].id;
-      const obeBalanceResult = await client.query(
+    if (obeIdRes.rows.length) {
+      const obeId = obeIdRes.rows[0].id;
+      const obeBalRes = await client.query(
         `
-        SELECT 
-          SUM(CASE a.normal_side
-                WHEN 'Debit' THEN (jl.debit - jl.credit)
-                ELSE          -(jl.debit - jl.credit)
-              END) AS balance
+        SELECT COALESCE(SUM(
+          CASE a.normal_side
+            WHEN 'Debit' THEN (jl.debit - jl.credit)
+            ELSE               -(jl.debit - jl.credit)
+          END
+        ),0) AS balance
         FROM public.journal_lines jl
         JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-        JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
         WHERE jl.user_id = $1
           AND jl.account_id = $2
           AND je.entry_date <= $3::date
         `,
-        [userId, obeAccountId, asOf]
+        [userId, obeId, asOf]
       );
-      openingBalanceEquityValue = parseFloat(obeBalanceResult.rows[0]?.balance) || 0;
+      openingBalanceEquityValue = Number(obeBalRes.rows[0]?.balance || 0);
     }
-    // --- End Opening Balance Equity ---
 
-    // --- 4. Prepare the final response data ---
-    // Organize the standard sections for easy access
-    const sectionsMap: Record<string, number> = {};
-    balanceSheetSections.forEach(s => {
-        sectionsMap[s.section] = parseFloat(s.value) || 0;
-    });
+    const totalEquityAsOf = sectionsMap["equity"] ?? 0;
+    const otherEquityMovements = totalEquityAsOf - (openingBalanceEquityValue + netProfitLoss);
 
-    // Calculate the derived equity values
-    const retainedEarningsOrSimilarEquity = sectionsMap['equity'] || 0; // This might include OBE + some retained earnings if manually adjusted
-    // More accurate closing equity: Opening OBE + Net Profit (This is the key calculation)
-    const closingEquity = openingBalanceEquityValue + netProfitLoss; 
-
-    // Send back all necessary data for the frontend to build the desired structure
-    res.json({ 
-      asOf, 
-      sections: balanceSheetSections, // Standard sections from reporting categories
+    res.json({
+      asOf,
+      sections: bsRows,
       openingEquity: openingBalanceEquityValue,
-      netProfitLoss: netProfitLoss,
-      closingEquity: closingEquity,
-      // Also pass raw values for assets/liabilities for totals if needed
+      netProfitLoss,
+      closingEquity: totalEquityAsOf,
       assets: {
-        current: sectionsMap['current_assets'] || 0,
-        non_current: sectionsMap['non_current_assets'] || 0
+        current: sectionsMap["current_assets"] ?? sectionsMap["current_asset"] ?? 0,
+        non_current: sectionsMap["non_current_assets"] ?? sectionsMap["noncurrent_assets"] ?? 0
       },
       liabilities: {
-        current: sectionsMap['current_liabilities'] || 0,
-        non_current: sectionsMap['non_current_liabilities'] || 0
-      }
+        current: sectionsMap["current_liabilities"] ?? 0,
+        non_current: sectionsMap["non_current_liabilities"] ?? sectionsMap["noncurrent_liabilities"] ?? 0
+      },
+      otherEquityMovements
     });
-
   } catch (err) {
     console.error("Error generating balance sheet:", err);
     res.status(500).json({ error: "Failed to generate balance sheet" });
@@ -10566,129 +10665,168 @@ app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Resp
   }
 });
 
+
+
 // Cash Flow (Indirect)
 // GET /reports/cash-flow?start=YYYY-MM-DD&end=YYYY-MM-DD
 // Cash Flow (Indirect)
 // GET /reports/cash-flow?start=YYYY-MM-DD&end=YYYY-MM-DD
+// Cash Flow (Indirect)
+// GET /reports/cash-flow?start=YYYY-MM-DD&end=YYYY-MM-DD[&autoDepreciate=true]
 app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id;
   const start = req.query.start as string;
-  const end = req.query.end as string;
+  const end   = req.query.end   as string;
+  const auto  = String(req.query.autoDepreciate || 'false').toLowerCase() === 'true';
   if (!start || !end) return res.status(400).json({ error: "start & end required" });
 
+  const client = await pool.connect();
   try {
-    // Direct query approach with corrected column names
-    const { rows } = await pool.query(
+    if (auto) { await client.query('BEGIN'); await runDepreciationForUser(client, userId, end); await client.query('COMMIT'); }
+
+    const { rows } = await client.query(
       `
-      WITH cash_changes AS (
-        -- Operating: Net Income
-        SELECT 
-          'operating' as section,
-          'Net Income' as line,
-          SUM(CASE 
-            WHEN a.normal_side = 'Debit' THEN (jl.credit - jl.debit)
-            ELSE (jl.debit - jl.credit)
-          END) as amount
+      WITH
+      jl AS (
+        SELECT jl.entry_id, jl.account_id, jl.debit, jl.credit, jl.user_id, je.entry_date
         FROM public.journal_lines jl
         JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-        JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-        JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
         WHERE je.user_id = $1
-          AND rc.statement = 'income_statement'
           AND je.entry_date BETWEEN $2::date AND $3::date
-      
-        UNION ALL
-      
-        -- Operating: Depreciation
-        SELECT 
-          'operating' as section,
-          'Depreciation' as line,
-          SUM(CASE 
-            WHEN a.normal_side = 'Debit' THEN (jl.debit - jl.credit)
-            ELSE (jl.credit - jl.debit)
-          END) as amount
-        FROM public.journal_lines jl
-        JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-        JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-        WHERE je.user_id = $1
-          AND a.name ILIKE '%depreciation%'
-          AND je.entry_date BETWEEN $2::date AND $3::date
-      
-        UNION ALL
-      
-        -- Investing: Purchase of Assets
-        SELECT 
-          'investing' as section,
-          'Purchase of Fixed Assets' as line,
-          SUM(CASE 
-            WHEN a.normal_side = 'Debit' THEN (jl.debit - jl.credit)
-            ELSE (jl.credit - jl.debit)
-          END) as amount
-        FROM public.journal_lines jl
-        JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-        JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-        WHERE je.user_id = $1
-          AND a.type = 'Asset'
-          AND je.entry_date BETWEEN $2::date AND $3::date
-      
-        UNION ALL
-      
-        -- Financing: Loan Proceeds
-        SELECT 
-          'financing' as section,
-          'Loan Proceeds' as line,
-          SUM(CASE 
-            WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit)
-            ELSE (jl.debit - jl.credit)
-          END) as amount
-        FROM public.journal_lines jl
-        JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-        JOIN public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-        WHERE je.user_id = $1
-          AND a.type = 'Liability'
-          AND je.entry_date BETWEEN $2::date AND $3::date
+      ),
+      acc AS (
+        SELECT a.id, a.user_id, a.name, a.type, a.normal_side, a.reporting_category_id
+        FROM public.accounts a
+        WHERE a.user_id = $1
+      ),
+      rc AS (
+        SELECT rc.id, rc.statement, rc.section
+        FROM public.reporting_categories rc
+      ),
+      -- Operating
+      net_income AS (
+        SELECT 'operating' AS section, 'Net Income' AS line,
+               COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+               JOIN rc  r ON r.id = a.reporting_category_id
+        WHERE r.statement = 'income_statement'
+      ),
+      depreciation AS (
+        SELECT 'operating' AS section, 'Depreciation' AS line,
+               COALESCE(SUM(jl.debit - jl.credit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        WHERE (a.name ILIKE '%depreciation%' OR a.name ILIKE '%amortization%')
+      ),
+      delta_current_assets AS (
+        SELECT 'operating' AS section,
+               'Change in Working Capital: Current Assets (excl. cash/bank)' AS line,
+               COALESCE(-SUM(jl.debit - jl.credit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        LEFT JOIN rc  r ON r.id = a.reporting_category_id
+        WHERE ((r.statement = 'balance_sheet' AND r.section = 'Current Assets')
+               OR (r.id IS NULL AND a.type = 'Asset'))
+          AND a.name NOT ILIKE '%cash%' AND a.name NOT ILIKE '%bank%'
+      ),
+      delta_current_liab AS (
+        SELECT 'operating' AS section,
+               'Change in Working Capital: Current Liabilities' AS line,
+               COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        LEFT JOIN rc  r ON r.id = a.reporting_category_id
+        WHERE (r.statement = 'balance_sheet' AND r.section = 'Current Liabilities')
+           OR (r.id IS NULL AND a.type = 'Liability')
+      ),
+      -- Investing
+      investing_assets AS (
+        SELECT 'investing' AS section,
+               'Purchase / (Sale) of Fixed Assets' AS line,
+               COALESCE(-SUM(jl.debit - jl.credit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        LEFT JOIN rc  r ON r.id = a.reporting_category_id
+        WHERE (r.statement = 'balance_sheet' AND r.section = 'Non-Current Assets')
+           OR (r.id IS NULL AND a.type = 'Asset'
+               AND a.name NOT ILIKE '%cash%' AND a.name NOT ILIKE '%bank%')
+      ),
+      -- Financing
+      financing_debt AS (
+        SELECT 'financing' AS section, 'Debt Proceeds / (Repayments)' AS line,
+               COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        LEFT JOIN rc  r ON r.id = a.reporting_category_id
+        WHERE (r.statement = 'balance_sheet' AND r.section = 'Non-Current Liabilities')
+           OR a.name ILIKE '%loan%' OR a.name ILIKE '%bond%' OR a.name ILIKE '%note payable%'
+      ),
+      financing_equity AS (
+        SELECT 'financing' AS section, 'Owner Contributions / (Drawings)' AS line,
+               COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        LEFT JOIN rc  r ON r.id = a.reporting_category_id
+        WHERE (r.statement = 'balance_sheet' AND r.section = 'Equity')
+           OR a.type = 'Equity'
+      ),
+      cash_changes AS (
+        SELECT * FROM net_income
+        UNION ALL SELECT * FROM depreciation
+        UNION ALL SELECT * FROM delta_current_assets
+        UNION ALL SELECT * FROM delta_current_liab
+        UNION ALL SELECT * FROM investing_assets
+        UNION ALL SELECT * FROM financing_debt
+        UNION ALL SELECT * FROM financing_equity
+      ),
+      cash_movement AS (
+        SELECT COALESCE(SUM(
+                 CASE WHEN a.normal_side = 'Debit'
+                      THEN (jl.debit - jl.credit)
+                      ELSE (jl.credit - jl.debit)
+                 END
+               ),0)::numeric AS delta_cash
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        WHERE a.name ILIKE '%cash%' OR a.name ILIKE '%bank%'
       )
-      
-      SELECT section, line, COALESCE(amount, 0) as amount
-      FROM cash_changes
-      WHERE amount != 0
-      ORDER BY section, line
+      SELECT c.section, c.line, c.amount,
+             (SELECT delta_cash FROM cash_movement) AS delta_cash_check
+      FROM cash_changes c
+      WHERE c.amount <> 0
+      ORDER BY c.section, c.line;
       `,
       [userId, start, end]
     );
 
-    // Group for nicer JSON
     const grouped: Record<string, { line: string; amount: number }[]> = {};
-    for (const r of rows) {
-      grouped[r.section] = grouped[r.section] || [];
-      grouped[r.section].push({ line: r.line, amount: parseFloat(r.amount.toString()) });
+    let deltaCashCheck: number | null = null;
+    for (const r of rows as any[]) {
+      if (deltaCashCheck === null && r.delta_cash_check !== null) deltaCashCheck = Number(r.delta_cash_check);
+      const section = r.section as string;
+      grouped[section] = grouped[section] || [];
+      grouped[section].push({ line: r.line as string, amount: Number(r.amount) });
     }
-    
-    // Add totals for each section
     for (const section in grouped) {
-      const total = grouped[section].reduce((sum, item) => sum + item.amount, 0);
+      const total = grouped[section].reduce((sum, it) => sum + it.amount, 0);
       grouped[section].push({
         line: `Net Cash from ${section.charAt(0).toUpperCase() + section.slice(1)} Activities`,
-        amount: total
+        amount: Number(total.toFixed(2))
       });
     }
+    const netCash = Object.values(grouped).reduce((acc, items) => acc + (items[items.length - 1]?.amount ?? 0), 0);
 
-    // Calculate final net increase/decrease in cash
-    const netCash = Object.values(grouped).reduce((total, section) => {
-      const lastItem = section[section.length - 1];
-      return total + lastItem.amount;
-    }, 0);
-
-    res.json({ 
-      period: { start, end }, 
+    res.json({
+      period: { start, end },
       sections: grouped,
-      netIncreaseInCash: netCash
+      netIncreaseInCash: Number(netCash.toFixed(2)),
+      reconciliation: {
+        movementOnCashAccounts: Number((deltaCashCheck ?? 0).toFixed(2)),
+        matches: Math.abs((deltaCashCheck ?? 0) - netCash) < 0.01
+      }
     });
   } catch (error) {
     console.error("Cash flow error:", error);
     res.status(500).json({ error: "Failed to generate cash flow statement" });
+  } finally {
+    client.release();
   }
 });
+
+
 app.get("/reports/trial-balance", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id; // Access user from req.user
   const start = req.query.start as string;
