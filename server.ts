@@ -521,6 +521,8 @@ const mapCustomerToFrontend = (customer: CustomerDB): CustomerFrontend => ({
 
 
 
+
+
 // Assuming 'app', 'pool', 'authMiddleware', 'bcrypt', 'uuidv4', 'Request', 'Response' are defined elsewhere
 
 // Assuming 'app', 'pool', 'authMiddleware', 'bcrypt', 'uuidv4', 'Request', 'Response' are defined elsewhere
@@ -532,6 +534,175 @@ const mapCustomerToFrontend = (customer: CustomerDB): CustomerFrontend => ({
 // import { v4 as uuidv4 } from 'uuid';
 // import jwt from 'jsonwebtoken';
 // --- End imports ---
+// ---------- Reporting Category helpers ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Reporting category + account mapping helpers
+// ─────────────────────────────────────────────────────────────────────────────
+type PgLike = { query: (q: string, p?: any[]) => Promise<any> };
+
+const toSnake = (s: string) => s.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
+
+function normalSideFor(type: string): "Debit" | "Credit" {
+  return (type === "Asset" || type === "Expense") ? "Debit" : "Credit";
+}
+
+
+
+// Creates/fetches Opening Balance Equity and maps it correctly
+async function getOrCreateOBE(client:any, userId:string): Promise<number> {
+  const r = await client.query(
+    `SELECT id FROM public.accounts WHERE user_id=$1 AND name='Opening Balance Equity' LIMIT 1`,
+    [userId]
+  );
+  if (r.rows.length) {
+    await ensureAccountReportingCategory(client, userId, Number(r.rows[0].id));
+    return Number(r.rows[0].id);
+  }
+  const rcId = await ensureReportingCategoryId(client, 'balance_sheet', 'equity');
+  const ins = await client.query(
+    `INSERT INTO public.accounts
+       (user_id, code, name, type, normal_side, reporting_category_id, is_postable, is_active)
+     VALUES ($1,'3999','Opening Balance Equity','Equity','Credit',$2, TRUE, TRUE)
+     RETURNING id`,
+    [userId, rcId]
+  );
+  return Number(ins.rows[0].id);
+}
+
+/** Look up an existing reporting category by (statement, section). No creation here. */
+async function ensureReportingCategoryId(
+  client: PgLike,
+  statement: string,  // e.g. 'balance_sheet' | 'income_statement'
+  section: string     // e.g. 'current_assets', 'cost_of_sales', 'operating_expenses'
+): Promise<number> {
+  const stmt = toSnake(statement);
+  const sec  = toSnake(section);
+
+  const rc = await client.query(
+    `
+    SELECT id
+      FROM public.reporting_categories
+     WHERE lower(statement) = $1
+       AND (
+             lower(section) = $2
+          OR lower(replace(section,' ','_')) = $2
+         )
+     LIMIT 1
+    `,
+    [stmt, sec]
+  );
+  if (!rc.rows.length) {
+    throw new Error(`Missing reporting category: statement='${stmt}', section='${sec}'. Seed it first.`);
+  }
+  return Number(rc.rows[0].id);
+}
+
+/** Heuristic: name+type → (statement, section) that matches your seeded categories */
+function guessReportingForAccount(
+  type: string,
+  name: string,
+  code?: string
+): { statement: string; section: string } {
+  const t = (type || "").toLowerCase();
+  const n = (name || "").toLowerCase();
+  const c = String(code || "");
+
+  if (t === "asset") {
+    if (/accumulated depreciation/.test(n)) {
+      return { statement: "balance_sheet", section: "non_current_assets" };
+    }
+    if (/(cash|bank|petty|receiv|inventory|stock|prepaid|deposit|vat|tax receivable)/.test(n)
+        || c.startsWith("10") || c.startsWith("11") || c.startsWith("12") || c.startsWith("13") || c.startsWith("14") || c.startsWith("16")) {
+      return { statement: "balance_sheet", section: "current_assets" };
+    }
+    return { statement: "balance_sheet", section: "non_current_assets" };
+  }
+
+  if (t === "liability") {
+    if (/(loan|note|bond|mortgage|long[-\s]?term)/.test(n) || c.startsWith("26") || c.startsWith("27")) {
+      return { statement: "balance_sheet", section: "non_current_liabilities" };
+    }
+    return { statement: "balance_sheet", section: "current_liabilities" };
+  }
+
+  if (t === "equity") {
+    return { statement: "balance_sheet", section: "equity" };
+  }
+
+  if (t === "income") {
+    if (/(other|misc|non[-\s]?operating|interest income|gain)/.test(n)) {
+      return { statement: "income_statement", section: "other_income" };
+    }
+    return { statement: "income_statement", section: "revenue" };
+  }
+
+  if (t === "expense") {
+    if (/(cogs|cost of goods|cost of sales|purchases)/.test(n) || c.startsWith("5")) {
+      return { statement: "income_statement", section: "cost_of_sales" }; // ✅ not 'cogs'
+    }
+    if (/(interest|bank charge|finance|loan interest)/.test(n)) {
+      // use finance_costs if you have it; otherwise fall back to operating_expenses
+      return { statement: "income_statement", section: "finance_costs" };
+    }
+    return { statement: "income_statement", section: "operating_expenses" };
+  }
+
+  // default (shouldn't hit)
+  return { statement: "income_statement", section: "operating_expenses" };
+}
+
+/** Ensure normal_side + reporting_category_id are set correctly for this account */
+async function ensureAccountReportingCategory(
+  client: PgLike,
+  userId: string,
+  accountId: number
+): Promise<number> {
+  const q = await client.query(
+    `SELECT id, name, type, code, normal_side, reporting_category_id
+       FROM public.accounts
+      WHERE user_id = $1 AND id = $2
+      LIMIT 1`,
+    [userId, accountId]
+  );
+  if (!q.rows.length) throw new Error("Account not found for this user.");
+  const a = q.rows[0];
+
+  // normal_side per your CHECK constraint
+  const wantSide = normalSideFor(a.type);
+  if (a.normal_side !== wantSide) {
+    await client.query(
+      `UPDATE public.accounts SET normal_side = $1, updated_at = NOW()
+        WHERE id = $2 AND user_id = $3`,
+      [wantSide, accountId, userId]
+    );
+  }
+
+  if (a.reporting_category_id) return Number(a.reporting_category_id);
+
+  const guess = guessReportingForAccount(a.type, a.name, a.code);
+  // Some installs don't have "finance_costs" — fallback to operating_expenses
+  const sectionWanted = (guess.section === "finance_costs") ? "finance_costs" : guess.section;
+  let rcId: number;
+  try {
+    rcId = await ensureReportingCategoryId(client, guess.statement, sectionWanted);
+  } catch {
+    // fallback (only for the finance costs case)
+    rcId = await ensureReportingCategoryId(client, "income_statement", "operating_expenses");
+  }
+
+  await client.query(
+    `UPDATE public.accounts
+        SET reporting_category_id = $1, updated_at = NOW()
+      WHERE id = $2 AND user_id = $3`,
+    [rcId, accountId, userId]
+  );
+  return rcId;
+}
+
+
+
+
+
 
 // --- Registration Endpoint (Updated for Extended Frontend Form AND Default Accounts) ---
 // --- Registration Endpoint (Updated for Extended Frontend Form AND Default Accounts) ---
@@ -666,74 +837,78 @@ app.post('/register', async (req: Request, res: Response) => {
       // --- Step 3: Insert Default Accounts based on ImportScreen.tsx ---
       // These accounts provide a base set for transaction categorization
       // and align with the logic in the frontend's suggestion functions.
-   const defaultAccounts: [string, 'Asset'|'Liability'|'Equity'|'Income'|'Expense', string, string][] = [
-  // ── ASSETS (1000–1999)
-  ['Bank Account',                     'Asset',    'Bank',                            '1000'],
-  ['Cash',                             'Asset',    'Cash',                            '1100'],
-  ['Accounts Receivable',              'Asset',    'Accounts Receivable',             '1200'], // FIXED: was Income
-  ['Inventory',                        'Asset',    'Inventory',                       '1300'],
-  ['Prepaid Expenses',                 'Asset',    'Prepaid Expenses',                '1400'],
-  ['Property, Plant & Equipment',      'Asset',    'Fixed Assets',                    '1500'],
-  // (Optional but recommended – see note on contra accounts below)
-  ['Accumulated Depreciation',         'Asset',    'Contra Asset (PPE offset)',       '1550'],
+   // --- Step 3: Insert Default Accounts (then auto-map) ---
+// --- Step 3: Insert Default Accounts (with normal_side) and auto-map categories ---
+const defaultAccounts: Array<{ name: string; type: 'Asset'|'Liability'|'Equity'|'Income'|'Expense'; code: string; }> = [
+  // ASSETS
+  { name: 'Bank Account',                    type: 'Asset',    code: '1000' },
+  { name: 'Cash',                            type: 'Asset',    code: '1100' },
+  { name: 'Accounts Receivable',             type: 'Asset',    code: '1200' },
+  { name: 'Inventory',                       type: 'Asset',    code: '1300' },
+  { name: 'Prepaid Expenses',                type: 'Asset',    code: '1400' },
+  { name: 'Property, Plant & Equipment',     type: 'Asset',    code: '1500' },
+  { name: 'Accumulated Depreciation',        type: 'Asset',    code: '1550' },
+  { name: 'VAT Input (Receivable)',          type: 'Asset',    code: '1600' },
 
-  // VAT (South Africa typical handling)
-  ['VAT Input (Receivable)',           'Asset',    'VAT',                             '1600'],
+  // LIABILITIES
+  { name: 'Accounts Payable',                type: 'Liability', code: '2100' },
+  { name: 'VAT Output (Payable)',            type: 'Liability', code: '2200' },
+  { name: 'VAT Control / Net Payable',       type: 'Liability', code: '2210' },
+  { name: 'Accrued Expenses',                type: 'Liability', code: '2300' },
+  { name: 'Unearned Revenue (Deferred)',     type: 'Liability', code: '2400' },
+  { name: 'Payroll Liabilities - PAYE',      type: 'Liability', code: '2420' },
+  { name: 'Payroll Liabilities - UIF',       type: 'Liability', code: '2430' },
+  { name: 'Payroll Liabilities - SDL',       type: 'Liability', code: '2440' },
+  { name: 'Credit Facility Payable',         type: 'Liability', code: '2500' },
+  { name: 'Car Loans',                       type: 'Liability', code: '2600' },
+  { name: 'Long-term Loan Payable',          type: 'Liability', code: '2700' },
 
-  // ── LIABILITIES (2000–2999)
-  ['Accounts Payable',                 'Liability','Accounts Payable',                '2100'],
-  ['VAT Output (Payable)',             'Liability','VAT',                             '2200'],
-  ['VAT Control / Net Payable',        'Liability','VAT',                             '2210'],
-  ['Accrued Expenses',                 'Liability','Accruals',                        '2300'],
-  ['Unearned Revenue (Deferred)',      'Liability','Deferred Income',                 '2400'],
-  ['Payroll Liabilities - PAYE',       'Liability','Statutory Payroll',               '2420'],
-  ['Payroll Liabilities - UIF',        'Liability','Statutory Payroll',               '2430'],
-  ['Payroll Liabilities - SDL',        'Liability','Statutory Payroll',               '2440'],
-  ['Credit Facility Payable',          'Liability','Credit Facility',                 '2500'],
-  ['Car Loans',                        'Liability','Vehicle Finance',                 '2600'],
-  ['Long-term Loan Payable',           'Liability','Loans',                           '2700'],
+  // EQUITY
+  { name: 'Owner’s Capital',                 type: 'Equity',    code: '3000' },
+  { name: 'Retained Earnings',               type: 'Equity',    code: '3100' },
+  { name: 'Owner’s Drawings',                type: 'Equity',    code: '3200' },
+  { name: 'Opening Balance Equity',          type: 'Equity',    code: '3999' },
 
-  // ── EQUITY (3000–3999)
-  ['Owner’s Capital',                  'Equity',   'Equity',                          '3000'],
-  ['Retained Earnings',                'Equity',   'Equity',                          '3100'],
-  ['Owner’s Drawings',                 'Equity',   'Contra Equity',                   '3200'],
-  ['Opening Balance Equity',           'Equity',   'System',                          '3999'],
+  // INCOME
+  { name: 'Sales Revenue',                   type: 'Income',    code: '4000' },
+  { name: 'Sales Returns & Allowances',      type: 'Income',    code: '4050' },
+  { name: 'Interest Income',                 type: 'Income',    code: '4100' },
+  { name: 'Other Income',                    type: 'Income',    code: '4900' },
 
-  // ── INCOME (4000–4999)
-  ['Sales Revenue',                    'Income',   'Sales Revenue',                    '4000'],
-  ['Sales Returns & Allowances',       'Income',   'Contra Revenue',                   '4050'],
-  ['Other Income',                     'Income',   'Other Income',                     '4900'],
-  ['Interest Income',                  'Income',   'Interest Income',                   '4100'],
+  // COGS
+  { name: 'Cost of Goods Sold',              type: 'Expense',   code: '5000' },
+  { name: 'Freight & Import Duties (COGS)',  type: 'Expense',   code: '5100' },
 
-  // ── COST OF SALES (5000–5999)
-  ['Cost of Goods Sold',               'Expense',  'Cost of Goods Sold',               '5000'],
-  ['Freight & Import Duties (COGS)',   'Expense',  'Cost of Goods Sold',               '5100'],
-
-  // ── OPERATING EXPENSES (6000–7999)
-  ['Salaries and Wages Expense',       'Expense',  'Salaries and Wages',               '6100'],
-  ['Bank Charges & Fees',              'Expense',  'Bank Charges & Fees',              '6200'],
-  ['Rent Expense',                     'Expense',  'Rent',                             '6300'],
-  ['Repairs & Maintenance Expense',    'Expense',  'Repairs & Maintenance',           '6400'],
-  ['Fuel Expense',                     'Expense',  'Fuel',                             '6500'],
-  ['Utilities Expense',                'Expense',  'Utilities',                        '6600'],
-  ['Insurance Expense',                'Expense',  'Insurance',                        '6700'],
-  ['Loan Interest Expense',            'Expense',  'Loan Interest',                    '6800'],
-  ['Communication Expense',            'Expense',  'Computer, Internet & Telephone',   '6900'],
-  ['Website Hosting Fees',             'Expense',  'Website Hosting Fees',             '6950'],
-  ['Accounting Fees Expense',          'Expense',  'Accounting Fees',                  '7000'],
-  ['Depreciation Expense',             'Expense',  'Depreciation Expense',             '7770'],
-  ['Bad Debts Expense',                'Expense',  'Credit Losses',                    '7800'],
-  ['Miscellaneous Expense',            'Expense',  'Other Expenses',                   '7900'],
+  // OPERATING EXPENSES
+  { name: 'Salaries and Wages Expense',      type: 'Expense',   code: '6100' },
+  { name: 'Bank Charges & Fees',             type: 'Expense',   code: '6200' },
+  { name: 'Rent Expense',                    type: 'Expense',   code: '6300' },
+  { name: 'Repairs & Maintenance Expense',   type: 'Expense',   code: '6400' },
+  { name: 'Fuel Expense',                    type: 'Expense',   code: '6500' },
+  { name: 'Utilities Expense',               type: 'Expense',   code: '6600' },
+  { name: 'Insurance Expense',               type: 'Expense',   code: '6700' },
+  { name: 'Loan Interest Expense',           type: 'Expense',   code: '6800' },
+  { name: 'Communication Expense',           type: 'Expense',   code: '6900' },
+  { name: 'Website Hosting Fees',            type: 'Expense',   code: '6950' },
+  { name: 'Accounting Fees Expense',         type: 'Expense',   code: '7000' },
+  { name: 'Depreciation Expense',            type: 'Expense',   code: '7770' },
+  { name: 'Bad Debts Expense',               type: 'Expense',   code: '7800' },
+  { name: 'Miscellaneous Expense',           type: 'Expense',   code: '7900' },
 ];
 
-      for (const account of defaultAccounts) {
-        await client.query(
-          `INSERT INTO public.accounts (name, type, category, code, user_id)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [account[0], account[1], account[2], account[3], newUserId]
-        );
-      }
-      console.log(`[AUTH] ${defaultAccounts.length} default accounts created for user_id: ${newUserId}.`);
+for (const { name: accName, type, code } of defaultAccounts) {
+  const normal_side = normalSideFor(type);
+  const ins = await client.query(
+    `INSERT INTO public.accounts (name, type, code, user_id, normal_side, is_postable, is_active)
+     VALUES ($1,$2,$3,$4,$5, TRUE, TRUE)
+     RETURNING id`,
+    [accName, type, code, newUserId, normal_side]
+  );
+  await ensureAccountReportingCategory(client, newUserId, Number(ins.rows[0].id));
+}
+console.log(`[AUTH] ${defaultAccounts.length} default accounts created & mapped for user_id: ${newUserId}.`);
+
+
       // --- End Step 3: Insert Default Accounts ---
 
       // --- COMMIT DATABASE TRANSACTION ---
@@ -1772,34 +1947,48 @@ app.get('/accounts', authMiddleware, async (req: Request, res: Response) => {
 });
 
 app.post('/accounts', authMiddleware, async (req: Request, res: Response) => {
-  const { type, name, code } = req.body;
+  const { type, name, code } = req.body as { type: string; name: string; code: string };
   const user_id = req.user!.parent_user_id;
 
-  if (!type || !name || !code) {
-    return res.status(400).json({ error: 'Missing required account fields: type, name, code' });
-  }
+  if (!type || !name || !code) return res.status(400).json({ error: 'Missing required account fields: type, name, code' });
 
+  const client = await pool.connect();
   try {
-    // Enforce unique (user_id, code)
-    const dupe = await pool.query(`SELECT 1 FROM accounts WHERE user_id = $1 AND code = $2 LIMIT 1`, [user_id, code]);
-    if (dupe.rowCount) {
-      return res.status(409).json({ error: `Account code ${code} already exists.` });
-    }
+    await client.query('BEGIN');
 
-const insert = await pool.query(
-  `INSERT INTO accounts (type, name, code, user_id) -- Consider adding defaults for is_active etc. if needed
-   VALUES ($1, $2, $3, $4)
-   RETURNING id, name, type, code, is_postable, is_active, reporting_category_id`, // <-- Updated RETURNING
-  [type, name, code, user_id]
-);
-res.status(201).json(insert.rows[0]);
+    const dupe = await client.query(
+      `SELECT 1 FROM public.accounts WHERE user_id = $1 AND code = $2 LIMIT 1`,
+      [user_id, code]
+    );
+    if (dupe.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: `Account code ${code} already exists.` }); }
 
-    res.status(201).json(insert.rows[0]);
-  } catch (error: unknown) {
-    console.error('Error adding account:', error);
-    res.status(500).json({ error: 'Failed to add account', detail: error instanceof Error ? error.message : String(error) });
+    const normal_side = normalSideFor(type);
+    const ins = await client.query(
+      `INSERT INTO public.accounts (type, name, code, user_id, normal_side, is_postable, is_active)
+       VALUES ($1,$2,$3,$4,$5, TRUE, TRUE)
+       RETURNING id`,
+      [type, name, code, user_id, normal_side]
+    );
+
+    await ensureAccountReportingCategory(client, user_id, Number(ins.rows[0].id));
+
+    await client.query('COMMIT');
+
+    const out = await pool.query(
+      `SELECT id, name, type, code, normal_side, reporting_category_id, is_postable, is_active
+         FROM public.accounts WHERE id = $1 AND user_id = $2`,
+      [ins.rows[0].id, user_id]
+    );
+    res.status(201).json(out.rows[0]);
+  } catch (e:any) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to add account', detail: e.message ?? String(e) });
+  } finally {
+    client.release();
   }
 });
+
+
 
 app.put('/accounts/:id', authMiddleware, async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -2155,38 +2344,329 @@ app.post('/api/invoices/:id/send-pdf-email', authMiddleware, async (req: Request
     }
 });
 
+// --- Journal Entry helper (single source of truth) ---
+//type JELine = { account_id: number; debit?: number; credit?: number };
+
+/**
+ * Inserts a balanced journal entry with the given lines.
+ * - Validates each line has exactly one positive side (debit XOR credit).
+ * - Validates total debits == total credits (to 2 decimals) before inserting.
+ * - Inserts entry header, then all lines, then rechecks in SQL.
+ * Assumes tables: public.journal_entries(id,user_id,entry_date,description),
+ *                 public.journal_lines(entry_id,user_id,account_id,debit,credit).
+ */
+// ---- Balanced JE helper ----
 type JELine = { account_id: number; debit?: number; credit?: number };
 
 async function postJournalEntry(
-  client: any,
+  client: any,                   // pg PoolClient
   userId: string,
-  entry_date: string,  // 'YYYY-MM-DD'
-  memo: string,
-  lines: JELine[]
-) {
-  const d = (n?: number) => Number(n ?? 0);
-  const totalDebit  = lines.reduce((s,l)=>s + d(l.debit), 0);
-  const totalCredit = lines.reduce((s,l)=>s + d(l.credit), 0);
-  if (Math.abs(totalDebit - totalCredit) > 0.005) {
-    throw new Error(`Unbalanced JE: debit=${totalDebit} credit=${totalCredit}`);
+  entryDate: string,             // 'YYYY-MM-DD'
+  memo: string,                  // <-- DB column is `memo`
+  lines: JELine[],
+  source: string = 'api'         // optional, goes to journal_entries.source
+): Promise<number> {
+  if (!Array.isArray(lines) || lines.length < 2) {
+    throw new Error('postJournalEntry: need at least 2 lines.');
   }
 
+  // normalize/validate lines
+  const norm = lines.map((ln, i) => {
+    const d = Number(ln.debit ?? 0);
+    const c = Number(ln.credit ?? 0);
+    if (!(d > 0 || c > 0)) throw new Error(`JE line ${i+1}: debit or credit must be > 0`);
+    if (d > 0 && c > 0)    throw new Error(`JE line ${i+1}: cannot have both debit and credit`);
+    return {
+      account_id: Number(ln.account_id),
+      debit:  +d.toFixed(2),
+      credit: +c.toFixed(2),
+    };
+  });
+
+  const totalD = +norm.reduce((s,l)=>s+l.debit,0).toFixed(2);
+  const totalC = +norm.reduce((s,l)=>s+l.credit,0).toFixed(2);
+  const delta  = +(totalD - totalC).toFixed(2);
+  if (Math.abs(delta) > 0.01) {
+    throw new Error(`postJournalEntry: unbalanced before insert (Δ=${delta.toFixed(2)})`);
+  }
+
+  // 1) header -> uses `memo` (and optional `source`)
   const je = await client.query(
-    `INSERT INTO public.journal_entries (user_id, entry_date, memo)
-     VALUES ($1,$2,$3) RETURNING id`,
-    [userId, entry_date, memo || null]
+    `INSERT INTO public.journal_entries (user_id, entry_date, memo, "source")
+     VALUES ($1, $2::date, $3, $4) RETURNING id`,
+    [userId, entryDate, memo || null, source || null]
   );
   const entryId = je.rows[0].id;
 
-  for (const l of lines) {
-    await client.query(
-      `INSERT INTO public.journal_lines (entry_id, account_id, debit, credit, user_id)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [entryId, l.account_id, d(l.debit), d(l.credit), userId]
-    );
+  // 2) lines (user_id must match header due to FK)
+  const valuesSql: string[] = [];
+  const params: any[] = [];
+  norm.forEach((l, i) => {
+    const b = i*5;
+    valuesSql.push(`($${b+1}, $${b+2}, $${b+3}, $${b+4}, $${b+5})`);
+    params.push(userId, entryId, l.account_id, l.debit, l.credit);
+  });
+  await client.query(
+    `INSERT INTO public.journal_lines (user_id, entry_id, account_id, debit, credit)
+     VALUES ${valuesSql.join(',')}`,
+    params
+  );
+
+  // 3) sanity check (your trigger will also enforce this)
+  const chk = await client.query(
+    `SELECT COALESCE(SUM(debit),0)::numeric(18,2) d, COALESCE(SUM(credit),0)::numeric(18,2) c
+       FROM public.journal_lines
+      WHERE user_id=$1 AND entry_id=$2`,
+    [userId, entryId]
+  );
+  const d = Number(chk.rows[0].d || 0);
+  const c = Number(chk.rows[0].c || 0);
+  if (Math.abs(d - c) > 0.01) {
+    throw new Error(`postJournalEntry: unbalanced after insert (Δ=${(d-c).toFixed(2)})`);
   }
+
   return entryId;
 }
+
+
+
+function endOfMonth(d: Date)   { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
+function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+
+function monthsInclusive(startDate: Date, endDate: Date) {
+  // counts full calendar months from startMonth to endMonth inclusive
+  const s = startOfMonth(startDate);
+  const e = startOfMonth(endDate);
+  const m = (e.getFullYear() - s.getFullYear()) * 12 + (e.getMonth() - s.getMonth()) + 1;
+  return Math.max(0, m);
+}
+
+// Month-based straight-line depreciation, capped to remaining depreciable base
+function calcStraightLineForPeriod(
+  cost: number,
+  salvageValue: number,
+  usefulLifeYears: number,
+  accumulatedToDate: number,
+  periodStart: Date,
+  periodEnd: Date
+) {
+  if (!usefulLifeYears || usefulLifeYears <= 0) return 0;
+  const base = Math.max(0, Number(cost) - Number(salvageValue || 0));
+  const remaining = Math.max(0, base - Number(accumulatedToDate || 0));
+  if (remaining <= 0) return 0;
+
+  const months = monthsInclusive(periodStart, periodEnd);
+  if (months <= 0) return 0;
+
+  const monthly = base / (usefulLifeYears * 12);
+  const amount = Math.min(remaining, monthly * months);
+  return Math.round(amount * 100) / 100; // 2dp
+}
+
+// Runs depreciation for all eligible assets up to endDate (inclusive, normalized to month-end).
+// Idempotent via last_depreciation_date (only posts NEW months).
+async function runDepreciationForUser(client: any, user_id: string, endDateISO: string) {
+  const calculationEndDate = endOfMonth(new Date(endDateISO)); // normalize to month end
+  const endISO = calculationEndDate.toISOString().slice(0, 10);
+
+  // ── 1) Required accounts ─────────────────────────────────────────────────────
+  // Depreciation Expense (prefer exact name if present)
+  const expenseAccountRes = await client.query(
+    `SELECT id
+       FROM public.accounts
+      WHERE user_id = $1
+        AND (name ILIKE 'Depreciation Expense' OR name ILIKE 'Other Expenses')
+      ORDER BY (name ILIKE 'Depreciation Expense') DESC
+      LIMIT 1`,
+    [user_id]
+  );
+  if (!expenseAccountRes.rows.length) {
+    throw new Error('No depreciation expense account for this user.');
+  }
+  const depExpenseId: number = Number(expenseAccountRes.rows[0].id);
+
+  // Make sure the expense account is mapped (→ income_statement / operating_expenses)
+  await ensureAccountReportingCategory(client, user_id, depExpenseId);
+
+  // Accumulated Depreciation (contra asset). Create if missing and map to BS/non_current_assets.
+  let accDepId: number;
+  const accDepRes = await client.query(
+    `SELECT id
+       FROM public.accounts
+      WHERE user_id = $1 AND name ILIKE 'Accumulated Depreciation%'
+      LIMIT 1`,
+    [user_id]
+  );
+
+  if (!accDepRes.rows.length) {
+    // reporting_categories use lower-case in your DB
+    const rcId = await ensureReportingCategoryId(client, 'balance_sheet', 'non_current_assets');
+
+const created = await client.query(
+  `INSERT INTO public.accounts
+     (user_id, code, name, type, normal_side, reporting_category_id, is_postable, is_active)
+   VALUES ($1, $2, $3, $4, $5, $6, TRUE, TRUE)
+   RETURNING id`,
+  [user_id, '1700', 'Accumulated Depreciation', 'Asset', 'Debit', rcId]
+);
+
+    accDepId = Number(created.rows[0].id);
+  } else {
+    accDepId = Number(accDepRes.rows[0].id);
+    // Ensure mapping in case the account exists but isn't categorized
+    await ensureAccountReportingCategory(client, user_id, accDepId);
+  }
+
+  // ── 2) Assets needing catch-up to end date ───────────────────────────────────
+  const assetsResult = await client.query(
+    `SELECT id, name, cost, useful_life_years, salvage_value,
+            date_received, accumulated_depreciation, last_depreciation_date
+       FROM public.assets
+      WHERE user_id = $1
+        AND depreciation_method = 'straight-line'
+        AND useful_life_years IS NOT NULL AND useful_life_years > 0
+        AND (last_depreciation_date IS NULL OR last_depreciation_date < $2::date)
+      ORDER BY date_received`,
+    [user_id, endISO]
+  );
+
+  const results: Array<{ assetId: number; amount: number; entryId: number; transactionId: number | null }> = [];
+  let total = 0;
+
+  for (const a of assetsResult.rows) {
+    const cost = Number(a.cost);
+    const salvage = Number(a.salvage_value || 0);
+    const lifeY = Number(a.useful_life_years);
+    const accToDate = Number(a.accumulated_depreciation || 0);
+
+    const received = new Date(a.date_received);
+    const last = a.last_depreciation_date ? new Date(a.last_depreciation_date) : null;
+
+    // start from next month after last run, or from the asset month
+    const start = last ? new Date(last.getFullYear(), last.getMonth() + 1, 1) : startOfMonth(received);
+
+    // stop at useful life end
+    const lifeEnd = endOfMonth(new Date(received.getFullYear() + lifeY, received.getMonth(), 1));
+    const effectiveEnd = calculationEndDate <= lifeEnd ? calculationEndDate : lifeEnd;
+
+    if (start > effectiveEnd) continue;
+
+    const amount = calcStraightLineForPeriod(cost, salvage, lifeY, accToDate, start, effectiveEnd);
+    if (amount <= 0) continue;
+
+    const depDateISO = effectiveEnd.toISOString().slice(0, 10);
+
+    // 2.1 Update asset summary
+    await client.query(
+      `UPDATE public.assets
+          SET accumulated_depreciation = accumulated_depreciation + $1,
+              last_depreciation_date   = $2
+        WHERE id = $3 AND user_id = $4`,
+      [amount, depDateISO, a.id, user_id]
+    );
+
+    // 2.2 Post JE (Dr expense / Cr accumulated depreciation)
+    const entryId = await postJournalEntry(
+      client,
+      user_id,
+      depDateISO,
+      `Depreciation for ${a.name} (asset ${a.id})`,
+      [
+        { account_id: depExpenseId, debit: amount },
+        { account_id: accDepId, credit: amount }
+      ]
+    );
+
+    // 2.3 Optional: keep your transactions table in sync (if present)
+    let transactionId: number | null = null;
+    try {
+      const t = await client.query(
+        `INSERT INTO public.transactions (type, amount, description, date, category, account_id, user_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         RETURNING id`,
+        [
+          'expense',
+          amount,
+          `Depreciation Expense for ${a.name} (asset ${a.id})`,
+          depDateISO,
+          'Depreciation Expense',
+          depExpenseId,
+          user_id
+        ]
+      );
+      transactionId = Number(t.rows[0].id);
+    } catch {
+      // ignore if you don't use the transactions table
+    }
+
+    // 2.4 Detail row (if you have the table)
+    try {
+      await client.query(
+        `INSERT INTO public.depreciation_entries (asset_id, depreciation_date, amount, transaction_id, user_id)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [a.id, depDateISO, amount, transactionId, user_id]
+      );
+    } catch {
+      // ignore if table is absent
+    }
+
+    total += amount;
+    results.push({ assetId: Number(a.id), amount, entryId: Number(entryId), transactionId });
+  }
+
+  return { total, results };
+}
+
+const calculateDepreciation = (
+  cost: number,
+  salvageValue: number,
+  usefulLifeYears: number,
+  startDate: Date,
+  endDate: Date
+): number => {
+  if (usefulLifeYears <= 0) return 0;
+
+  const depreciableBase = cost - salvageValue;
+  const annualDepreciation = depreciableBase / usefulLifeYears;
+  const monthlyDepreciation = annualDepreciation / 12;
+
+  // Calculate number of months in the period
+  let monthsToDepreciate = 0;
+  let currentMonth = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+
+  while (currentMonth <= endDate) {
+    monthsToDepreciate++;
+    currentMonth.setMonth(currentMonth.getMonth() + 1);
+  }
+
+  return monthlyDepreciation * monthsToDepreciate;
+};
+
+
+// POST /api/depreciation/run  { endDate: 'YYYY-MM-DD' }
+app.post('/api/depreciation/run', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.parent_user_id;
+  const { endDate } = req.body;
+  if (!endDate) return res.status(400).json({ error: 'endDate is required' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const out = await runDepreciationForUser(client, user_id, endDate);
+    await client.query('COMMIT');
+    res.json({
+      message: 'Depreciation posted.',
+      totalDepreciationExpense: out.total,
+      depreciatedAssets: out.results
+    });
+  } catch (e:any) {
+    await client.query('ROLLBACK');
+    console.error('Error running depreciation:', e);
+    res.status(500).json({ error: 'Failed to run depreciation', detail: e.message ?? String(e) });
+  } finally {
+    client.release();
+  }
+});
 
 
 
@@ -2240,74 +2720,159 @@ app.get('/assets', authMiddleware, async (req: Request, res: Response) => { // A
   }
 });
 
+// CREATE ASSET + OPTIONAL CAPITALIZATION JE
+// CREATE ASSET + OPTIONAL CAPITALIZATION JE
 app.post('/assets', authMiddleware, async (req: Request, res: Response) => {
   const {
     type, name, number, cost, date_received, account_id,
     depreciation_method, useful_life_years, salvage_value,
-    paid_from_account_id,             // NEW optional (bank/cash account id)
-    financed_liability_account_id     // NEW optional (loan/AP account id)
+    paid_from_account_id,             // optional (bank/cash)
+    financed_liability_account_id     // optional (loan/AP)
   } = req.body;
 
   const user_id = req.user!.parent_user_id;
 
+  // Basic required fields
   if (!type || !name || cost == null || !date_received || !account_id) {
     return res.status(400).json({ error: 'Missing required asset fields: type, name, cost, date_received, account_id' });
+  }
+
+  // Disallow both funding options at the same time
+  if (paid_from_account_id && financed_liability_account_id) {
+    return res.status(400).json({ error: 'Choose either paid_from_account_id OR financed_liability_account_id (not both).' });
+  }
+
+  // If depreciation method is provided, require a sensible useful life
+  if (depreciation_method && depreciation_method !== 'straight-line') {
+    return res.status(400).json({ error: 'Only straight-line depreciation is supported right now.' });
+  }
+  if (depreciation_method && (!useful_life_years || Number(useful_life_years) <= 0)) {
+    return res.status(400).json({ error: 'useful_life_years must be > 0 when depreciation_method is set.' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1) insert asset record as before
+    // 0) Validate the asset account belongs to the same user and is an Asset
+    const assetAccQ = await client.query(
+      `SELECT id, name, type FROM public.accounts WHERE user_id = $1 AND id = $2 LIMIT 1`,
+      [user_id, Number(account_id)]
+    );
+    if (!assetAccQ.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Asset account not found for this user.' });
+    }
+    if (assetAccQ.rows[0].type !== 'Asset') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'account_id must be an Asset account.' });
+    }
+
+    // 1) Validate optional credit side
+    let creditAccountId: number | null = null;
+    if (paid_from_account_id) {
+      const bankQ = await client.query(
+        `SELECT id, type FROM public.accounts WHERE user_id = $1 AND id = $2 LIMIT 1`,
+        [user_id, Number(paid_from_account_id)]
+      );
+      if (!bankQ.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'paid_from_account_id not found for this user.' });
+      }
+      if (bankQ.rows[0].type !== 'Asset') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'paid_from_account_id must be an Asset (cash/bank) account.' });
+      }
+      creditAccountId = Number(bankQ.rows[0].id);
+    } else if (financed_liability_account_id) {
+      const liabQ = await client.query(
+        `SELECT id, type FROM public.accounts WHERE user_id = $1 AND id = $2 LIMIT 1`,
+        [user_id, Number(financed_liability_account_id)]
+      );
+      if (!liabQ.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'financed_liability_account_id not found for this user.' });
+      }
+      if (liabQ.rows[0].type !== 'Liability') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'financed_liability_account_id must be a Liability account.' });
+      }
+      creditAccountId = Number(liabQ.rows[0].id);
+    } else {
+      // fallback: credit Opening Balance Equity so the asset still hits the BS
+      creditAccountId = await getOrCreateOBE(client, user_id);
+    }
+
+    // 2) Insert asset record
     const insert = await client.query(
-      `INSERT INTO assets (
-        type, name, number, cost, date_received, account_id,
-        depreciation_method, useful_life_years, salvage_value,
-        accumulated_depreciation, last_depreciation_date, user_id
+      `INSERT INTO public.assets (
+         type, name, number, cost, date_received, account_id,
+         depreciation_method, useful_life_years, salvage_value,
+         accumulated_depreciation, last_depreciation_date, user_id
        )
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        RETURNING id`,
       [
-        type, name, number || null, cost, date_received, account_id,
-        depreciation_method || null, useful_life_years || null, salvage_value || null,
-        0, null, user_id
+        String(type),
+        String(name),
+        number || null,
+        Number(cost),
+        date_received,                // 'YYYY-MM-DD'
+        Number(account_id),
+        depreciation_method || null,
+        useful_life_years ? Number(useful_life_years) : null,
+        salvage_value == null ? null : Number(salvage_value),
+        0,                            // accumulated_depreciation
+        null,                         // last_depreciation_date
+        user_id
       ]
     );
     const assetId = insert.rows[0].id;
 
-    // 2) OPTIONAL capitalization JE: Dr Asset / Cr Bank OR Cr Liability
-    const creditAccountId = paid_from_account_id || financed_liability_account_id;
-    if (creditAccountId) {
-      await postJournalEntry(
-        client, user_id, date_received,
-        `Capitalize asset: ${name} (#${assetId})`,
-        [
-          { account_id: Number(account_id),      debit:  Number(cost) },
-          { account_id: Number(creditAccountId), credit: Number(cost) }
-        ]
-      );
-    }
+    // 3) Ensure reporting categories on both sides so BS picks it up
+    await ensureAccountReportingCategory(client, user_id, Number(account_id));
+    await ensureAccountReportingCategory(client, user_id, Number(creditAccountId));
+
+    // 4) Capitalization JE (Dr Asset / Cr Cash | Loan | OBE)
+    const journal_entry_id = await postJournalEntry(
+      client,
+      user_id,
+      date_received,
+      `Capitalize asset: ${name} (#${assetId})`,
+      [
+        { account_id: Number(account_id),  debit:  Number(cost) },
+        { account_id: Number(creditAccountId), credit: Number(cost) }
+      ]
+    );
 
     await client.query('COMMIT');
 
-    const fullAsset = await client.query(`
-      SELECT a.id,a.type,a.name,a.number,a.cost,a.date_received,a.account_id,acc.name AS account_name,
-             a.depreciation_method,a.useful_life_years,a.salvage_value,a.accumulated_depreciation,a.last_depreciation_date
-      FROM assets a
-      JOIN accounts acc ON a.account_id = acc.id
-      WHERE a.id = $1 AND a.user_id = $2`,
+    // 5) Return the new asset (with account_name) + JE id
+    const fullAsset = await client.query(
+      `SELECT a.id,a.type,a.name,a.number,a.cost,a.date_received,a.account_id,acc.name AS account_name,
+              a.depreciation_method,a.useful_life_years,a.salvage_value,
+              a.accumulated_depreciation,a.last_depreciation_date
+         FROM public.assets a
+         JOIN public.accounts acc ON a.account_id = acc.id
+        WHERE a.id = $1 AND a.user_id = $2`,
       [assetId, user_id]
     );
 
-    res.json(fullAsset.rows[0]);
+    return res.status(201).json({
+      ...fullAsset.rows[0],
+      journal_entry_id
+    });
   } catch (error:any) {
     await client.query('ROLLBACK');
     console.error('Error adding asset:', error);
-    res.status(500).json({ error: 'Failed to add asset', detail: error.message ?? String(error) });
+    return res.status(500).json({ error: 'Failed to add asset', detail: error.message ?? String(error) });
   } finally {
     client.release();
   }
 });
+
+
+
 
 
 app.put('/assets/:id', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
@@ -2374,170 +2939,14 @@ app.delete('/assets/:id', authMiddleware, async (req: Request, res: Response) =>
 
 
 /* --- Depreciation API --- */
+// ===== Depreciation + Journal helpers =====
+
 
 
 
 // Helper function to calculate straight-line depreciation for a period
-const calculateDepreciation = (
-  cost: number,
-  salvageValue: number,
-  usefulLifeYears: number,
-  startDate: Date,
-  endDate: Date
-): number => {
-  if (usefulLifeYears <= 0) return 0;
-
-  const depreciableBase = cost - salvageValue;
-  const annualDepreciation = depreciableBase / usefulLifeYears;
-  const monthlyDepreciation = annualDepreciation / 12;
-
-  // Calculate number of months in the period
-  let monthsToDepreciate = 0;
-  let currentMonth = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
-
-  while (currentMonth <= endDate) {
-    monthsToDepreciate++;
-    currentMonth.setMonth(currentMonth.getMonth() + 1);
-  }
-
-  return monthlyDepreciation * monthsToDepreciate;
-};
 
 
-app.post('/api/depreciation/run', authMiddleware, async (req: Request, res: Response) => { // ADDED authMiddleware
-  const { endDate } = req.body; // endDate: The date up to which depreciation should be calculated
-  const user_id = req.user!.parent_user_id; // Get user_id from req.user
-
-  if (!endDate) {
-    return res.status(400).json({ error: 'endDate is required for depreciation calculation.' });
-  }
-
-  const calculationEndDate = new Date(endDate);
-  const client = await pool.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    // Fetch all assets that are depreciable and haven't been depreciated up to the endDate
-    const assetsResult = await client.query(`
-      SELECT
-        id, cost, useful_life_years, salvage_value, date_received, accumulated_depreciation, last_depreciation_date
-      FROM assets
-      WHERE
-        user_id = $1 AND -- ADDED user_id filter
-        depreciation_method = 'straight-line' AND useful_life_years IS NOT NULL AND useful_life_years > 0
-        AND (last_depreciation_date IS NULL OR last_depreciation_date < $2)
-    `, [user_id, calculationEndDate.toISOString().split('T')[0]]); // Compare only date part
-
-    const depreciatedAssets: { assetId: number; amount: number; transactionId: number }[] = [];
-    let totalDepreciationExpense = 0;
-    let defaultExpenseAccountId: number | null = null;
-
-    // Try to find a suitable account for depreciation expense (e.g., 'Depreciation Expense' or 'Other Expenses')
-    const expenseAccountResult = await client.query(
-      `SELECT id FROM accounts WHERE (name ILIKE 'Depreciation Expense' OR name ILIKE 'Other Expenses') AND user_id = $1 LIMIT 1`, // ADDED user_id filter
-      [user_id]
-    );
-    if (expenseAccountResult.rows.length > 0) {
-      defaultExpenseAccountId = expenseAccountResult.rows[0].id;
-    } else {
-      await client.query('ROLLBACK');
-      return res.status(500).json({ error: 'Could not find a suitable expense account for depreciation for this user.' });
-    }
-
-    for (const asset of assetsResult.rows) {
-      const assetCost = parseFloat(asset.cost);
-      const assetSalvageValue = parseFloat(asset.salvage_value || 0);
-      const assetUsefulLifeYears = parseInt(asset.useful_life_years, 10);
-      const assetDateReceived = new Date(asset.date_received);
-      const assetLastDepreciationDate = asset.last_depreciation_date ? new Date(asset.last_depreciation_date) : null;
-
-      // Determine the start date for this depreciation calculation
-      // It's either the day after last_depreciation_date, or date_received if no prior depreciation
-      let depreciationStartDate = assetLastDepreciationDate
-        ? new Date(assetLastDepreciationDate.getFullYear(), assetLastDepreciationDate.getMonth(), assetLastDepreciationDate.getDate() + 1)
-        : assetDateReceived;
-
-      // Ensure depreciation doesn't start before the asset was received
-      if (depreciationStartDate < assetDateReceived) {
-        depreciationStartDate = assetDateReceived;
-      }
-
-      // Ensure we don't depreciate beyond the useful life
-      const usefulLifeEndDate = new Date(assetDateReceived.getFullYear() + assetUsefulLifeYears, assetDateReceived.getMonth(), assetDateReceived.getDate());
-      if (depreciationStartDate >= usefulLifeEndDate) {
-          console.log(`Asset ${asset.id} has reached end of useful life or already fully depreciated.`);
-          continue; // Skip if already fully depreciated or beyond useful life
-      }
-
-      // Adjust calculationEndDate if it's beyond the useful life end date
-      let effectiveCalculationEndDate = calculationEndDate;
-      if (effectiveCalculationEndDate > usefulLifeEndDate) {
-          effectiveCalculationEndDate = usefulLifeEndDate;
-      }
-
-      // Calculate depreciation only if the period is valid
-      if (depreciationStartDate <= effectiveCalculationEndDate) {
-        const depreciationAmount = calculateDepreciation(
-          assetCost,
-          assetSalvageValue,
-          assetUsefulLifeYears,
-          depreciationStartDate,
-          effectiveCalculationEndDate
-        );
-
-        if (depreciationAmount > 0) {
-          // 1. Update accumulated_depreciation on the asset
-          const newAccumulatedDepreciation = parseFloat(asset.accumulated_depreciation) + depreciationAmount;
-          await client.query(
-            `UPDATE assets SET accumulated_depreciation = $1, last_depreciation_date = $2 WHERE id = $3 AND user_id = $4`, // ADDED user_id filter
-            [newAccumulatedDepreciation, effectiveCalculationEndDate.toISOString().split('T')[0], asset.id, user_id]
-          );
-
-          // 2. Create a transaction for depreciation expense
-          const transactionResult = await client.query(
-            `INSERT INTO transactions (type, amount, description, date, category, account_id, user_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, // ADDED user_id
-            [
-              'expense',
-              depreciationAmount,
-              `Depreciation Expense for ${asset.name} (ID: ${asset.id})`,
-              effectiveCalculationEndDate.toISOString().split('T')[0], // Use end date of calculation period
-              'Depreciation Expense', // Use a specific category for depreciation
-              defaultExpenseAccountId, // Link to a general expense account
-              user_id // ADDED user_id
-            ]
-          );
-          const transactionId = transactionResult.rows[0].id;
-
-          // 3. Record the depreciation entry
-          await client.query(
-            `INSERT INTO depreciation_entries (asset_id, depreciation_date, amount, transaction_id, user_id)
-             VALUES ($1, $2, $3, $4, $5)`, // ADDED user_id
-            [asset.id, effectiveCalculationEndDate.toISOString().split('T')[0], depreciationAmount, transactionId, user_id]
-          );
-
-          totalDepreciationExpense += depreciationAmount;
-          depreciatedAssets.push({ assetId: asset.id, amount: depreciationAmount, transactionId: transactionId });
-        }
-      }
-    }
-
-    await client.query('COMMIT');
-    res.json({
-      message: 'Depreciation calculated and recorded successfully.',
-      totalDepreciationExpense: totalDepreciationExpense,
-      depreciatedAssets: depreciatedAssets
-    });
-
-  } catch (error: unknown) {
-    await client.query('ROLLBACK');
-    console.error('Error running depreciation:', error);
-    res.status(500).json({ error: 'Failed to run depreciation', detail: error instanceof Error ? error.message : String(error) });
-  } finally {
-    client.release();
-  }
-});
 
 
 /* --- Expenses API --- */
@@ -7962,10 +8371,10 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
             }
 
             // Add Company Info (aligned to the left)
-            doc.fontSize(16).font('Helvetica-Bold').text(companyName, 50, y); // Align left
+            doc.fontSize(16).font('Helvetica-Bold').fillColor('#2563eb').text(companyName, 50, y); // Blue color
             y += 20;
             if (companyFullAddress) {
-                doc.fontSize(10).font('Helvetica').text(companyFullAddress, 50, y);
+                doc.fontSize(10).font('Helvetica').fillColor('black').text(companyFullAddress, 50, y);
                 y += 15;
             }
             // Optional: Add Phone, Email, VAT, Reg if desired
@@ -7985,8 +8394,8 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
                 y += 15;
             }
 
-            // Draw a line separator
-            doc.moveTo(50, y).lineTo(rightAlign, y).stroke();
+            // Draw a colored line separator
+            doc.moveTo(50, y).lineTo(rightAlign, y).strokeColor('#2563eb').stroke(); // Blue line
             doc.moveDown(1); // Add space after header
         };
 
@@ -7995,9 +8404,18 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
 
         // --- Add Content to PDF based on documentType ---
         if (documentType === 'income-statement') {
-            doc.fontSize(18).font('Helvetica-Bold').text('Income Statement', { align: 'center' });
-            doc.fontSize(12).font('Helvetica').text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
+            doc.fontSize(20).font('Helvetica-Bold').fillColor('#1e40af').text('Income Statement', { align: 'center' }); // Darker blue
+            doc.fontSize(12).font('Helvetica').fillColor('black').text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
             doc.moveDown();
+
+            // Define colors for sections
+            const sectionColors: Record<string, string> = {
+                'revenue': '#10b981', // Emerald Green
+                'other_income': '#34d399', // Light Emerald
+                'cost_of_goods_sold': '#ef4444', // Red
+                'operating_expenses': '#f97316', // Orange
+                'other_expenses': '#fb923c' // Light Orange
+            };
 
             const sectionsToPrint = [
                 { id: 'revenue', title: 'Revenue' },
@@ -8007,7 +8425,6 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
                 { id: 'other_expenses', title: 'Other Expenses' },
             ];
 
-            // Re-calculate totals more explicitly for clarity
             let totalRevenue = 0;
             let totalExpenses = 0;
 
@@ -8015,13 +8432,14 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
                 const sectionData = reportData.sections.find((s: any) => s.section === sectionMeta.id);
 
                 if (sectionData) {
-                    doc.fontSize(14).font('Helvetica-Bold').text(sectionMeta.title).moveDown(0.5);
+                    const color = sectionColors[sectionMeta.id] || 'black';
+                    doc.fontSize(14).font('Helvetica-Bold').fillColor(color).text(sectionMeta.title).moveDown(0.5);
 
                     sectionData.accounts.forEach((account: any) => {
-                        doc.fontSize(12).font('Helvetica').text(`  ${account.name}`).text(formatCurrency(account.amount), { align: 'right' });
+                        doc.fontSize(12).font('Helvetica').fillColor('black').text(`  ${account.name}`);
+                        doc.text(formatCurrency(account.amount), { align: 'right' });
                     });
 
-                    // Add to appropriate total (expenses are already negative in calculation)
                     if (['revenue', 'other_income'].includes(sectionMeta.id)) {
                         totalRevenue += sectionData.amount;
                     } else {
@@ -8030,38 +8448,42 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
 
                     doc.moveDown(0.5);
                     const subtotalLabel = `Total ${sectionMeta.title}`;
-                    doc.fontSize(12).font('Helvetica').text(subtotalLabel).text(formatCurrency(sectionData.amount), { align: 'right' }).moveDown();
+                    doc.fontSize(12).font('Helvetica-Bold').fillColor(color).text(subtotalLabel);
+                    doc.text(formatCurrency(sectionData.amount), { align: 'right' }).moveDown();
                 }
             });
 
-            // The net profit is the total revenue minus the total expenses
-            const netProfitLoss = totalRevenue - totalExpenses; // Expenses are negative, so subtraction adds them correctly
+            const netProfitLoss = totalRevenue - totalExpenses;
+            const netColor = netProfitLoss >= 0 ? '#10b981' : '#ef4444'; // Green for profit, Red for loss
 
-            doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).stroke().moveDown(0.5);
-            doc.fontSize(14).font('Helvetica-Bold').text(`${netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period'}`).text(formatCurrency(Math.abs(netProfitLoss)), { align: 'right' });
+            doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).strokeColor('#d1d5db').stroke().moveDown(0.5); // Light gray line
+            doc.fontSize(16).font('Helvetica-Bold').fillColor(netColor).text(`${netProfitLoss >= 0 ? 'NET PROFIT for the period' : 'NET LOSS for the period'}`);
+            doc.text(formatCurrency(Math.abs(netProfitLoss)), { align: 'right' });
         }
         else if (documentType === 'balance-sheet') {
             const totalAssets = (reportData.assets.current || 0) + (reportData.assets.non_current || 0);
             const totalLiabilities = (reportData.liabilities.current || 0) + (reportData.liabilities.non_current || 0);
             const totalEquityAndLiabilities = totalLiabilities + reportData.closingEquity;
 
-            doc.fontSize(18).font('Helvetica-Bold').text('Balance Sheet', { align: 'center' });
-            doc.fontSize(12).font('Helvetica').text(`As of ${formatDate(reportData.asOf)}`, { align: 'center' });
+            doc.fontSize(20).font('Helvetica-Bold').fillColor('#1e40af').text('Balance Sheet', { align: 'center' });
+            doc.fontSize(12).font('Helvetica').fillColor('black').text(`As of ${formatDate(reportData.asOf)}`, { align: 'center' });
             doc.moveDown();
 
-            doc.fontSize(14).font('Helvetica-Bold').text('ASSETS');
+            // Assets Section
+            doc.fontSize(14).font('Helvetica-Bold').fillColor('#2563eb').text('ASSETS');
             doc.moveDown(0.5);
-            doc.fontSize(12).font('Helvetica').text(`  Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' });
+            doc.fontSize(12).font('Helvetica').fillColor('black').text(`  Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' });
             doc.text(`Total Current Assets`).text(formatCurrency(reportData.assets.current), { align: 'right' }).moveDown(0.5);
 
             doc.text(`  Non-current Assets`).text(formatCurrency(reportData.assets.non_current), { align: 'right' });
             doc.text(`Total Non-Current Assets`).text(formatCurrency(reportData.assets.non_current), { align: 'right' }).moveDown(0.5);
 
-            doc.fontSize(14).font('Helvetica-Bold').text(`TOTAL ASSETS`).text(formatCurrency(totalAssets), { align: 'right' }).moveDown();
+            doc.fontSize(14).font('Helvetica-Bold').fillColor('#10b981').text(`TOTAL ASSETS`).text(formatCurrency(totalAssets), { align: 'right' }).moveDown();
 
-            doc.fontSize(14).font('Helvetica-Bold').text('EQUITY AND LIABILITIES');
+            // Equity and Liabilities Section
+            doc.fontSize(14).font('Helvetica-Bold').fillColor('#2563eb').text('EQUITY AND LIABILITIES');
             doc.moveDown(0.5);
-            doc.fontSize(12).font('Helvetica').text(`  Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' });
+            doc.fontSize(12).font('Helvetica').fillColor('black').text(`  Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' });
             doc.text(`Total Current Liabilities`).text(formatCurrency(reportData.liabilities.current), { align: 'right' }).moveDown(0.5);
 
             doc.text(`  Non-Current Liabilities`).text(formatCurrency(reportData.liabilities.non_current), { align: 'right' });
@@ -8069,31 +8491,39 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
 
             doc.text(`TOTAL LIABILITIES`).text(formatCurrency(totalLiabilities), { align: 'right' }).moveDown(0.5);
 
-            doc.fontSize(12).font('Helvetica').text(`  Equity`);
+            doc.fontSize(12).font('Helvetica').fillColor('black').text(`  Equity`);
             doc.text(`    Opening Balance`).text(formatCurrency(reportData.openingEquity), { align: 'right' });
-            doc.text(`    ${reportData.netProfitLoss >= 0 ? 'Net Profit for Period' : 'Net Loss for Period'}`).text(formatCurrency(Math.abs(reportData.netProfitLoss)), { align: 'right' });
-            doc.text(`TOTAL EQUITY`).text(formatCurrency(reportData.closingEquity), { align: 'right' }).moveDown(0.5);
+            const profitColor = reportData.netProfitLoss >= 0 ? '#10b981' : '#ef4444';
+            doc.fillColor(profitColor).text(`    ${reportData.netProfitLoss >= 0 ? 'Net Profit for Period' : 'Net Loss for Period'}`).text(formatCurrency(Math.abs(reportData.netProfitLoss)), { align: 'right' });
+            doc.fillColor('#10b981').text(`TOTAL EQUITY`).text(formatCurrency(reportData.closingEquity), { align: 'right' }).moveDown(0.5);
 
-            doc.fontSize(14).font('Helvetica-Bold').text(`TOTAL EQUITY AND LIABILITIES`).text(formatCurrency(totalEquityAndLiabilities), { align: 'right' });
+            doc.fontSize(14).font('Helvetica-Bold').fillColor('#10b981').text(`TOTAL EQUITY AND LIABILITIES`).text(formatCurrency(totalEquityAndLiabilities), { align: 'right' });
         }
         else if (documentType === 'cash-flow-statement') {
-            doc.fontSize(18).font('Helvetica-Bold').text('Cash Flow Statement', { align: 'center' });
-            doc.fontSize(12).font('Helvetica').text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
+            doc.fontSize(20).font('Helvetica-Bold').fillColor('#1e40af').text('Cash Flow Statement', { align: 'center' });
+            doc.fontSize(12).font('Helvetica').fillColor('black').text(`For the period ${formatDate(reportData.period.start)} to ${formatDate(reportData.period.end)}`, { align: 'center' });
             doc.moveDown();
 
             let netChange = 0;
             const categories = ['operating', 'investing', 'financing'];
+            const categoryColors: Record<string, string> = {
+                'operating': '#2563eb', // Blue
+                'investing': '#f97316', // Orange
+                'financing': '#8b5cf6'  // Violet
+            };
 
             categories.forEach(cat => {
                 const itemsRaw = reportData.sections[cat];
                 if (Array.isArray(itemsRaw) && itemsRaw.length > 0) {
-                    doc.fontSize(14).font('Helvetica-Bold').text(`${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`).moveDown(0.5);
+                    const color = categoryColors[cat] || 'black';
+                    doc.fontSize(14).font('Helvetica-Bold').fillColor(color).text(`${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`).moveDown(0.5);
 
                     let sectionTotal = 0;
                     itemsRaw.forEach((item: any) => {
                         const amount = parseFloat(item.amount.toString());
                         sectionTotal += amount;
-                        doc.fontSize(12).font('Helvetica').text(`  ${item.line}`).text(formatCurrency(amount), { align: 'right' });
+                        doc.fontSize(12).font('Helvetica').fillColor('black').text(`  ${item.line}`);
+                        doc.text(formatCurrency(amount), { align: 'right' });
                     });
 
                     netChange += sectionTotal;
@@ -8102,37 +8532,47 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
                         : `Net cash used in ${cat.charAt(0).toUpperCase() + cat.slice(1)} Activities`;
 
                     doc.moveDown(0.5);
-                    doc.fontSize(12).font('Helvetica-Bold').text(subtotalLabel).text(formatCurrency(sectionTotal), { align: 'right' }).moveDown();
+                    doc.fontSize(12).font('Helvetica-Bold').fillColor(color).text(subtotalLabel);
+                    doc.text(formatCurrency(sectionTotal), { align: 'right' }).moveDown();
                 }
             });
 
-            doc.fontSize(14).font('Helvetica-Bold').text('Net Increase / (Decrease) in Cash').text(formatCurrency(netChange), { align: 'right' });
+            const netChangeColor = netChange >= 0 ? '#10b981' : '#ef4444'; // Green for positive, Red for negative
+            doc.fontSize(14).font('Helvetica-Bold').fillColor(netChangeColor).text('Net Increase / (Decrease) in Cash').text(formatCurrency(netChange), { align: 'right' });
         }
         else if (documentType === 'trial-balance') {
-            doc.fontSize(18).font('Helvetica-Bold').text('Trial Balance', { align: 'center' });
-            doc.fontSize(12).font('Helvetica').text(`As of ${formatDate(reportData.period.end)}`, { align: 'center' });
+            doc.fontSize(20).font('Helvetica-Bold').fillColor('#1e40af').text('Trial Balance', { align: 'center' });
+            doc.fontSize(12).font('Helvetica').fillColor('black').text(`As of ${formatDate(reportData.period.end)}`, { align: 'center' });
             doc.moveDown();
 
-            // Table Headers
+            // Table Headers with background and color
             const startX = 50;
             let x = startX;
             const y = doc.y;
             const colWidth = 150;
-            doc.fontSize(12).font('Helvetica-Bold').text('Account', x, y);
+            const headerColor = '#2563eb'; // Blue
+            const headerBgColor = '#dbeafe'; // Light blue background
+
+            // Draw header background
+            doc.rect(startX, y, colWidth * 3, 20).fill(headerBgColor);
+            
+            doc.fontSize(12).font('Helvetica-Bold').fillColor(headerColor).text('Account', x, y + 5);
             x += colWidth;
-            doc.text('Debit', x, y, { width: colWidth, align: 'right' }); // Simplified label
+            doc.text('Debit', x, y + 5, { width: colWidth, align: 'right' });
             x += colWidth;
-            doc.text('Credit', x, y, { width: colWidth, align: 'right' }); // Simplified label
+            doc.text('Credit', x, y + 5, { width: colWidth, align: 'right' });
             doc.moveDown();
 
-            // Underline headers
-            doc.moveTo(startX, doc.y).lineTo(startX + colWidth * 3, doc.y).stroke();
-
             // Table Rows
-            reportData.items.forEach((item: any) => {
+            reportData.items.forEach((item: any, index: number) => {
+                // Alternate row background for better readability
+                if (index % 2 === 0) {
+                    doc.rect(startX, doc.y, colWidth * 3, 15).fill('#f9fafb'); // Very light gray
+                }
+                
                 x = startX;
-                doc.fontSize(10).font('Helvetica');
-                doc.text(`${item.code} - ${item.name}`, x, doc.y);
+                doc.fontSize(10).font('Helvetica').fillColor('black');
+                doc.text(`${item.code} - ${item.name}`, x, doc.y + 2); // Slight vertical offset for text
                 x += colWidth;
                 doc.text(formatCurrency(parseFloat(item.balance_debit)), x, doc.y, { width: colWidth, align: 'right' });
                 x += colWidth;
@@ -8140,20 +8580,22 @@ app.get('/generate-financial-document', authMiddleware, async (req: Request, res
                 doc.moveDown(0.3);
             });
 
-            // Totals Row
+            // Totals Row with emphasis
             x = startX;
-            doc.moveTo(startX, doc.y).lineTo(startX + colWidth * 3, doc.y).stroke(); // Line above totals
-            doc.fontSize(12).font('Helvetica-Bold').text('TOTALS', x, doc.y);
+            // Draw totals background
+            doc.rect(startX, doc.y, colWidth * 3, 20).fill('#dbeafe'); // Light blue background
+            
+            doc.fontSize(12).font('Helvetica-Bold').fillColor(headerColor).text('TOTALS', x, doc.y + 5);
             x += colWidth;
-            doc.text(formatCurrency(reportData.totals.balance_debit), x, doc.y, { width: colWidth, align: 'right' });
+            doc.text(formatCurrency(reportData.totals.balance_debit), x, doc.y + 5, { width: colWidth, align: 'right' });
             x += colWidth;
-            doc.text(formatCurrency(reportData.totals.balance_credit), x, doc.y, { width: colWidth, align: 'right' });
+            doc.text(formatCurrency(reportData.totals.balance_credit), x, doc.y + 5, { width: colWidth, align: 'right' });
         }
 
         // Optional: Add Footer
         const addFooter = () => {
             const bottom = doc.page.height - 50;
-            doc.fontSize(10).font('Helvetica').text(`${companyName} | Generated on ${new Date().toLocaleDateString('en-ZA')}`, 50, bottom, { align: 'center', width: doc.page.width - 100 });
+            doc.fontSize(10).font('Helvetica').fillColor('#6b7280').text(`${companyName} | Generated on ${new Date().toLocaleDateString('en-ZA')}`, 50, bottom, { align: 'center', width: doc.page.width - 100 });
         };
         addFooter();
 
@@ -10443,101 +10885,96 @@ app.delete("/journal-entries/:id", authMiddleware, async (req: Request, res: Res
 
 // Income Statement (by period, indirect signs)
 // GET /reports/income-statement?start=YYYY-MM-DD&end=YYYY-MM-DD
+// Income Statement (by period)
+// GET /reports/income-statement?start=YYYY-MM-DD&end=YYYY-MM-DD[&autoDepreciate=true]
 app.get("/reports/income-statement", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id;
   const start = req.query.start as string;
-  const end = req.query.end as string;
+  const end   = req.query.end   as string;
+  const auto  = String(req.query.autoDepreciate || 'false').toLowerCase() === 'true';
   if (!start || !end) return res.status(400).json({ error: "start & end required" });
 
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query(
+    if (auto) { await client.query('BEGIN'); await runDepreciationForUser(client, userId, end); await client.query('COMMIT'); }
+
+    const { rows } = await client.query(
       `
       SELECT
         a.name AS account_name,
         rc.section AS reporting_section,
         a.normal_side AS normal_side,
         SUM(jl.debit - jl.credit) AS balance
-      FROM
-        public.journal_lines jl
-      JOIN
-        public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
-      JOIN
-        public.accounts a ON a.id = jl.account_id AND a.user_id = jl.user_id
-      JOIN
-        public.reporting_categories rc ON rc.id = a.reporting_category_id
-      WHERE
-        je.user_id = $1
+      FROM public.journal_lines jl
+      JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+      JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
+      JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+      WHERE je.user_id = $1
         AND rc.statement = 'income_statement'
         AND je.entry_date BETWEEN $2::date AND $3::date
-      GROUP BY
-        a.name, rc.section, a.normal_side
-      ORDER BY
-        rc.section, a.name;
+      GROUP BY a.name, rc.section, a.normal_side
+      ORDER BY rc.section, a.name;
       `,
       [userId, start, end]
     );
 
     const sectionMap: Record<string, { section: string; amount: number; accounts: any[] }> = {};
-
     rows.forEach(row => {
       const sectionName = row.reporting_section;
-      if (!sectionMap[sectionName]) {
-        sectionMap[sectionName] = {
-          section: sectionName,
-          amount: 0,
-          accounts: []
-        };
-      }
-      
+      if (!sectionMap[sectionName]) sectionMap[sectionName] = { section: sectionName, amount: 0, accounts: [] };
       const balance = parseFloat(row.balance);
-      const amount = (row.normal_side === 'Credit') ? -balance : balance;
-
+      const amount  = (row.normal_side === 'Credit') ? -balance : balance;
       sectionMap[sectionName].amount += amount;
-      sectionMap[sectionName].accounts.push({
-        name: row.account_name,
-        amount: amount
-      });
+      sectionMap[sectionName].accounts.push({ name: row.account_name, amount });
     });
 
     res.json({ period: { start, end }, sections: Object.values(sectionMap) });
-
   } catch (error) {
     console.error("Error fetching income statement:", error);
     res.status(500).json({ error: "Internal server error" });
+  } finally {
+    client.release();
   }
 });
 
 
-// GET /reports/balance-sheet?asOf=YYYY-MM-DD[&start=YYYY-MM-DD]
+
+// Balance Sheet (as of date, optional start for period P&L)
+// GET /reports/balance-sheet?asOf=YYYY-MM-DD[&start=YYYY-MM-DD][&autoDepreciate=true]
+// Balance Sheet (as of)
+// GET /reports/balance-sheet?asOf=YYYY-MM-DD[&start=YYYY-MM-DD][&autoDepreciate=true][&debug=1]
 app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id;
-  const asOf = req.query.asOf as string;
-  const start = (req.query.start as string) || null; // optional for period P&L display
+  const asOf   = req.query.asOf as string;
+  const start  = (req.query.start as string) || null; // optional period for P&L rollforward
+  const auto   = String(req.query.autoDepreciate || "false").toLowerCase() === "true";
+  const debug  = String(req.query.debug || "0") === "1";
   if (!asOf) return res.status(400).json({ error: "asOf required" });
 
   const client = await pool.connect();
   try {
-    // Helper to normalize section keys ("Current Assets" -> "current_assets")
-    const normalize = (s: string | null): string =>
+    if (auto) {
+      await client.query("BEGIN");
+      await runDepreciationForUser(client, userId, asOf);
+      await client.query("COMMIT");
+    }
+
+    const normalize = (s: string | null) =>
       (s || "").trim().toLowerCase().replace(/[^a-z]+/g, "_");
 
-    // 1) Net Profit/Loss for the SELECTED period [start, asOf]
-    // If start is null, we compute from "inception" (1900-01-01) to asOf.
+    // ---------- Net profit for [start, asOf] ----------
     const profitLossResult = await client.query(
       `
       SELECT COALESCE(SUM(
         CASE
-          WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit)  -- income/revenue
-          ELSE                      - (jl.debit  - jl.credit)        -- expenses subtract
+          WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit)
+          ELSE                      - (jl.debit  - jl.credit)
         END
       ),0) AS net_profit_loss
       FROM public.journal_lines jl
-      JOIN public.journal_entries je
-        ON je.id = jl.entry_id AND je.user_id = jl.user_id
-      JOIN public.accounts a
-        ON a.id = jl.account_id AND a.user_id = jl.user_id
-      JOIN public.reporting_categories rc
-        ON rc.id = a.reporting_category_id
+      JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+      JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
+      JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
       WHERE je.user_id = $1
         AND rc.statement = 'income_statement'
         AND je.entry_date BETWEEN COALESCE($2::date, '1900-01-01') AND $3::date
@@ -10546,23 +10983,43 @@ app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Resp
     );
     const netProfitLoss = Number(profitLossResult.rows[0]?.net_profit_loss || 0);
 
-    // 2) Balance-sheet sections as of the date (Assets, Liabilities, Equity)
+    // ---------- Net income since inception up to asOf (RET. EARNINGS driver) ----------
+    const ytdRes = await client.query(
+      `
+      SELECT COALESCE(SUM(
+        CASE
+          WHEN a.normal_side = 'Credit' THEN (jl.credit - jl.debit)
+          ELSE                      - (jl.debit  - jl.credit)
+        END
+      ),0) AS net_income_to_date
+      FROM public.journal_lines jl
+      JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+      JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
+      JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+      WHERE je.user_id = $1
+        AND rc.statement = 'income_statement'
+        AND je.entry_date <= $2::date
+      `,
+      [userId, asOf]
+    );
+    const netIncomeToDate = Number(ytdRes.rows[0]?.net_income_to_date || 0);
+    const priorRetained   = Number((netIncomeToDate - netProfitLoss).toFixed(2));
+
+    // ---------- Balance-sheet sections (TYPE-oriented sign) ----------
     const { rows: bsRows } = await client.query(
       `
       SELECT rc.section,
              COALESCE(SUM(
-               CASE a.normal_side
-                 WHEN 'Debit'  THEN (jl.debit - jl.credit)
-                 ELSE               -(jl.debit - jl.credit)
+               CASE
+                 WHEN LOWER(a.type) = 'asset'                  THEN (jl.debit - jl.credit)
+                 WHEN LOWER(a.type) IN ('liability','equity') THEN (jl.credit - jl.debit)
+                 ELSE 0
                END
              ),0) AS value
       FROM public.journal_lines jl
-      JOIN public.journal_entries je
-        ON je.id = jl.entry_id AND je.user_id = jl.user_id
-      JOIN public.accounts a
-        ON a.id = jl.account_id AND a.user_id = jl.user_id
-      JOIN public.reporting_categories rc
-        ON rc.id = a.reporting_category_id
+      JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+      JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
+      JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
       WHERE je.user_id = $1
         AND rc.statement = 'balance_sheet'
         AND je.entry_date <= $2::date
@@ -10573,11 +11030,9 @@ app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Resp
     );
 
     const sectionsMap: Record<string, number> = {};
-    for (const r of bsRows) {
-      sectionsMap[normalize(r.section)] = Number(r.value || 0);
-    }
+    for (const r of bsRows) sectionsMap[normalize(r.section)] = Number(r.value || 0);
 
-    // 3) Opening Balance Equity (as of date)
+    // ---------- Opening Balance Equity (type-oriented sign) ----------
     const obeIdRes = await client.query(
       `SELECT id FROM public.accounts WHERE user_id = $1 AND name = 'Opening Balance Equity' LIMIT 1`,
       [userId]
@@ -10588,16 +11043,15 @@ app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Resp
       const obeBalRes = await client.query(
         `
         SELECT COALESCE(SUM(
-          CASE a.normal_side
-            WHEN 'Debit' THEN (jl.debit - jl.credit)
-            ELSE               -(jl.debit - jl.credit)
+          CASE
+            WHEN LOWER(a.type) = 'asset'                  THEN (jl.debit - jl.credit)
+            WHEN LOWER(a.type) IN ('liability','equity') THEN (jl.credit - jl.debit)
+            ELSE 0
           END
         ),0) AS balance
         FROM public.journal_lines jl
-        JOIN public.journal_entries je
-          ON je.id = jl.entry_id AND je.user_id = jl.user_id
-        JOIN public.accounts a
-          ON a.id = jl.account_id AND a.user_id = jl.user_id
+        JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+        JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
         WHERE jl.user_id = $1
           AND jl.account_id = $2
           AND je.entry_date <= $3::date
@@ -10607,30 +11061,142 @@ app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Resp
       openingBalanceEquityValue = Number(obeBalRes.rows[0]?.balance || 0);
     }
 
-    // 4) Equity total AS OF date (from the equity section)
-    const totalEquityAsOf = sectionsMap["equity"] ?? 0;
+    // ---------- Type totals to prove A = L + E ----------
+    const { rows: ctrlRows } = await client.query(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN LOWER(a.type)='asset'
+                          THEN (jl.debit - jl.credit) ELSE 0 END),0) AS assets,
+        COALESCE(SUM(CASE WHEN LOWER(a.type)='liability'
+                          THEN (jl.credit - jl.debit) ELSE 0 END),0) AS liabilities,
+        COALESCE(SUM(CASE WHEN LOWER(a.type)='equity'
+                          THEN (jl.credit - jl.debit) ELSE 0 END),0) AS equity
+      FROM public.journal_lines jl
+      JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
+      JOIN public.accounts a        ON a.id = jl.account_id AND a.user_id = jl.user_id
+      WHERE je.user_id = $1
+        AND je.entry_date <= $2::date
+      `,
+      [userId, asOf]
+    );
+    const assetsTotal      = Number(ctrlRows[0]?.assets || 0);
+    const liabilitiesTotal = Number(ctrlRows[0]?.liabilities || 0);
+    const equityTotal      = Number(ctrlRows[0]?.equity || 0);
+    const liabPlusEquity   = liabilitiesTotal + equityTotal;
+    const controlDiff      = Number((assetsTotal - liabPlusEquity).toFixed(2));
 
-    // 5) Reconcile other equity movements (capital injections/drawings)
-    const otherEquityMovements = totalEquityAsOf - (openingBalanceEquityValue + netProfitLoss);
+    // ---------- Equity rollforward from sections ----------
+    const closingEquity         = sectionsMap["equity"] ?? 0;
+    const otherEquityMovements  = closingEquity - (openingBalanceEquityValue + netProfitLoss);
+    const equityRollforwardDiff = Number((openingBalanceEquityValue + netProfitLoss + otherEquityMovements - closingEquity).toFixed(2));
 
-    // 6) Build response in the same shape your frontend expects
+    // ---------- EFFECTIVE equity incl. retained earnings ----------
+    const equityComputed          = Number((equityTotal + netIncomeToDate).toFixed(2));
+    const liabPlusEquityComputed  = Number((liabilitiesTotal + equityComputed).toFixed(2));
+    const diffComputed            = Number((assetsTotal - liabPlusEquityComputed).toFixed(2));
+
+    // ---------- Optional deep debug ----------
+    let accountsBySection: any[] = [];
+    let suspects: any[] = [];
+    if (debug) {
+      const { rows: acctRows } = await client.query(
+        `
+        SELECT a.id, a.code, a.name, a.type, a.normal_side,
+               COALESCE(rc.section, '<NULL>') AS section,
+               COALESCE(SUM(
+                 CASE
+                   WHEN LOWER(a.type)='asset'                   THEN (jl.debit - jl.credit)
+                   WHEN LOWER(a.type) IN ('liability','equity') THEN (jl.credit - jl.debit)
+                   ELSE 0
+                 END
+               ),0)::numeric(18,2) AS amount
+        FROM public.accounts a
+        LEFT JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+        LEFT JOIN public.journal_lines jl
+               ON jl.account_id = a.id AND jl.user_id = a.user_id
+        LEFT JOIN public.journal_entries je
+               ON je.id = jl.entry_id AND je.user_id = jl.user_id AND je.entry_date <= $2::date
+        WHERE a.user_id = $1
+        GROUP BY a.id, a.code, a.name, a.type, a.normal_side, rc.section
+        ORDER BY rc.section NULLS FIRST, a.code::text, a.name::text
+        `,
+        [userId, asOf]
+      );
+      accountsBySection = acctRows;
+
+      const okSections = new Set([
+        "current_assets",
+        "non_current_assets",
+        "current_liabilities",
+        "non_current_liabilities",
+        "equity",
+      ]);
+
+      suspects = acctRows.filter((r: any) => {
+        const sec = normalize(r.section);
+        const typ = String(r.type || "").toLowerCase();
+        const amt = Number(r.amount || 0);
+        if (Math.abs(amt) < 0.01) return false;
+
+        const noSection   = !sec || sec === "<null>";
+        const weirdName   = !okSections.has(sec);
+        const clashAsset  = typ === "asset"     && sec.includes("liabil");
+        const clashLiab   = typ === "liability" && sec.includes("asset");
+        const clashEquity = typ === "equity"    && sec.includes("asset");
+
+        return noSection || weirdName || clashAsset || clashLiab || clashEquity;
+      });
+    }
+
     res.json({
       asOf,
-      sections: bsRows,                            // raw grouped rows if you need them
-      openingEquity: openingBalanceEquityValue,    // shown as "Opening Balance"
-      netProfitLoss,                                // "Net Profit for Period" (uses optional start)
-      closingEquity: totalEquityAsOf,               // use ACTUAL equity as-of for TOTAL EQUITY
-      // assets/liabilities normalized for your UI
+      periodStart: start,
+
+      // sections your UI uses
+      openingEquity: openingBalanceEquityValue,
+      netProfitLoss,
+      closingEquity,
+      otherEquityMovements,
       assets: {
-        current: sectionsMap["current_assets"] ?? sectionsMap["current_asset"] ?? 0,
-        non_current: sectionsMap["non_current_assets"] ?? sectionsMap["noncurrent_assets"] ?? 0
+        current:     sectionsMap["current_assets"] ?? sectionsMap["current_asset"] ?? 0,
+        non_current: sectionsMap["non_current_assets"] ?? sectionsMap["noncurrent_assets"] ?? 0,
       },
       liabilities: {
-        current: sectionsMap["current_liabilities"] ?? 0,
-        non_current: sectionsMap["non_current_liabilities"] ?? sectionsMap["noncurrent_liabilities"] ?? 0
+        current:     sectionsMap["current_liabilities"] ?? 0,
+        non_current: sectionsMap["non_current_liabilities"] ?? sectionsMap["noncurrent_liabilities"] ?? 0,
       },
-      // (Optional) expose the reconciling line so you can show it if non-zero
-      otherEquityMovements
+
+      // diagnostics & computed balance
+      control: {
+        assetsTotal,
+        liabilitiesTotal,
+        equityTotal,           // equity accounts only
+        liabPlusEquity,
+        diff: controlDiff,     // often equals netIncomeToDate when RE not closed
+        effective: {           // <- use this to prove balance in UI
+          equityComputed,
+          liabPlusEquityComputed,
+          diffComputed         // should be ~0.00
+        }
+      },
+      equityBreakdown: {
+        opening: openingBalanceEquityValue,
+        priorRetained,           // before "start"
+        periodProfit: netProfitLoss,
+        sinceInception: netIncomeToDate,
+        equityAccounts: equityTotal,
+        totalComputed: equityComputed
+      },
+      equityRollforwardCheck: {
+        opening: openingBalanceEquityValue,
+        netProfitLoss,
+        otherMovements: otherEquityMovements,
+        closing: closingEquity,
+        diff: equityRollforwardDiff
+      },
+
+      sections: bsRows,
+      debug: debug ? { accountsBySection, suspects } : undefined,
     });
   } catch (err) {
     console.error("Error generating balance sheet:", err);
@@ -10641,43 +11207,31 @@ app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Resp
 });
 
 
-// Cash Flow (Indirect)
-// GET /reports/cash-flow?start=YYYY-MM-DD&end=YYYY-MM-DD
-// Cash Flow (Indirect)
-// GET /reports/cash-flow?start=YYYY-MM-DD&end=YYYY-MM-DD
+
+// GET /reports/cash-flow?start=YYYY-MM-DD&end=YYYY-MM-DD[&autoDepreciate=true]
 app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id;
   const start = req.query.start as string;
-  const end = req.query.end as string;
+  const end   = req.query.end   as string;
+  const auto  = String(req.query.autoDepreciate || 'false').toLowerCase() === 'true';
   if (!start || !end) return res.status(400).json({ error: "start & end required" });
 
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query(
+    if (auto) { await client.query('BEGIN'); await runDepreciationForUser(client, userId, end); await client.query('COMMIT'); }
+
+    const { rows } = await client.query(
       `
       WITH
-      -- Keep a single user_id column (from jl). Do NOT select je.user_id.
       jl AS (
-        SELECT
-          jl.entry_id,
-          jl.account_id,
-          jl.debit,
-          jl.credit,
-          jl.user_id,         -- the only user_id we keep
-          je.entry_date
+        SELECT jl.entry_id, jl.account_id, jl.debit, jl.credit, jl.user_id, je.entry_date
         FROM public.journal_lines jl
-        JOIN public.journal_entries je
-          ON je.id = jl.entry_id AND je.user_id = jl.user_id
+        JOIN public.journal_entries je ON je.id = jl.entry_id AND je.user_id = jl.user_id
         WHERE je.user_id = $1
           AND je.entry_date BETWEEN $2::date AND $3::date
       ),
       acc AS (
-        SELECT
-          a.id,
-          a.user_id,
-          a.name,
-          a.type,
-          a.normal_side,
-          a.reporting_category_id
+        SELECT a.id, a.user_id, a.name, a.type, a.normal_side, a.reporting_category_id
         FROM public.accounts a
         WHERE a.user_id = $1
       ),
@@ -10685,100 +11239,67 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
         SELECT rc.id, rc.statement, rc.section
         FROM public.reporting_categories rc
       ),
-
-      ------------------------------------------------------------------
-      -- 1) OPERATING
-      ------------------------------------------------------------------
+      -- Operating
       net_income AS (
-        SELECT
-          'operating' AS section,
-          'Net Income' AS line,
-          COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
-        FROM jl
-        JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
-        JOIN rc  r ON r.id = a.reporting_category_id
+        SELECT 'operating' AS section, 'Net Income' AS line,
+               COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+               JOIN rc  r ON r.id = a.reporting_category_id
         WHERE r.statement = 'income_statement'
       ),
       depreciation AS (
-        SELECT
-          'operating' AS section,
-          'Depreciation' AS line,
-          COALESCE(SUM(jl.debit - jl.credit), 0)::numeric AS amount
-        FROM jl
-        JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        SELECT 'operating' AS section, 'Depreciation' AS line,
+               COALESCE(SUM(jl.debit - jl.credit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
         WHERE (a.name ILIKE '%depreciation%' OR a.name ILIKE '%amortization%')
       ),
       delta_current_assets AS (
-        SELECT
-          'operating' AS section,
-          'Change in Working Capital: Current Assets (excl. cash/bank)' AS line,
-          COALESCE(-SUM(jl.debit - jl.credit), 0)::numeric AS amount
-        FROM jl
-        JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        SELECT 'operating' AS section,
+               'Change in Working Capital: Current Assets (excl. cash/bank)' AS line,
+               COALESCE(-SUM(jl.debit - jl.credit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
         LEFT JOIN rc  r ON r.id = a.reporting_category_id
-        WHERE (
-                r.statement = 'balance_sheet' AND r.section = 'Current Assets'
-              )
-           OR (
-                r.id IS NULL AND a.type = 'Asset'
-              )
-          AND a.name NOT ILIKE '%cash%'
-          AND a.name NOT ILIKE '%bank%'
+        WHERE ((r.statement = 'balance_sheet' AND r.section = 'Current Assets')
+               OR (r.id IS NULL AND a.type = 'Asset'))
+          AND a.name NOT ILIKE '%cash%' AND a.name NOT ILIKE '%bank%'
       ),
       delta_current_liab AS (
-        SELECT
-          'operating' AS section,
-          'Change in Working Capital: Current Liabilities' AS line,
-          COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
-        FROM jl
-        JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        SELECT 'operating' AS section,
+               'Change in Working Capital: Current Liabilities' AS line,
+               COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
         LEFT JOIN rc  r ON r.id = a.reporting_category_id
         WHERE (r.statement = 'balance_sheet' AND r.section = 'Current Liabilities')
            OR (r.id IS NULL AND a.type = 'Liability')
       ),
-
-      ------------------------------------------------------------------
-      -- 2) INVESTING
-      ------------------------------------------------------------------
+      -- Investing
       investing_assets AS (
-        SELECT
-          'investing' AS section,
-          'Purchase / (Sale) of Fixed Assets' AS line,
-          COALESCE(-SUM(jl.debit - jl.credit), 0)::numeric AS amount
-        FROM jl
-        JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        SELECT 'investing' AS section,
+               'Purchase / (Sale) of Fixed Assets' AS line,
+               COALESCE(-SUM(jl.debit - jl.credit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
         LEFT JOIN rc  r ON r.id = a.reporting_category_id
         WHERE (r.statement = 'balance_sheet' AND r.section = 'Non-Current Assets')
            OR (r.id IS NULL AND a.type = 'Asset'
                AND a.name NOT ILIKE '%cash%' AND a.name NOT ILIKE '%bank%')
       ),
-
-      ------------------------------------------------------------------
-      -- 3) FINANCING
-      ------------------------------------------------------------------
+      -- Financing
       financing_debt AS (
-        SELECT
-          'financing' AS section,
-          'Debt Proceeds / (Repayments)' AS line,
-          COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
-        FROM jl
-        JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        SELECT 'financing' AS section, 'Debt Proceeds / (Repayments)' AS line,
+               COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
         LEFT JOIN rc  r ON r.id = a.reporting_category_id
         WHERE (r.statement = 'balance_sheet' AND r.section = 'Non-Current Liabilities')
            OR a.name ILIKE '%loan%' OR a.name ILIKE '%bond%' OR a.name ILIKE '%note payable%'
       ),
       financing_equity AS (
-        SELECT
-          'financing' AS section,
-          'Owner Contributions / (Drawings)' AS line,
-          COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
-        FROM jl
-        JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        SELECT 'financing' AS section, 'Owner Contributions / (Drawings)' AS line,
+               COALESCE(SUM(jl.credit - jl.debit), 0)::numeric AS amount
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
         LEFT JOIN rc  r ON r.id = a.reporting_category_id
         WHERE (r.statement = 'balance_sheet' AND r.section = 'Equity')
            OR a.type = 'Equity'
       ),
-
       cash_changes AS (
         SELECT * FROM net_income
         UNION ALL SELECT * FROM depreciation
@@ -10788,26 +11309,18 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
         UNION ALL SELECT * FROM financing_debt
         UNION ALL SELECT * FROM financing_equity
       ),
-
-      -- Reconciliation: movement on cash/bank accounts for the same period
       cash_movement AS (
-        SELECT
-          COALESCE(SUM(
-            CASE
-              WHEN a.normal_side = 'Debit' THEN (jl.debit - jl.credit)
-              ELSE (jl.credit - jl.debit)
-            END
-          ), 0)::numeric AS delta_cash
-        FROM jl
-        JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
+        SELECT COALESCE(SUM(
+                 CASE WHEN a.normal_side = 'Debit'
+                      THEN (jl.debit - jl.credit)
+                      ELSE (jl.credit - jl.debit)
+                 END
+               ),0)::numeric AS delta_cash
+        FROM jl JOIN acc a ON a.id = jl.account_id AND a.user_id = jl.user_id
         WHERE a.name ILIKE '%cash%' OR a.name ILIKE '%bank%'
       )
-
-      SELECT
-        c.section,
-        c.line,
-        c.amount,
-        (SELECT delta_cash FROM cash_movement) AS delta_cash_check
+      SELECT c.section, c.line, c.amount,
+             (SELECT delta_cash FROM cash_movement) AS delta_cash_check
       FROM cash_changes c
       WHERE c.amount <> 0
       ORDER BY c.section, c.line;
@@ -10815,19 +11328,14 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
       [userId, start, end]
     );
 
-    // Group to your existing JSON shape
     const grouped: Record<string, { line: string; amount: number }[]> = {};
     let deltaCashCheck: number | null = null;
-
     for (const r of rows as any[]) {
-      if (deltaCashCheck === null && r.delta_cash_check !== null) {
-        deltaCashCheck = Number(r.delta_cash_check);
-      }
+      if (deltaCashCheck === null && r.delta_cash_check !== null) deltaCashCheck = Number(r.delta_cash_check);
       const section = r.section as string;
       grouped[section] = grouped[section] || [];
       grouped[section].push({ line: r.line as string, amount: Number(r.amount) });
     }
-
     for (const section in grouped) {
       const total = grouped[section].reduce((sum, it) => sum + it.amount, 0);
       grouped[section].push({
@@ -10835,11 +11343,7 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
         amount: Number(total.toFixed(2))
       });
     }
-
-    const netCash = Object.values(grouped).reduce((acc, items) => {
-      const subtotal = items[items.length - 1]?.amount ?? 0;
-      return acc + subtotal;
-    }, 0);
+    const netCash = Object.values(grouped).reduce((acc, items) => acc + (items[items.length - 1]?.amount ?? 0), 0);
 
     res.json({
       period: { start, end },
@@ -10853,8 +11357,11 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
   } catch (error) {
     console.error("Cash flow error:", error);
     res.status(500).json({ error: "Failed to generate cash flow statement" });
+  } finally {
+    client.release();
   }
 });
+
 
 app.get("/reports/trial-balance", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id; // Access user from req.user
