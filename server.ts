@@ -10568,6 +10568,8 @@ app.get("/reports/balance-sheet", authMiddleware, async (req: Request, res: Resp
 
 // Cash Flow (Indirect)
 // GET /reports/cash-flow?start=YYYY-MM-DD&end=YYYY-MM-DD
+// Cash Flow (Indirect)
+// GET /reports/cash-flow?start=YYYY-MM-DD&end=YYYY-MM-DD
 app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.user!.parent_user_id;
   const start = req.query.start as string;
@@ -10575,10 +10577,11 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
   if (!start || !end) return res.status(400).json({ error: "start & end required" });
 
   try {
-    // Direct query approach instead of using the problematic function
+    // Direct query approach with corrected column names
     const { rows } = await pool.query(
       `
       WITH cash_changes AS (
+        -- Operating: Net Income
         SELECT 
           'operating' as section,
           'Net Income' as line,
@@ -10596,6 +10599,7 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
       
         UNION ALL
       
+        -- Operating: Depreciation
         SELECT 
           'operating' as section,
           'Depreciation' as line,
@@ -10612,9 +10616,10 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
       
         UNION ALL
       
+        -- Investing: Purchase of Assets
         SELECT 
           'investing' as section,
-          'Purchase of Assets' as line,
+          'Purchase of Fixed Assets' as line,
           SUM(CASE 
             WHEN a.normal_side = 'Debit' THEN (jl.debit - jl.credit)
             ELSE (jl.credit - jl.debit)
@@ -10628,6 +10633,7 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
       
         UNION ALL
       
+        -- Financing: Loan Proceeds
         SELECT 
           'financing' as section,
           'Loan Proceeds' as line,
@@ -10652,13 +10658,32 @@ app.get("/reports/cash-flow", authMiddleware, async (req: Request, res: Response
     );
 
     // Group for nicer JSON
-    const grouped: Record<string, { line: string; amount: string | number }[]> = {};
+    const grouped: Record<string, { line: string; amount: number }[]> = {};
     for (const r of rows) {
       grouped[r.section] = grouped[r.section] || [];
       grouped[r.section].push({ line: r.line, amount: parseFloat(r.amount.toString()) });
     }
     
-    res.json({ period: { start, end }, sections: grouped });
+    // Add totals for each section
+    for (const section in grouped) {
+      const total = grouped[section].reduce((sum, item) => sum + item.amount, 0);
+      grouped[section].push({
+        line: `Net Cash from ${section.charAt(0).toUpperCase() + section.slice(1)} Activities`,
+        amount: total
+      });
+    }
+
+    // Calculate final net increase/decrease in cash
+    const netCash = Object.values(grouped).reduce((total, section) => {
+      const lastItem = section[section.length - 1];
+      return total + lastItem.amount;
+    }, 0);
+
+    res.json({ 
+      period: { start, end }, 
+      sections: grouped,
+      netIncreaseInCash: netCash
+    });
   } catch (error) {
     console.error("Cash flow error:", error);
     res.status(500).json({ error: "Failed to generate cash flow statement" });
