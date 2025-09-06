@@ -5662,7 +5662,111 @@ app.delete('/employees/:id', authMiddleware, async (req: Request, res: Response)
     }
 });
 
+// Add this to your server routes
+// Add this to your server routes (if not already there)
+app.put('/employees/:id', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.parent_user_id;
+  const { id } = req.params;
+  const {
+    name,
+    position,
+    email,
+    idNumber,
+    phone,
+    startDate,
+    paymentType,
+    baseSalary,
+    hourlyRate,
+    bankDetails,
+  } = req.body;
 
+  // Basic validation
+  if (!name || !position || !email || !idNumber || !startDate || !paymentType || !bankDetails) {
+    return res.status(400).json({ error: 'Missing required employee fields.' });
+  }
+  if (paymentType === 'salary' && (baseSalary === null || baseSalary === undefined)) {
+    return res.status(400).json({ error: 'Base salary is required for salary-based employees.' });
+  }
+  if (paymentType === 'hourly' && (hourlyRate === null || hourlyRate === undefined)) {
+    return res.status(400).json({ error: 'Hourly rate is required for hourly-based employees.' });
+  }
+  if (!bankDetails.accountHolder || !bankDetails.bankName || !bankDetails.accountNumber || !bankDetails.branchCode) {
+    return res.status(400).json({ error: 'Missing required bank details.' });
+  }
+
+  try {
+    // Check if employee exists and belongs to user
+    const existingEmployee = await pool.query(
+      `SELECT id FROM employees WHERE id = $1 AND user_id = $2`,
+      [id, user_id]
+    );
+
+    if (existingEmployee.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+
+    // Check for duplicate ID number or email (excluding current employee)
+    const duplicateCheck = await pool.query(
+      `SELECT id FROM employees WHERE user_id = $1 AND (id_number = $2 OR email = $3) AND id != $4`,
+      [user_id, idNumber, email, id]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      return res.status(409).json({ error: 'Employee with this ID number or email already exists.' });
+    }
+
+    // Update employee
+    const result = await pool.query(
+      `UPDATE employees SET
+        name = $1,
+        position = $2,
+        email = $3,
+        id_number = $4,
+        phone = $5,
+        start_date = $6,
+        payment_type = $7,
+        base_salary = $8,
+        hourly_rate = $9,
+        bank_details = $10,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $11 AND user_id = $12
+      RETURNING id, name`,
+      [
+        name,
+        position,
+        email,
+        idNumber,
+        phone,
+        startDate,
+        paymentType,
+        baseSalary,
+        hourlyRate,
+        JSON.stringify(bankDetails),
+        id,
+        user_id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+
+    res.json({
+      message: 'Employee updated successfully',
+      employee: {
+        id: result.rows[0].id,
+        name: result.rows[0].name,
+      },
+    });
+
+  } catch (error: unknown) {
+    console.error('Error updating employee:', error);
+    res.status(500).json({ 
+      error: 'Failed to update employee', 
+      details: error instanceof Error ? error.message : String(error) 
+    });
+  }
+});
 /* --- TIME ENTRIES API --- */
 
 // NEW: GET All Time Entries (for dashboard and general list)
@@ -6700,74 +6804,224 @@ const formatMonth = (date: Date) => {
 // GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
 // GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
 // GET Revenue Trend Data (Profit, Expenses, Revenue by Month)
-app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: Response) => {
-    // Get the authenticated user's parent_user_id from the request object
-    const user_id = req.user!.parent_user_id;
+// --- Updated /api/charts/sales-expenses-sunburst Endpoint ---
+// This endpoint now fetches categorized financial data directly from journal_lines
+// using reporting_categories for classification.
+// --- Updated /api/charts/sales-expenses-sunburst Endpoint ---
 
-    // Extract startDate and endDate from query parameters, if provided
+app.get('/api/charts/sales-expenses-sunburst', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
     const { startDate, endDate } = req.query;
 
     try {
-        // --- Revenue Transactions Query Construction ---
-        // This filter will be applied to transactions identified as revenue
-        let revenueDateFilter = '';
-        const revenueQueryParams: (string | number)[] = [user_id]; // Parameters specific to the revenue transaction query
-        let revenueParamIndex = 2; // Start index for additional parameters for revenue
+        // --- Build Date Filter for Journal Entries ---
+        let jeDateFilter = '';
+        const queryParams: any[] = [user_id];
+        let paramIndex = 2;
 
         if (startDate) {
-            revenueDateFilter += ` AND date >= $${revenueParamIndex++}`;
-            revenueQueryParams.push(startDate as string);
+            jeDateFilter += ` AND je.entry_date >= $${paramIndex++}`;
+            queryParams.push(startDate as string);
         }
         if (endDate) {
-            revenueDateFilter += ` AND date <= $${revenueParamIndex++}`;
-            revenueQueryParams.push(endDate as string);
+            jeDateFilter += ` AND je.entry_date <= $${paramIndex++}`;
+            queryParams.push(endDate as string);
         }
 
-        // --- Expense Transactions Query Construction ---
-        // This filter will be applied to transactions identified as expenses
-        let expenseDateFilter = '';
-        const expenseQueryParams: (string | number)[] = [user_id]; // Parameters specific to the expense transaction query
-        let expenseParamIndex = 2; // Start index for additional parameters for expenses
+        // --- Fetch Categorized Revenue from journal_lines ---
+        // Revenue is identified by rc.section = 'revenue' and using jl.credit
+        const revenueQuery = `
+            SELECT
+                a.name AS category, -- Use account name as category
+                COALESCE(SUM(jl.credit), 0)::numeric(14, 2) AS value
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+            WHERE
+                je.user_id = $1
+                AND rc.statement = 'income_statement'
+                AND rc.section = 'revenue'
+                ${jeDateFilter}
+            GROUP BY a.name;
+        `;
+        const revenueCategoriesResult = await pool.query(revenueQuery, queryParams);
+
+        // --- Fetch Categorized Expenses from journal_lines ---
+        // Expenses are identified by specific rc.section values and using jl.debit
+        const expenseQuery = `
+            SELECT
+                a.name AS category, -- Use account name as category
+                COALESCE(SUM(jl.debit), 0)::numeric(14, 2) AS value
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+            WHERE
+                je.user_id = $1
+                AND rc.statement = 'income_statement'
+                AND rc.section IN ('operating_expenses', 'finance_costs', 'cogs') -- Include relevant expense sections
+                ${jeDateFilter}
+            GROUP BY a.name;
+        `;
+        const expenseCategoriesResult = await pool.query(expenseQuery, queryParams);
+
+        // --- Fetch Categorized Other Income from journal_lines ---
+        // Other Income is identified by rc.section = 'other_income' and using jl.credit
+        const otherIncomeQuery = `
+            SELECT
+                a.name AS category, -- Use account name as category
+                COALESCE(SUM(jl.credit), 0)::numeric(14, 2) AS value
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+            WHERE
+                je.user_id = $1
+                AND rc.statement = 'income_statement'
+                AND rc.section = 'other_income'
+                ${jeDateFilter}
+            GROUP BY a.name;
+        `;
+        const otherIncomeCategoriesResult = await pool.query(otherIncomeQuery, queryParams);
+
+        let totalSales = 0;
+        let totalExpenses = 0;
+        let totalOtherIncome = 0;
+
+        const sunburstData: { id: string; parent?: string; name: string; value?: number; color?: string; }[] = [];
+
+        // Add top-level nodes for 'Revenue', 'Expenses', 'Other Income'
+        sunburstData.push({ id: 'revenue-parent', parent: 'total', name: 'Revenue', color: '#4CAF50' }); // Green for Revenue
+        sunburstData.push({ id: 'expenses-parent', parent: 'total', name: 'Expenses', color: '#F44336' }); // Red for Expenses
+        sunburstData.push({ id: 'other-income-parent', parent: 'total', name: 'Other Income', color: '#FFC107' }); // Amber for Other Income
+
+        // Process Revenue Categories
+        revenueCategoriesResult.rows.forEach((row, index) => { // Added index
+            const value = parseFloat(row.value);
+            if (value > 0) {
+                totalSales += value;
+                // Create a unique ID using category name and index
+                const categoryId = `revenue-${row.category.toLowerCase().replace(/\s+/g, '-')}-${index}`;
+                sunburstData.push({
+                    id: categoryId,
+                    parent: 'revenue-parent',
+                    name: row.category,
+                    value: value
+                });
+            }
+        });
+
+        // Process Expense Categories
+        expenseCategoriesResult.rows.forEach((row, index) => { // Added index
+            const value = parseFloat(row.value);
+            if (value > 0) {
+                totalExpenses += value;
+                const categoryId = `expense-${row.category.toLowerCase().replace(/\s+/g, '-')}-${index}`;
+                sunburstData.push({
+                    id: categoryId,
+                    parent: 'expenses-parent',
+                    name: row.category,
+                    value: value
+                });
+            }
+        });
+
+        // Process Other Income Categories
+        otherIncomeCategoriesResult.rows.forEach((row, index) => { // Added index
+            const value = parseFloat(row.value);
+            if (value > 0) {
+                totalOtherIncome += value;
+                const categoryId = `other-income-${row.category.toLowerCase().replace(/\s+/g, '-')}-${index}`;
+                sunburstData.push({
+                    id: categoryId,
+                    parent: 'other-income-parent',
+                    name: row.category,
+                    value: value
+                });
+            }
+        });
+
+        // Add the overall 'total' node after calculating sums
+        const overallTotal = totalSales + totalExpenses + totalOtherIncome;
+        sunburstData.unshift({ id: 'total', name: 'Financial Overview', value: overallTotal });
+
+        res.json(sunburstData);
+
+    } catch (error: unknown) {
+        console.error('Error fetching sunburst data from journal:', error);
+        if (error instanceof Error) {
+            res.status(500).json({ error: 'Failed to fetch sunburst data', detail: error.message });
+        } else {
+            res.status(500).json({ error: 'Failed to fetch sunburst data', detail: String(error) });
+        }
+    }
+});
+// --- End Updated /api/charts/sales-expenses-sunburst ---
+// --- End Updated /api/charts/sales-expenses-sunburst ---
+
+
+// --- Updated /api/charts/revenue-trend Endpoint ---
+// This endpoint now fetches monthly revenue and expense trends directly from journal_lines
+// using reporting_categories for classification.
+app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: Response) => {
+    const user_id = req.user!.parent_user_id;
+    const { startDate, endDate } = req.query;
+
+    try {
+        // --- Build Date Filter for Journal Entries ---
+        let jeDateFilter = '';
+        const queryParams: any[] = [user_id];
+        let paramIndex = 2;
 
         if (startDate) {
-            expenseDateFilter += ` AND date >= $${expenseParamIndex++}`;
-            expenseQueryParams.push(startDate as string);
+            jeDateFilter += ` AND je.entry_date >= $${paramIndex++}`;
+            queryParams.push(startDate as string);
         }
         if (endDate) {
-            expenseDateFilter += ` AND date <= $${expenseParamIndex++}`;
-            expenseQueryParams.push(endDate as string);
+            jeDateFilter += ` AND je.entry_date <= $${paramIndex++}`;
+            queryParams.push(endDate as string);
         }
 
-        // Fetch revenue from public.transactions by month with date and category filtering
-        // Assuming 'type' for revenue transactions is 'income' or similar.
-        // If your revenue transactions don't have a specific 'type', you can remove `AND type = 'income'`.
-        const revenueTransactionsResult = await pool.query(`
+        // --- Fetch Monthly Revenue from journal_lines ---
+        // Revenue is identified by rc.section = 'revenue' and using jl.credit
+        const revenueQuery = `
             SELECT
-                TO_CHAR(date, 'YYYY-MM') AS month,
-                COALESCE(SUM(amount), 0) AS revenue
-            FROM public.transactions
+                TO_CHAR(je.entry_date, 'YYYY-MM') AS month,
+                COALESCE(SUM(jl.credit), 0)::numeric(14, 2) AS revenue
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
             WHERE
-                user_id = $1
-                AND type = 'income' -- Adjust or remove if 'type' is not used for revenue
-                AND category IN ('Revenue', 'Sales Revenue')
-                ${revenueDateFilter}
+                je.user_id = $1
+                AND rc.statement = 'income_statement'
+                AND rc.section = 'revenue'
+                ${jeDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, revenueQueryParams);
+        `;
+        const revenueTransactionsResult = await pool.query(revenueQuery, queryParams);
 
-        // Fetch expenses from public.transactions by month with date filtering
-        const expensesResult = await pool.query(`
+        // --- Fetch Monthly Expenses from journal_lines ---
+        // Expenses are identified by specific rc.section values and using jl.debit
+        const expenseQuery = `
             SELECT
-                TO_CHAR(date, 'YYYY-MM') AS month,
-                COALESCE(SUM(amount), 0) AS expenses
-            FROM public.transactions
+                TO_CHAR(je.entry_date, 'YYYY-MM') AS month,
+                COALESCE(SUM(jl.debit), 0)::numeric(14, 2) AS expenses
+            FROM public.journal_lines jl
+            JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+            JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
             WHERE
-                type = 'expense'
-                AND user_id = $1
-                ${expenseDateFilter}
+                je.user_id = $1
+                AND rc.statement = 'income_statement'
+                AND rc.section IN ('operating_expenses', 'finance_costs', 'cogs') -- Include relevant expense sections
+                ${jeDateFilter}
             GROUP BY month
             ORDER BY month;
-        `, expenseQueryParams);
+        `;
+        const expensesResult = await pool.query(expenseQuery, queryParams);
 
         // --- Data Aggregation and Transformation ---
         const revenueMap = new Map<string, { revenue: number, expenses: number }>();
@@ -6796,23 +7050,29 @@ app.get('/api/charts/revenue-trend', authMiddleware, async (req: Request, res: R
             const profit = data.revenue - data.expenses;
             monthlyData.push({
                 month,
-                profit: parseFloat(profit.toFixed(2)), // Format to 2 decimal places
+                profit: parseFloat(profit.toFixed(2)),
                 expenses: parseFloat(data.expenses.toFixed(2)),
                 revenue: parseFloat(data.revenue.toFixed(2))
             });
         });
 
-        // Send the aggregated and formatted monthly data as a JSON response
         res.json(monthlyData);
     } catch (error: unknown) {
-        // Log the error and send a 500 internal server error response
-        console.error('Error fetching revenue trend data:', error);
-        res.status(500).json({
-            error: 'Failed to fetch revenue trend data',
-            detail: error instanceof Error ? error.message : String(error)
-        });
+        console.error('Error fetching revenue trend data from journal:', error);
+        if (error instanceof Error) {
+            res.status(500).json({
+                error: 'Failed to fetch revenue trend data',
+                detail: error.message
+            });
+        } else {
+            res.status(500).json({
+                error: 'Failed to fetch revenue trend data',
+                detail: String(error)
+            });
+        }
     }
 });
+// --- End Updated /api/charts/revenue-trend ---
 
 
 
@@ -6987,11 +7247,7 @@ const getStatusFromPercentage = (percentage: number): string => {
     }
 };
 
-// After your pool + pool.query are defined
-// Helper function to recompute task progress based on mode
-// Helper function to recompute task progress based on mode
-// Place this after your pool definition
-// Helper function to recompute task progress based on mode
+
 // Place this after your pool definition
 async function recomputeTaskProgress(taskId: string) {
     // Fetch progress mode + goal/current
@@ -7043,16 +7299,17 @@ async function recomputeTaskProgress(taskId: string) {
 }
 /* --- Task Management API Endpoints --- */
 
+// GET /api/tasks - Fetch tasks for the authenticated user
 app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
     try {
-        const currentUser_id = req.user!.user_id;       // The actual logged-in user's ID
-        const parentUser_id = req.user!.parent_user_id; // The company owner's ID
+        const currentUser_id = req.user!.user_id;       // The actual logged-in user's ID (UUID)
+        const parentUser_id = req.user!.parent_user_id; // The company owner's ID (UUID)
 
         let query = `
             SELECT
                 t.*,
                 p.name AS project_name,
-                u.name AS assignee_name, -- This line is supposed to get the name
+                u.name AS assignee_name,
                 COALESCE(
                 json_agg(
                     json_build_object(
@@ -7068,7 +7325,8 @@ app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
                 ) AS steps
             FROM public.tasks t
             LEFT JOIN public.projects p ON p.id = t.project_id
-            LEFT JOIN public.users u ON u.user_id = t.assignee_user_id -- This is the crucial join
+            -- Assuming assignee_id in tasks references users.id (integer)
+            LEFT JOIN public.users u ON u.id = t.assignee_id
             LEFT JOIN LATERAL (
                 SELECT s.id, s.title, s.weight, s.is_done, s.position
                 FROM public.task_steps s
@@ -7077,20 +7335,31 @@ app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
             ) s ON TRUE
         `;
 
-        const queryParams: string[] = [];
+        const queryParams: string[] = []; // Or use (string | UUID)[] if you have mixed types
         let paramIndex = 1;
 
         // Determine if the current user is the company owner
         const isCompanyOwner = currentUser_id === parentUser_id;
 
         if (isCompanyOwner) {
-            // Company owners see all tasks associated with their company
-            query += ` WHERE t.user_id = $${paramIndex++}::varchar`;
-            queryParams.push(parentUser_id);
+            // Company owners see all tasks associated with their company (user_id is UUID)
+            query += ` WHERE t.user_id = $${paramIndex}`;
+            queryParams.push(parentUser_id); // Push UUID directly
+            paramIndex++;
         } else {
-            // Regular users only see tasks where they are explicitly assigned
-            query += ` WHERE t.assignee_user_id = $${paramIndex++}::varchar`;
-            queryParams.push(currentUser_id);
+            // Regular users only see tasks where they are explicitly assigned (assignee_id references users.id, which is integer)
+            // Need to get the integer 'id' from the users table for the current user
+            const userLookupResult = await pool.query('SELECT id FROM public.users WHERE user_id = $1', [currentUser_id]);
+            if (userLookupResult.rows.length === 0) {
+                 // Handle case where user lookup fails (shouldn't happen if auth is correct)
+                 console.error('User lookup failed for assignee filter:', currentUser_id);
+                 return res.status(500).json({ error: 'User lookup failed for task assignment filter.' });
+            }
+            const currentUserIdInteger = userLookupResult.rows[0].id; // Get the integer id
+
+            query += ` WHERE t.assignee_id = $${paramIndex}`; // Use assignee_id, not assignee_user_id
+            queryParams.push(currentUserIdInteger.toString()); // Push integer id as string for parameter binding
+            paramIndex++;
         }
 
         query += `
@@ -7102,7 +7371,12 @@ app.get('/api/tasks', authMiddleware, async (req: Request, res: Response) => {
         res.json(rows);
     } catch (e: any) {
         console.error('list tasks error', e);
-        res.status(500).json({ error: 'Failed to fetch tasks' });
+        // Provide a more specific error message if it's the type mismatch we identified
+        if (e.code === '42883' && e.message.includes('uuid')) {
+             res.status(500).json({ error: 'Failed to fetch tasks due to a data type mismatch. Please check server logs.' });
+        } else {
+             res.status(500).json({ error: 'Failed to fetch tasks', detail: e.message }); // Include detail
+        }
     }
 });
 
@@ -8884,7 +9158,66 @@ app.get('/api/projections/baseline-data', authMiddleware, async (req: Request, r
   }
 });
 
+// Example structure for a new backend endpoint (server-side code)
+// Add this endpoint to your server.ts file
+// Make sure to place it with your other API routes
+// Add this endpoint to your server.ts file
+app.get('/api/projections/historical-baseline', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.parent_user_id;
+  const { startDate, endDate } = req.query; // Get date range from query params
 
+  try {
+    // --- Query to Aggregate Key Financial Components ---
+    // This query joins the necessary tables and sums values based on your reporting categories.
+    const query = `
+      SELECT
+        COALESCE(SUM(CASE WHEN rc.section = 'revenue' THEN jl.credit ELSE 0 END), 0)::numeric(14, 2) AS total_revenue,
+        COALESCE(SUM(CASE WHEN rc.section = 'cogs' THEN jl.debit ELSE 0 END), 0)::numeric(14, 2) AS total_cogs,
+        COALESCE(SUM(CASE WHEN rc.section = 'operating_expenses' THEN jl.debit ELSE 0 END), 0)::numeric(14, 2) AS total_operating_expenses,
+        COALESCE(SUM(CASE WHEN rc.section = 'finance_costs' THEN jl.debit ELSE 0 END), 0)::numeric(14, 2) AS total_finance_costs,
+        COALESCE(SUM(CASE WHEN rc.section = 'other_income' THEN jl.credit ELSE 0 END), 0)::numeric(14, 2) AS total_other_income
+      FROM public.journal_lines jl
+      JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
+      JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
+      JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
+      WHERE je.user_id = $1
+        AND rc.statement = 'income_statement'
+        AND je.entry_date >= $2
+        AND je.entry_date <= $3
+    `;
+
+    // Ensure dates are strings or provide defaults
+    const start = typeof startDate === 'string' ? startDate : '1970-01-01';
+    const end = typeof endDate === 'string' ? endDate : '9999-12-31';
+    const queryParams = [user_id, start, end];
+
+    const result = await pool.query(query, queryParams);
+
+    const aggregatedData = result.rows[0]; // Assuming one row returned
+
+    // Calculate derived metrics
+    const totalExpenses = parseFloat(aggregatedData.total_operating_expenses) + 
+                         parseFloat(aggregatedData.total_finance_costs);
+
+    // Send the aggregated data back to the frontend
+    res.json({
+      sales: parseFloat(aggregatedData.total_revenue),
+      costOfGoods: parseFloat(aggregatedData.total_cogs),
+      operatingExpenses: parseFloat(aggregatedData.total_operating_expenses),
+      financeCosts: parseFloat(aggregatedData.total_finance_costs),
+      otherIncome: parseFloat(aggregatedData.total_other_income),
+      totalExpenses: totalExpenses,
+    });
+
+  } catch (error: unknown) {
+    console.error('Error fetching historical baseline data:', error);
+    if (error instanceof Error) {
+        res.status(500).json({ error: 'Failed to fetch historical baseline data.', detail: error.message });
+    } else {
+        res.status(500).json({ error: 'Failed to fetch historical baseline data.', detail: String(error) });
+    }
+  }
+});
 // --- API Endpoints for User Management ---
 // NOTE: These endpoints have been updated to remove the 'position' column
 // and would require separate endpoints to manage user roles.
@@ -9687,133 +10020,7 @@ app.get('/api/reconciliation/short-days', authMiddleware, async (req, res) => {
   }
 });
 
-// NEW ENDPOINT: GET Sales, Expenses, and Other Categories for Sunburst Chart
-app.get('/api/charts/sales-expenses-sunburst', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id;
-    const { startDate, endDate } = req.query;
 
-    try {
-        // Shared date filter parameters, applied to the 'date' column in transactions
-        let dateFilter = '';
-        const sharedQueryParams: (string | number)[] = [user_id];
-        let paramIndex = 2; // Start index for additional parameters
-
-        if (startDate) {
-            dateFilter += ` AND date >= $${paramIndex++}`; // Use 'date' column for filtering
-            sharedQueryParams.push(startDate as string);
-        }
-        if (endDate) {
-            dateFilter += ` AND date <= $${paramIndex++}`; // Use 'date' column for filtering
-            sharedQueryParams.push(endDate as string);
-        }
-
-        // Fetch Revenue from public.transactions, categorized
-        const revenueCategoriesResult = await pool.query(`
-            SELECT
-                category,
-                COALESCE(SUM(amount), 0) AS value
-            FROM public.transactions
-            WHERE
-                user_id = $1
-                AND type = 'income' -- Assuming 'income' type for revenue
-                AND category IN ('Revenue', 'Sales Revenue') -- Specific categories for sales/revenue
-                ${dateFilter}
-            GROUP BY category;
-        `, sharedQueryParams);
-
-        // Fetch Expenses from public.transactions, categorized
-        const expenseCategoriesResult = await pool.query(`
-            SELECT
-                category,
-                COALESCE(SUM(amount), 0) AS value
-            FROM public.transactions
-            WHERE
-                user_id = $1
-                AND type = 'expense' -- Assuming 'expense' type for expenses
-                ${dateFilter}
-            GROUP BY category;
-        `, sharedQueryParams);
-
-        // Fetch Other Income from public.transactions, categorized
-        // This will capture any income not explicitly tagged as 'Revenue' or 'Sales Revenue'
-        const otherIncomeCategoriesResult = await pool.query(`
-            SELECT
-                category,
-                COALESCE(SUM(amount), 0) AS value
-            FROM public.transactions
-            WHERE
-                user_id = $1
-                AND type = 'income'
-                AND category NOT IN ('Revenue', 'Sales Revenue')
-                ${dateFilter}
-            GROUP BY category;
-        `, sharedQueryParams);
-
-        let totalSales = 0;
-        let totalExpenses = 0;
-        let totalOtherIncome = 0;
-
-        const sunburstData: { id: string; parent?: string; name: string; value?: number; color?: string; }[] = [];
-
-        // Add top-level nodes for 'Revenue', 'Expenses', 'Other Income'
-        sunburstData.push({ id: 'revenue-parent', parent: 'total', name: 'Revenue', color: '#4CAF50' }); // Green for Revenue
-        sunburstData.push({ id: 'expenses-parent', parent: 'total', name: 'Expenses', color: '#F44336' }); // Red for Expenses
-        sunburstData.push({ id: 'other-income-parent', parent: 'total', name: 'Other Income', color: '#FFC107' }); // Amber for Other Income
-
-        // Process Revenue Categories
-        revenueCategoriesResult.rows.forEach(row => {
-            const value = parseFloat(row.value);
-            if (value > 0) { // Only include categories with actual value
-                totalSales += value;
-                sunburstData.push({
-                    id: `revenue-${row.category.toLowerCase().replace(/\s/g, '-')}`,
-                    parent: 'revenue-parent',
-                    name: row.category,
-                    value: value
-                });
-            }
-        });
-
-        // Process Expense Categories
-        expenseCategoriesResult.rows.forEach(row => {
-            const value = parseFloat(row.value);
-            if (value > 0) { // Only include categories with actual value
-                totalExpenses += value;
-                sunburstData.push({
-                    id: `expense-${row.category.toLowerCase().replace(/\s/g, '-')}`,
-                    parent: 'expenses-parent',
-                    name: row.category,
-                    value: value
-                });
-            }
-        });
-
-        // Process Other Income Categories
-        otherIncomeCategoriesResult.rows.forEach(row => {
-            const value = parseFloat(row.value);
-            if (value > 0) { // Only include categories with actual value
-                totalOtherIncome += value;
-                sunburstData.push({
-                    id: `other-income-${row.category.toLowerCase().replace(/\s/g, '-')}`,
-                    parent: 'other-income-parent',
-                    name: row.category,
-                    value: value
-                });
-            }
-        });
-
-        // Add the overall 'total' node after calculating sums
-        const overallTotal = totalSales + totalExpenses + totalOtherIncome;
-        sunburstData.unshift({ id: 'total', name: 'Financial Overview', value: overallTotal });
-
-
-        res.json(sunburstData);
-
-    } catch (error: unknown) {
-        console.error('Error fetching sunburst data:', error);
-        res.status(500).json({ error: 'Failed to fetch sunburst data', detail: error instanceof Error ? error.message : String(error) });
-    }
-});
 
 // Helper function to calculate previous period dates based on the current period
 const getPreviousPeriodDates = (startDateStr: string, endDateStr: string) => {
@@ -10546,47 +10753,542 @@ app.patch('/api/applications/:id', authMiddleware, async (req: Request, res: Res
         client.release();
     }
 });
-// Add this new endpoint to your server.ts file, e.g., after the quotes endpoint.
-// --- NEW ENDPOINT: GET MY CLIENTS & SALES DATA ---
-app.get('/api/my-clients', authMiddleware, async (req: Request, res: Response) => {
-  const user_id = req.user!.user_id;
+
+
+app.delete('/api/applications/:id', authMiddleware, async (req, res) => {
+  const applicationId = req.params.id;
+  const ownerId = req.user!.parent_user_id; // or user_id if that’s your rule
+
   const client = await pool.connect();
-
   try {
-    const myClientsQuery = `
-      SELECT
-          a.name AS client_name,
-          a.surname AS client_surname,
-          a.created_at AS application_date,
-          s.total_amount AS sales_amount
-      FROM
-          public.applications AS a
-      JOIN
-          public.sales AS s ON a.agent_name = s.branch
-      WHERE
-          a.user_id = $1
-      ORDER BY
-          a.created_at DESC;
-    `;
-    
-    const result = await client.query(myClientsQuery, [user_id]);
-    
-    // Format the data for the frontend
-    const myClientsData = result.rows.map(row => ({
-      clientName: `${row.client_name ?? ''} ${row.client_surname ?? ''}`.trim(),
-      applicationDate: new Date(row.application_date).toLocaleDateString(),
-      salesAmount: row.sales_amount ? parseFloat(row.sales_amount) : 0,
-    }));
+    await client.query('BEGIN');
 
-    res.status(200).json(myClientsData);
+    // verify ownership
+    const check = await client.query(
+      'SELECT 1 FROM public.applications WHERE id = $1 AND parent_user_id = $2',
+      [applicationId, ownerId]
+    );
+    if (!check.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Not found or access denied' });
+    }
 
-  } catch (error) {
-    console.error('Error fetching my clients data:', error);
-    res.status(500).json({ error: 'Failed to fetch clients and sales data.' });
+    // delete dependents first (if ON DELETE CASCADE isn’t set)
+    await client.query('DELETE FROM public.family_members WHERE application_id = $1', [applicationId]);
+    await client.query('DELETE FROM public.extended_family WHERE application_id = $1', [applicationId]);
+
+    await client.query('DELETE FROM public.applications WHERE id = $1', [applicationId]);
+
+    await client.query('COMMIT');
+    res.json({ message: 'Deleted' });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Failed to delete' });
   } finally {
     client.release();
   }
 });
+
+// GET /api/my-clients — SALES view scoped to the logged-in agent by name/agent_code
+
+app.get('/api/my-clients', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.user_id;
+  const month = (req.query.month as string) || '';
+  const client = await pool.connect();
+
+  try {
+    const now = new Date();
+    const [y, m] = month && /^\d{4}-\d{2}$/.test(month)
+      ? month.split('-').map(Number)
+      : [now.getUTCFullYear(), now.getUTCMonth() + 1];
+
+    const startOfMonth = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0));
+    const startOfNext  = new Date(Date.UTC(y, m, 1, 0, 0, 0));
+
+    const q = `
+      WITH agent_identity AS (
+        SELECT LOWER(u.name) AS agent_name_lc,
+               LOWER(COALESCE(a.agent_code,'')) AS agent_code_lc
+        FROM public.users u
+        LEFT JOIN public.agents a ON a.user_id = u.user_id
+        WHERE u.user_id = $1
+        LIMIT 1
+      ),
+      scoped_sales AS (
+        SELECT s.*
+        FROM public.sales s
+        JOIN agent_identity ai ON (
+          s.teller_id = $1
+          OR (ai.agent_code_lc <> '' AND LOWER(COALESCE(s.branch,'')) = ai.agent_code_lc)
+          OR (ai.agent_name_lc <> '' AND LOWER(COALESCE(s.branch,'')) = ai.agent_name_lc)
+        )
+        WHERE s.payment_type IN ('Cash','Bank','Credit')
+      )
+      SELECT
+        COALESCE(s.customer_name, '—') AS customer_name,
+        COALESCE(SUM(s.total_amount), 0) AS total_all_time,
+        COALESCE(SUM(s.total_amount) FILTER (
+          WHERE s.created_at >= $2::timestamptz AND s.created_at < $3::timestamptz
+        ), 0) AS total_in_month,
+        MAX(s.created_at) AS last_payment_at
+      FROM scoped_sales s
+      GROUP BY s.customer_name
+      ORDER BY MAX(s.created_at) DESC NULLS LAST;
+    `;
+
+    const { rows } = await client.query(q, [user_id, startOfMonth.toISOString(), startOfNext.toISOString()]);
+
+    const payload = rows.map(r => {
+      const paidThisMonth = Number(r.total_in_month ?? 0);
+      return {
+        customerName: r.customer_name,
+        totalPaidAllTime: Number(r.total_all_time ?? 0),
+        paidThisMonth,
+        expectedCommissionMonth: Number((paidThisMonth * 0.10).toFixed(2)),
+        lastPaymentDate: r.last_payment_at ? new Date(r.last_payment_at).toISOString() : null,
+      };
+    });
+
+    res.status(200).json(payload);
+  } catch (err) {
+    console.error('Error fetching sales clients:', err);
+    res.status(500).json({ error: 'Failed to fetch sales clients.' });
+  } finally {
+    client.release();
+  }
+});
+
+
+// GET /api/my-client-history?customerName=...&month=YYYY-MM
+app.get('/api/my-client-history', authMiddleware, async (req: Request, res: Response) => {
+  const user_id = req.user!.user_id;
+  const customerName = (req.query.customerName as string) || '';
+  const month = (req.query.month as string) || '';
+
+  if (!customerName) {
+    return res.status(400).json({ error: 'customerName is required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const now = new Date();
+    const [y, m] = month && /^\d{4}-\d{2}$/.test(month)
+      ? month.split('-').map(Number)
+      : [now.getUTCFullYear(), now.getUTCMonth() + 1];
+
+    const startOfMonth = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0));
+    const startOfNext  = new Date(Date.UTC(y, m, 1, 0, 0, 0));
+
+    const q = `
+      WITH agent_identity AS (
+        SELECT LOWER(u.name) AS agent_name_lc,
+               LOWER(COALESCE(a.agent_code,'')) AS agent_code_lc
+        FROM public.users u
+        LEFT JOIN public.agents a ON a.user_id = u.user_id
+        WHERE u.user_id = $1
+        LIMIT 1
+      ),
+      scoped_sales AS (
+        SELECT s.*
+        FROM public.sales s
+        JOIN agent_identity ai ON (
+          s.teller_id = $1
+          OR (ai.agent_code_lc <> '' AND LOWER(COALESCE(s.branch,'')) = ai.agent_code_lc)
+          OR (ai.agent_name_lc <> '' AND LOWER(COALESCE(s.branch,'')) = ai.agent_name_lc)
+        )
+        WHERE s.payment_type IN ('Cash','Bank','Credit')
+          AND LOWER(COALESCE(s.customer_name,'')) = LOWER($2)
+      )
+      SELECT
+        COALESCE(SUM(total_amount), 0) AS total_all_time,
+        COALESCE(SUM(total_amount) FILTER (
+          WHERE created_at >= $3 AND created_at < $4
+        ), 0) AS total_in_month,
+        MAX(created_at) AS last_payment_at
+      FROM scoped_sales;
+    `;
+    const agg = await client.query(q, [user_id, customerName, startOfMonth.toISOString(), startOfNext.toISOString()]);
+    const totalAllTime = Number(agg.rows[0]?.total_all_time ?? 0);
+    const totalInMonth = Number(agg.rows[0]?.total_in_month ?? 0);
+    const lastPaymentAt = agg.rows[0]?.last_payment_at ? new Date(agg.rows[0]?.last_payment_at) : null;
+
+    const active =
+      totalInMonth > 0 ||
+      (lastPaymentAt ? (Date.now() - lastPaymentAt.getTime()) <= 35 * 24 * 60 * 60 * 1000 : false);
+
+    const q2 = `
+      WITH agent_identity AS (
+        SELECT LOWER(u.name) AS agent_name_lc,
+               LOWER(COALESCE(a.agent_code,'')) AS agent_code_lc
+        FROM public.users u
+        LEFT JOIN public.agents a ON a.user_id = u.user_id
+        WHERE u.user_id = $1
+        LIMIT 1
+      ),
+      scoped_sales AS (
+        SELECT s.*
+        FROM public.sales s
+        JOIN agent_identity ai ON (
+          s.teller_id = $1
+          OR (ai.agent_code_lc <> '' AND LOWER(COALESCE(s.branch,'')) = ai.agent_code_lc)
+          OR (ai.agent_name_lc <> '' AND LOWER(COALESCE(s.branch,'')) = ai.agent_name_lc)
+        )
+        WHERE s.payment_type IN ('Cash','Bank','Credit')
+          AND LOWER(COALESCE(s.customer_name,'')) = LOWER($2)
+      )
+      SELECT id, created_at, total_amount, payment_type, amount_paid, change_given, credit_amount, remaining_credit_amount
+      FROM scoped_sales
+      ORDER BY created_at DESC
+      LIMIT 200;
+    `;
+    const paymentsRes = await client.query(q2, [user_id, customerName]);
+
+    res.status(200).json({
+      customerName,
+      active,
+      aggregate: {
+        totalPaidAllTime: totalAllTime,
+        paidThisMonth: totalInMonth,
+        expectedCommissionMonth: Number((totalInMonth * 0.10).toFixed(2)),
+        lastPaymentDate: lastPaymentAt ? lastPaymentAt.toISOString() : null,
+      },
+      payments: paymentsRes.rows.map(r => ({
+        id: r.id,
+        date: r.created_at ? new Date(r.created_at).toISOString() : null,
+        totalAmount: Number(r.total_amount ?? 0),
+        paymentType: r.payment_type,
+        amountPaid: r.amount_paid !== null ? Number(r.amount_paid) : null,
+        changeGiven: r.change_given !== null ? Number(r.change_given) : null,
+        creditAmount: r.credit_amount !== null ? Number(r.credit_amount) : null,
+        remainingCreditAmount: r.remaining_credit_amount !== null ? Number(r.remaining_credit_amount) : null,
+      })),
+    });
+  } catch (err) {
+    console.error('Error fetching client history:', err);
+    res.status(500).json({ error: 'Failed to fetch client history.' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/super-agent/leaderboard?month=YYYY-MM&metric=commission|applications&limit=10
+app.get('/api/super-agent/leaderboard', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id;
+  const metric = (String(req.query.metric || 'commission').toLowerCase() === 'applications')
+    ? 'applications'
+    : 'commission';
+  const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '10'), 10) || 10));
+  const monthQ = (req.query.month as string) || '';
+
+  const now = new Date();
+  const [y, m] = monthQ && /^\d{4}-\d{2}$/.test(monthQ)
+    ? monthQ.split('-').map(Number)
+    : [now.getUTCFullYear(), now.getUTCMonth() + 1];
+
+  const startOfMonth = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0));
+  const startOfNext  = new Date(Date.UTC(y, m, 1, 0, 0, 0));
+
+  const client = await pool.connect();
+  try {
+    const rows = await client.query(
+      `
+      WITH team AS (
+        SELECT 
+          u.user_id,
+          u.name AS display_name,
+          LOWER(u.name) AS agent_name_lc,
+          LOWER(COALESCE(a.agent_code,'')) AS agent_code_lc,
+          COALESCE(a.agent_code,'') AS agent_code,
+          COALESCE(a.commission_rate, 0.10) AS commission_rate
+        FROM public.users u
+        JOIN public.user_roles ur ON ur.user_id = u.user_id AND LOWER(ur.role) = 'agent'
+        LEFT JOIN public.agents a ON a.user_id = u.user_id
+        WHERE u.parent_user_id = $1
+      ),
+      regs AS (
+        SELECT 
+          a.user_id,
+          COUNT(*) AS regs_month
+        FROM public.applications a
+        JOIN team t ON t.user_id = a.user_id
+        WHERE a.created_at >= $2 AND a.created_at < $3
+        GROUP BY a.user_id
+      ),
+      sales AS (
+        SELECT 
+          t.user_id,
+          COALESCE(SUM(s.total_amount), 0) AS sales_month
+        FROM team t
+        JOIN public.sales s
+          ON (
+            s.teller_id = t.user_id
+            OR (t.agent_code_lc <> '' AND LOWER(COALESCE(s.branch,'')) = t.agent_code_lc)
+            OR (t.agent_name_lc <> '' AND LOWER(COALESCE(s.branch,'')) = t.agent_name_lc)
+          )
+         AND s.payment_type IN ('Cash','Bank','Credit')
+         AND s.created_at >= $2 AND s.created_at < $3
+        GROUP BY t.user_id
+      )
+      SELECT 
+        t.user_id,
+        t.display_name,
+        t.agent_code,
+        COALESCE(r.regs_month, 0) AS registrations,
+        COALESCE(s.sales_month, 0) AS paid_total,
+        ROUND(COALESCE(s.sales_month,0) * t.commission_rate, 2) AS commission_month
+      FROM team t
+      LEFT JOIN regs  r ON r.user_id = t.user_id
+      LEFT JOIN sales s ON s.user_id = t.user_id
+      ORDER BY 
+        ${metric === 'applications' ? 'registrations DESC, paid_total DESC' : 'commission_month DESC, registrations DESC'}
+      LIMIT $4
+      `,
+      [superAgentUserId, startOfMonth.toISOString(), startOfNext.toISOString(), limit]
+    );
+
+    res.json(rows.rows);
+  } catch (err) {
+    console.error('Error building leaderboard:', err);
+    res.status(500).json({ error: 'Failed to build leaderboard' });
+  } finally {
+    client.release();
+  }
+});
+
+
+// GET /api/super-agent/agents-with-stats?month=YYYY-MM
+app.get('/api/super-agent/agents-with-stats', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id;
+  const monthQ = (req.query.month as string) || '';
+
+  const now = new Date();
+  const [y, m] = monthQ && /^\d{4}-\d{2}$/.test(monthQ)
+    ? monthQ.split('-').map(Number)
+    : [now.getUTCFullYear(), now.getUTCMonth() + 1];
+
+  const startOfMonth = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0));
+  const startOfNext  = new Date(Date.UTC(y, m, 1, 0, 0, 0));
+
+  const client = await pool.connect();
+  try {
+    const agentsRes = await client.query(
+      `
+      SELECT 
+        u.user_id,
+        u.name        AS display_name,
+        u.email,
+        COALESCE(a.agent_code, '') AS agent_code,
+        COALESCE(a.territory, '')  AS territory,
+        COALESCE(a.commission_rate, 0.10) AS commission_rate
+      FROM public.users u
+      JOIN public.user_roles ur ON ur.user_id = u.user_id AND LOWER(ur.role) = 'agent'
+      LEFT JOIN public.agents a   ON a.user_id  = u.user_id
+      WHERE u.parent_user_id = $1
+      ORDER BY LOWER(u.name)
+      `,
+      [superAgentUserId]
+    );
+
+    if (!agentsRes.rowCount) return res.json([]);
+
+    const regRes = await client.query(
+      `
+      WITH team_agents AS (
+        SELECT u.user_id
+        FROM public.users u
+        JOIN public.user_roles ur ON ur.user_id = u.user_id AND LOWER(ur.role) = 'agent'
+        WHERE u.parent_user_id = $1
+      )
+      SELECT 
+        a.user_id,
+        COUNT(*) FILTER (WHERE a.created_at >= $2 AND a.created_at < $3) AS regs_month,
+        COUNT(*) AS regs_all_time
+      FROM public.applications a
+      JOIN team_agents ta ON ta.user_id = a.user_id
+      GROUP BY a.user_id
+      `,
+      [superAgentUserId, startOfMonth.toISOString(), startOfNext.toISOString()]
+    );
+
+    const salesRes = await client.query(
+      `
+      WITH base AS (
+        SELECT 
+          u.user_id AS agent_user_id,
+          LOWER(u.name) AS agent_name_lc,
+          LOWER(COALESCE(a.agent_code,'')) AS agent_code_lc
+        FROM public.users u
+        JOIN public.user_roles ur ON ur.user_id = u.user_id AND LOWER(ur.role) = 'agent'
+        LEFT JOIN public.agents a  ON a.user_id  = u.user_id
+        WHERE u.parent_user_id = $1
+      ),
+      joined_sales AS (
+        SELECT 
+          b.agent_user_id,
+          s.total_amount,
+          s.created_at
+        FROM base b
+        JOIN public.sales s
+          ON (
+            s.teller_id = b.agent_user_id
+            OR (b.agent_code_lc <> '' AND LOWER(COALESCE(s.branch,'')) = b.agent_code_lc)
+            OR (b.agent_name_lc <> '' AND LOWER(COALESCE(s.branch,'')) = b.agent_name_lc)
+          )
+         AND s.payment_type IN ('Cash','Bank','Credit')
+      )
+      SELECT
+        agent_user_id,
+        COALESCE(SUM(total_amount) FILTER (WHERE created_at >= $2 AND created_at < $3), 0) AS sales_month,
+        COALESCE(SUM(total_amount), 0)                                                     AS sales_all_time
+      FROM joined_sales
+      GROUP BY agent_user_id
+      `,
+      [superAgentUserId, startOfMonth.toISOString(), startOfNext.toISOString()]
+    );
+
+    const regMap = new Map<string, { regs_month: number; regs_all_time: number }>();
+    for (const r of regRes.rows) {
+      regMap.set(r.user_id, {
+        regs_month: Number(r.regs_month || 0),
+        regs_all_time: Number(r.regs_all_time || 0),
+      });
+    }
+
+    const salesMap = new Map<string, { sales_month: number; sales_all_time: number }>();
+    for (const s of salesRes.rows) {
+      salesMap.set(s.agent_user_id, {
+        sales_month: Number(s.sales_month || 0),
+        sales_all_time: Number(s.sales_all_time || 0),
+      });
+    }
+
+    const out = agentsRes.rows.map((a) => {
+      const regs = regMap.get(a.user_id) || { regs_month: 0, regs_all_time: 0 };
+      const sales = salesMap.get(a.user_id) || { sales_month: 0, sales_all_time: 0 };
+      const commissionRate = Number(a.commission_rate ?? 0.10);
+      const commissionMonth = Number((sales.sales_month * commissionRate).toFixed(2));
+
+      return {
+        user_id: a.user_id,
+        displayName: a.display_name,
+        email: a.email,
+        agent_code: a.agent_code || null,
+        territory: a.territory || null,
+        commission_rate: commissionRate,
+        registrationsThisMonth: regs.regs_month,
+        registrationsAllTime: regs.regs_all_time,
+        totalPaidThisMonth: sales.sales_month,
+        totalPaidAllTime: sales.sales_all_time,
+        expectedCommissionThisMonth: commissionMonth,
+      };
+    });
+
+    res.json(out);
+  } catch (err) {
+    console.error('Error building agents-with-stats:', err);
+    res.status(500).json({ error: 'Failed to build agents-with-stats' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/super-agent/agent/:agent_user_id/chart-data?period=last_5_months
+app.get('/api/super-agent/agent/:agent_user_id/chart-data', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id;
+  const agentUserId      = req.params.agent_user_id;
+  const period           = String(req.query.period || 'last_5_months');
+
+  if (period !== 'last_5_months') {
+    return res.status(400).json({ error: 'Invalid or unsupported period parameter.' });
+  }
+
+  // Verify the agent belongs to this super agent
+  const own = await pool.query(
+    `SELECT 1 FROM public.users WHERE user_id = $1 AND parent_user_id = $2`,
+    [agentUserId, superAgentUserId]
+  );
+  if (!own.rowCount) return res.status(403).json({ error: 'Agent not in your team.' });
+
+  const now = new Date();
+
+  // Prepare 5 consecutive month windows
+  const months: { label: string; start: Date; end: Date }[] = [];
+  for (let i = 4; i >= 0; i--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0));
+    const end   = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1, 0, 0, 0));
+    months.push({ label: start.toLocaleString('en-ZA', { month: 'short' }), start, end });
+  }
+
+  const client = await pool.connect();
+  try {
+    // Pull agent_code and name (for branch fallback)
+    const meta = await client.query(
+      `
+      SELECT LOWER(u.name) AS agent_name_lc, LOWER(COALESCE(a.agent_code,'')) AS agent_code_lc
+      FROM public.users u
+      LEFT JOIN public.agents a ON a.user_id = u.user_id
+      WHERE u.user_id = $1
+      `,
+      [agentUserId]
+    );
+    const agent_name_lc = meta.rows[0]?.agent_name_lc || '';
+    const agent_code_lc = meta.rows[0]?.agent_code_lc || '';
+
+    const data = [];
+    for (const { label, start, end } of months) {
+      // registrations
+      const reg = await client.query(
+        `SELECT COUNT(*) AS cnt
+         FROM public.applications
+         WHERE user_id = $1
+           AND created_at >= $2::timestamptz
+           AND created_at <  $3::timestamptz`,
+        [agentUserId, start.toISOString(), end.toISOString()]
+      );
+      const registrations = parseInt(reg.rows[0]?.cnt || '0', 10);
+
+      // payments (sum of total_amount)
+// inside the for-loop, replace the payments SELECT with this guarded version:
+const pay = await client.query(
+  `
+  SELECT COALESCE(SUM(total_amount), 0) AS total
+  FROM public.sales s
+  WHERE (
+    s.teller_id = $1
+    OR ($2 <> '' AND LOWER(COALESCE(s.branch,'')) = $2)
+    OR ($3 <> '' AND LOWER(COALESCE(s.branch,'')) = $3)
+  )
+    AND s.payment_type IN ('Cash','Bank','Credit')
+    AND s.created_at >= $4::timestamptz
+    AND s.created_at <  $5::timestamptz
+  `,
+  [agentUserId, agent_code_lc, agent_name_lc, start.toISOString(), end.toISOString()]
+);
+
+      const paymentsTotal = Number(pay.rows[0]?.total || 0);
+
+      data.push({
+        month: label,
+        registrations,
+        paymentsTotal,                 // sum of total_amount
+        commissionAt10: Number((paymentsTotal * 0.10).toFixed(2)), // handy for the line/donut
+      });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error('Error building agent chart-data:', err);
+    res.status(500).json({ error: 'Failed to build agent chart data' });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
 
 
 
@@ -12869,16 +13571,16 @@ app.post('/api/migrate-transactions-to-journal', authMiddleware, async (req: Req
 });
 // --- END NEW ENDPOINT ---
 
-
-// Example SQL for Revenue Endpoint (GET /api/stats/revenue?startDate=...&endDate=...)
-// Replace the entire /api/stats/revenue endpoint with this version
-app.get("/api/stats/revenue", authMiddleware, async (req, res) => {
+// --- Updated /api/stats/revenue Endpoint ---
+// This endpoint now fetches revenue directly from journal_lines where the associated account's reporting_category is 'revenue'.
+app.get("/api/stats/revenue", authMiddleware, async (req: Request, res: Response) => {
     const userId = req.user!.parent_user_id;
     const startDate = req.query.startDate as string | undefined;
     const endDate = req.query.endDate as string | undefined;
 
     try {
         // --- Current Period Revenue ---
+        // Query sums the CREDIT side of journal lines linked to 'revenue' accounts.
         let currentQuery = `
             SELECT COALESCE(SUM(jl.credit), 0)::numeric(14, 2) AS total_revenue
             FROM public.journal_lines jl
@@ -12887,13 +13589,19 @@ app.get("/api/stats/revenue", authMiddleware, async (req, res) => {
             JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
             WHERE je.user_id = $1
               AND rc.statement = 'income_statement'
-              AND rc.section = 'revenue' -- Changed from a.type = 'Income'
-              AND je.entry_date >= $2
-              AND je.entry_date <= $3
+              AND rc.section = 'revenue'
         `;
-        let currentParams: any[] = [userId, '1970-01-01', '9999-12-31']; // Default wide range
-        if (startDate) currentParams[1] = startDate;
-        if (endDate) currentParams[2] = endDate;
+        // Add date filters if provided
+        if (startDate) {
+            currentQuery += ` AND je.entry_date >= $2`;
+        }
+        if (endDate) {
+            currentQuery += ` AND je.entry_date <= $${startDate ? '3' : '2'}`;
+        }
+
+        let currentParams: any[] = [userId];
+        if (startDate) currentParams.push(startDate);
+        if (endDate) currentParams.push(endDate);
 
         const currentResult = await pool.query(currentQuery, currentParams);
         const currentRevenue = parseFloat(currentResult.rows[0]?.total_revenue) || 0;
@@ -12907,30 +13615,29 @@ app.get("/api/stats/revenue", authMiddleware, async (req, res) => {
             JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
             WHERE je.user_id = $1
               AND rc.statement = 'income_statement'
-              AND rc.section = 'revenue' -- Changed from a.type = 'Income'
-              AND je.entry_date >= $2
-              AND je.entry_date < $3 -- Use < start to get previous period
+              AND rc.section = 'revenue'
         `;
-        let previousParams: any[] = [userId, '1970-01-01', currentParams[1]]; // Default, previous period ends before current starts
-
-        // Calculate a simple previous period (e.g., same number of days before the current period)
+        // Calculate previous period dates
+        let previousParams: any[] = [userId];
         if (startDate && endDate) {
-             const start = new Date(startDate);
-             const end = new Date(endDate);
-             const diffTime = Math.abs(end.getTime() - start.getTime());
-             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to make it inclusive like the main period?
-
-             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24); // One day before start
-             const previousStart = new Date(previousEnd.getTime() - diffTime); // Same duration before that
-
-             previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            const diffTime = Math.abs(end.getTime() - start.getTime());
+            const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24); // One day before start
+            const previousStart = new Date(previousEnd.getTime() - diffTime); // Same duration before that
+            previousQuery += ` AND je.entry_date >= $2 AND je.entry_date <= $3`;
+            previousParams.push(previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]);
         } else if (startDate) {
-            // If only start date, maybe compare to a fixed duration before?
             const start = new Date(startDate);
             const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24); // One day before
             const previousStart = new Date(previousEnd.getTime() - thirtyDaysMs);
-            previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+            previousQuery += ` AND je.entry_date >= $2 AND je.entry_date <= $3`;
+            previousParams.push(previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]);
+        } else {
+             // If no dates, previous period uses default wide range start to current default start
+             previousQuery += ` AND je.entry_date >= $2 AND je.entry_date < $3`;
+             previousParams.push('1970-01-01', '1970-01-01'); // Default comparison
         }
 
         const previousResult = await pool.query(previousQuery, previousParams);
@@ -12943,9 +13650,7 @@ app.get("/api/stats/revenue", authMiddleware, async (req, res) => {
             changePercentage = ((currentRevenue - previousRevenue) / Math.abs(previousRevenue)) * 100;
             changeType = changePercentage > 0 ? 'increase' : changePercentage < 0 ? 'decrease' : 'neutral';
         } else if (currentRevenue > 0) {
-             changeType = 'increase'; // Went from 0 to positive
-        } else if (currentRevenue < 0) {
-             changeType = 'decrease'; // Went from 0 to negative (unlikely for revenue, but possible in accounting)
+             changeType = 'increase';
         }
 
         res.json({
@@ -12955,20 +13660,29 @@ app.get("/api/stats/revenue", authMiddleware, async (req, res) => {
             changeType: changeType
         });
 
-    } catch (err: any) {
-        console.error("Error fetching revenue stats:", err);
-        res.status(500).json({ error: "Failed to fetch revenue statistics.", detail: err.message });
+    } catch (error: unknown) {
+        console.error("Error fetching revenue stats:", error);
+        if (error instanceof Error) {
+            res.status(500).json({ error: "Failed to fetch revenue statistics.", detail: error.message });
+        } else {
+            res.status(500).json({ error: "Failed to fetch revenue statistics.", detail: String(error) });
+        }
     }
 });
+// --- End Updated /api/stats/revenue ---
 
 
-app.get("/api/stats/expenses", authMiddleware, async (req, res) => {
+// --- Updated /api/stats/expenses Endpoint ---
+// This endpoint now fetches total expenses from journal_lines, summing relevant expense sections.
+app.get("/api/stats/expenses", authMiddleware, async (req: Request, res: Response) => {
     const userId = req.user!.parent_user_id;
     const startDate = req.query.startDate as string | undefined;
     const endDate = req.query.endDate as string | undefined;
 
     try {
         // --- Current Period Expenses ---
+        // Query sums the DEBIT side of journal lines linked to expense accounts.
+        // Includes operating_expenses, finance_costs, cogs (if considered an expense here).
         let currentQuery = `
             SELECT COALESCE(SUM(jl.debit), 0)::numeric(14, 2) AS total_expenses
             FROM public.journal_lines jl
@@ -12977,13 +13691,19 @@ app.get("/api/stats/expenses", authMiddleware, async (req, res) => {
             JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
             WHERE je.user_id = $1
               AND rc.statement = 'income_statement'
-              AND rc.section IN ('operating_expenses') -- Include ALL expense sections
-              AND je.entry_date >= $2
-              AND je.entry_date <= $3
+              AND rc.section IN ('operating_expenses', 'finance_costs', 'cogs')
         `;
-        let currentParams: any[] = [userId, '1970-01-01', '9999-12-31'];
-        if (startDate) currentParams[1] = startDate;
-        if (endDate) currentParams[2] = endDate;
+         // Add date filters if provided
+        if (startDate) {
+            currentQuery += ` AND je.entry_date >= $2`;
+        }
+        if (endDate) {
+            currentQuery += ` AND je.entry_date <= $${startDate ? '3' : '2'}`;
+        }
+
+        let currentParams: any[] = [userId];
+        if (startDate) currentParams.push(startDate);
+        if (endDate) currentParams.push(endDate);
 
         const currentResult = await pool.query(currentQuery, currentParams);
         const currentExpenses = parseFloat(currentResult.rows[0]?.total_expenses) || 0;
@@ -12997,29 +13717,28 @@ app.get("/api/stats/expenses", authMiddleware, async (req, res) => {
             JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
             WHERE je.user_id = $1
               AND rc.statement = 'income_statement'
-              AND rc.section IN ('operating_expenses')
-              AND je.entry_date >= $2
-              AND je.entry_date < $3
+              AND rc.section IN ('operating_expenses', 'finance_costs', 'cogs')
         `;
         // Calculate previous period dates (same logic as revenue)
-        let previousParams: any[] = [userId, '1970-01-01', currentParams[1]];
-
+        let previousParams: any[] = [userId];
         if (startDate && endDate) {
-             const start = new Date(startDate);
-             const end = new Date(endDate);
-             const diffTime = Math.abs(end.getTime() - start.getTime());
-             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-
-             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
-             const previousStart = new Date(previousEnd.getTime() - diffTime);
-
-             previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            const diffTime = Math.abs(end.getTime() - start.getTime());
+            const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
+            const previousStart = new Date(previousEnd.getTime() - diffTime);
+            previousQuery += ` AND je.entry_date >= $2 AND je.entry_date <= $3`;
+            previousParams.push(previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]);
         } else if (startDate) {
             const start = new Date(startDate);
             const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
             const previousStart = new Date(previousEnd.getTime() - thirtyDaysMs);
-            previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+            previousQuery += ` AND je.entry_date >= $2 AND je.entry_date <= $3`;
+            previousParams.push(previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]);
+        } else {
+             previousQuery += ` AND je.entry_date >= $2 AND je.entry_date < $3`;
+             previousParams.push('1970-01-01', '1970-01-01');
         }
 
         const previousResult = await pool.query(previousQuery, previousParams);
@@ -13033,8 +13752,6 @@ app.get("/api/stats/expenses", authMiddleware, async (req, res) => {
             changeType = changePercentage > 0 ? 'increase' : changePercentage < 0 ? 'decrease' : 'neutral';
         } else if (currentExpenses > 0) {
              changeType = 'increase';
-        } else if (currentExpenses < 0) {
-             changeType = 'decrease'; // Unlikely for expenses
         }
 
         res.json({
@@ -13044,45 +13761,51 @@ app.get("/api/stats/expenses", authMiddleware, async (req, res) => {
             changeType: changeType
         });
 
-    } catch (err: any) {
-        console.error("Error fetching expenses stats:", err);
-        res.status(500).json({ error: "Failed to fetch expenses statistics.", detail: err.message });
+    } catch (error: unknown) {
+        console.error("Error fetching expenses stats:", error);
+        if (error instanceof Error) {
+            res.status(500).json({ error: "Failed to fetch expenses statistics.", detail: error.message });
+        } else {
+            res.status(500).json({ error: "Failed to fetch expenses statistics.", detail: String(error) });
+        }
     }
 });
+// --- End Updated /api/stats/expenses ---
 
-// Example SQL for Profitability Endpoint (GET /api/stats/profitability?startDate=...&endDate=...)
-// Example SQL for Profitability Endpoint (GET /api/stats/profitability?startDate=...&endDate=...)
-app.get("/api/stats/profitability", authMiddleware, async (req, res) => {
+
+// --- Updated /api/stats/profitability Endpoint ---
+// This endpoint now calculates Net Profit/Loss directly from journal_lines using revenue and expense sections.
+app.get("/api/stats/profitability", authMiddleware, async (req: Request, res: Response) => {
     const userId = req.user!.parent_user_id;
     const startDate = req.query.startDate as string | undefined;
     const endDate = req.query.endDate as string | undefined;
 
     try {
         // --- Current Period Profitability (Net Income) ---
-        // --- FIXED: Use reporting_categories to filter for specific IS sections ---
+        // Calculates Net Profit: (Total Revenue Credits) - (Total Expense Debits)
         let currentQuery = `
             SELECT
-                COALESCE(SUM(CASE
-                    WHEN rc.section = 'revenue' THEN jl.credit -- Only 'revenue' section credits
-                    ELSE 0
-                END), 0)::numeric(14, 2) AS total_revenue,
-                COALESCE(SUM(CASE
-                    WHEN rc.section = 'operating_expenses' THEN jl.debit -- Only 'operating_expenses' section debits (adjust section name if needed)
-                    ELSE 0
-                END), 0)::numeric(14, 2) AS total_expenses
+                COALESCE(SUM(CASE WHEN rc.section = 'revenue' THEN jl.credit ELSE 0 END), 0)::numeric(14, 2) AS total_revenue,
+                COALESCE(SUM(CASE WHEN rc.section IN ('operating_expenses', 'finance_costs', 'cogs') THEN jl.debit ELSE 0 END), 0)::numeric(14, 2) AS total_expenses
             FROM public.journal_lines jl
             JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
             JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
-            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id -- Added JOIN
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
             WHERE je.user_id = $1
-              AND rc.statement = 'income_statement'                           -- Filter for IS
-              AND rc.section IN ('revenue', 'operating_expenses')            -- Specific sections (adjust if needed)
-              AND je.entry_date >= $2
-              AND je.entry_date <= $3
+              AND rc.statement = 'income_statement'
+              AND rc.section IN ('revenue', 'operating_expenses', 'finance_costs', 'cogs')
         `;
-        let currentParams: any[] = [userId, '1970-01-01', '9999-12-31'];
-        if (startDate) currentParams[1] = startDate;
-        if (endDate) currentParams[2] = endDate;
+         // Add date filters if provided
+        if (startDate) {
+            currentQuery += ` AND je.entry_date >= $2`;
+        }
+        if (endDate) {
+            currentQuery += ` AND je.entry_date <= $${startDate ? '3' : '2'}`;
+        }
+
+        let currentParams: any[] = [userId];
+        if (startDate) currentParams.push(startDate);
+        if (endDate) currentParams.push(endDate);
 
         const currentResult = await pool.query(currentQuery, currentParams);
         const currentRevenue = parseFloat(currentResult.rows[0]?.total_revenue) || 0;
@@ -13090,46 +13813,38 @@ app.get("/api/stats/profitability", authMiddleware, async (req, res) => {
         const currentProfit = currentRevenue - currentExpenses;
 
         // --- Previous Period Profitability (Net Income) ---
-        // --- FIXED: Use reporting_categories for previous period too ---
         let previousQuery = `
             SELECT
-                COALESCE(SUM(CASE
-                    WHEN rc.section = 'revenue' THEN jl.credit
-                    ELSE 0
-                END), 0)::numeric(14, 2) AS total_revenue,
-                COALESCE(SUM(CASE
-                    WHEN rc.section = 'operating_expenses' THEN jl.debit -- Adjust section name if needed
-                    ELSE 0
-                END), 0)::numeric(14, 2) AS total_expenses
+                COALESCE(SUM(CASE WHEN rc.section = 'revenue' THEN jl.credit ELSE 0 END), 0)::numeric(14, 2) AS total_revenue,
+                COALESCE(SUM(CASE WHEN rc.section IN ('operating_expenses', 'finance_costs', 'cogs') THEN jl.debit ELSE 0 END), 0)::numeric(14, 2) AS total_expenses
             FROM public.journal_lines jl
             JOIN public.journal_entries je ON jl.entry_id = je.id AND jl.user_id = je.user_id
             JOIN public.accounts a ON jl.account_id = a.id AND jl.user_id = a.user_id
-            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id -- Added JOIN
+            JOIN public.reporting_categories rc ON rc.id = a.reporting_category_id
             WHERE je.user_id = $1
-              AND rc.statement = 'income_statement'                             -- Filter for IS
-              AND rc.section IN ('revenue', 'operating_expenses')              -- Specific sections (adjust if needed)
-              AND je.entry_date >= $2
-              AND je.entry_date < $3
+              AND rc.statement = 'income_statement'
+              AND rc.section IN ('revenue', 'operating_expenses', 'finance_costs', 'cogs')
         `;
         // Calculate previous period dates
-        let previousParams: any[] = [userId, '1970-01-01', currentParams[1]];
-
+        let previousParams: any[] = [userId];
         if (startDate && endDate) {
-             const start = new Date(startDate);
-             const end = new Date(endDate);
-             const diffTime = Math.abs(end.getTime() - start.getTime());
-             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-
-             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
-             const previousStart = new Date(previousEnd.getTime() - diffTime);
-
-             previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            const diffTime = Math.abs(end.getTime() - start.getTime());
+            const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
+            const previousStart = new Date(previousEnd.getTime() - diffTime);
+            previousQuery += ` AND je.entry_date >= $2 AND je.entry_date <= $3`;
+            previousParams.push(previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]);
         } else if (startDate) {
             const start = new Date(startDate);
             const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
             const previousEnd = new Date(start.getTime() - 1000 * 60 * 60 * 24);
             const previousStart = new Date(previousEnd.getTime() - thirtyDaysMs);
-            previousParams = [userId, previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]];
+            previousQuery += ` AND je.entry_date >= $2 AND je.entry_date <= $3`;
+            previousParams.push(previousStart.toISOString().split('T')[0], previousEnd.toISOString().split('T')[0]);
+        } else {
+             previousQuery += ` AND je.entry_date >= $2 AND je.entry_date < $3`;
+             previousParams.push('1970-01-01', '1970-01-01');
         }
 
         const previousResult = await pool.query(previousQuery, previousParams);
@@ -13150,322 +13865,23 @@ app.get("/api/stats/profitability", authMiddleware, async (req, res) => {
         }
 
         res.json({
-            value: currentProfit, // Net Profit/Loss
+            value: currentProfit,
             previousValue: previousProfit,
             changePercentage: parseFloat(changePercentage.toFixed(2)),
             changeType: changeType
         });
 
-    } catch (err: any) {
-        console.error("Error fetching profitability stats:", err);
-        res.status(500).json({ error: "Failed to fetch profitability statistics.", detail: err.message });
-    }
-});
-
-// Helper function to calculate previous period dates based on the current period
-
-
-// NEW ENDPOINT: GET Revenue Statistics for a period (or all time)
-{/*app.get('/api/stats/revenue', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id;
-    // startDate and endDate can now be optional
-    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
-
-    try {
-        let currentPeriodValue = 0;
-        let previousPeriodValue = 0;
-        let changePercentage: number | undefined;
-        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
-
-        let dateFilterClause = '';
-        const currentQueryParams: (string | number)[] = [user_id];
-        let currentParamIndex = 2;
-
-        // If both startDate and endDate are provided, build the date filter clause
-        if (startDate && endDate) {
-            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
-            currentQueryParams.push(startDate);
-            currentQueryParams.push(endDate);
-        }
-
-        // Fetch current period revenue (or all-time if no dates provided)
-        const currentRevenueResult = await pool.query(`
-            SELECT COALESCE(SUM(amount), 0) AS value
-            FROM public.transactions
-            WHERE
-                user_id = $1
-                AND type = 'income'
-                AND category IN ('Revenue', 'Sales Revenue')
-                ${dateFilterClause};
-        `, currentQueryParams);
-
-        currentPeriodValue = parseFloat(currentRevenueResult.rows[0]?.value || 0);
-
-        // Only calculate previous period and change if a specific date range was provided
-        if (startDate && endDate) {
-            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
-            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
-
-            // Fetch previous period revenue
-            const previousRevenueResult = await pool.query(`
-                SELECT COALESCE(SUM(amount), 0) AS value
-                FROM public.transactions
-                WHERE
-                    user_id = $1
-                    AND type = 'income'
-                    AND category IN ('Revenue', 'Sales Revenue')
-                    AND date BETWEEN $2 AND $3;
-            `, previousQueryParams);
-
-            previousPeriodValue = parseFloat(previousRevenueResult.rows[0]?.value || 0);
-
-            // Calculate change percentage
-            if (previousPeriodValue !== 0) {
-                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
-                if (changePercentage > 0) {
-                    changeType = 'increase';
-                } else if (changePercentage < 0) {
-                    changeType = 'decrease';
-                }
-            } else if (currentPeriodValue > 0) {
-                changePercentage = 100; // Infinite increase from zero to a positive value
-                changeType = 'increase';
-            }
-        }
-
-        res.json({
-            value: currentPeriodValue,
-            previousValue: previousPeriodValue,
-            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
-            changeType: changeType
-        });
-
     } catch (error: unknown) {
-        console.error('Error fetching revenue stats:', error);
-        res.status(500).json({ error: 'Failed to fetch revenue statistics', detail: error instanceof Error ? error.message : String(error) });
+        console.error("Error fetching profitability stats:", error);
+        if (error instanceof Error) {
+            res.status(500).json({ error: "Failed to fetch profitability statistics.", detail: error.message });
+        } else {
+            res.status(500).json({ error: "Failed to fetch profitability statistics.", detail: String(error) });
+        }
     }
 });
+// --- End Updated /api/stats/profitability ---
 
-// NEW ENDPOINT: GET Expenses Statistics for a period (or all time)
-app.get('/api/stats/expenses', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id;
-    // startDate and endDate can now be optional
-    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
-
-    try {
-        let currentPeriodValue = 0;
-        let previousPeriodValue = 0;
-        let changePercentage: number | undefined;
-        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
-
-        let dateFilterClause = '';
-        const currentQueryParams: (string | number)[] = [user_id];
-        let currentParamIndex = 2;
-
-        // If both startDate and endDate are provided, build the date filter clause
-        if (startDate && endDate) {
-            dateFilterClause = ` AND date BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
-            currentQueryParams.push(startDate);
-            currentQueryParams.push(endDate);
-        }
-
-        // Fetch current period expenses (or all-time if no dates provided)
-        const currentExpensesResult = await pool.query(`
-            SELECT COALESCE(SUM(amount), 0) AS value
-            FROM public.transactions
-            WHERE
-                user_id = $1
-                AND type = 'expense'
-                ${dateFilterClause};
-        `, currentQueryParams);
-
-        currentPeriodValue = parseFloat(currentExpensesResult.rows[0]?.value || 0);
-
-        // Only calculate previous period and change if a specific date range was provided
-        if (startDate && endDate) {
-            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
-            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
-
-            // Fetch previous period expenses
-            const previousExpensesResult = await pool.query(`
-                SELECT COALESCE(SUM(amount), 0) AS value
-                FROM public.transactions
-                WHERE
-                    user_id = $1
-                    AND type = 'expense'
-                    AND date BETWEEN $2 AND $3;
-            `, previousQueryParams);
-
-            previousPeriodValue = parseFloat(previousExpensesResult.rows[0]?.value || 0);
-
-            // Calculate change percentage
-            if (previousPeriodValue !== 0) {
-                changePercentage = ((currentPeriodValue - previousPeriodValue) / previousPeriodValue) * 100;
-                if (changePercentage > 0) { // For expenses, an increase is often seen as a negative trend
-                    changeType = 'increase';
-                } else if (changePercentage < 0) {
-                    changeType = 'decrease';
-                }
-            } else if (currentPeriodValue > 0) {
-                changePercentage = 100; // Infinite increase from zero to a positive value
-                changeType = 'increase';
-            }
-        }
-
-        res.json({
-            value: currentPeriodValue,
-            previousValue: previousPeriodValue,
-            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
-            changeType: changeType
-        });
-
-    } catch (error: unknown) {
-        console.error('Error fetching expenses stats:', error);
-        res.status(500).json({ error: 'Failed to fetch expenses statistics', detail: error instanceof Error ? error.message : String(error) });
-    }
-});
-
-// Existing /api/stats/clients endpoint, modified to allow all-time view and use public.sales
-app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
-    const user_id = req.user!.parent_user_id;
-    // startDate and endDate can now be optional
-    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
-
-    try {
-        let currentPeriodCount = 0;
-        let previousPeriodCount = 0;
-        let changePercentage: number | undefined;
-        let changeType: 'increase' | 'decrease' | 'neutral' = 'neutral';
-
-        let dateFilterClause = '';
-        const currentQueryParams: (string | number)[] = [user_id];
-        let currentParamIndex = 2;
-
-        // If both startDate and endDate are provided, build the date filter clause for 'created_at'
-        if (startDate && endDate) {
-            dateFilterClause = ` AND created_at BETWEEN $${currentParamIndex++} AND $${currentParamIndex++}`;
-            currentQueryParams.push(startDate);
-            currentQueryParams.push(endDate);
-        }
-
-        // Fetch current period client count (or all-time if no dates provided)
-        // Now counting distinct customer_id from public.sales table
-        const currentClientsResult = await pool.query(`
-            SELECT COUNT(DISTINCT customer_id) AS count
-            FROM public.sales
-            WHERE user_id = $1
-            ${dateFilterClause};
-        `, currentQueryParams);
-        currentPeriodCount = parseInt(currentClientsResult.rows[0]?.count || 0, 10);
-
-        // Only calculate previous period and change if a specific date range was provided
-        if (startDate && endDate) {
-            const { prevStartDate, prevEndDate } = getPreviousPeriodDates(startDate, endDate);
-            const previousQueryParams: (string | number)[] = [user_id, prevStartDate, prevEndDate];
-
-            // Fetch previous period client count
-            // Now counting distinct customer_id from public.sales table
-            const previousClientsResult = await pool.query(`
-                SELECT COUNT(DISTINCT customer_id) AS count
-                FROM public.sales
-                WHERE user_id = $1
-                AND created_at BETWEEN $2 AND $3;
-            `, previousQueryParams);
-            previousPeriodCount = parseInt(previousClientsResult.rows[0]?.count || 0, 10);
-
-            // Calculate change percentage
-            if (previousPeriodCount !== 0) {
-                changePercentage = ((currentPeriodCount - previousPeriodCount) / previousPeriodCount) * 100;
-                if (changePercentage > 0) {
-                    changeType = 'increase';
-                } else if (changePercentage < 0) {
-                    changeType = 'decrease';
-                }
-            } else if (currentPeriodCount > 0) {
-                changePercentage = 100; // Infinite increase from zero to a positive value
-                changeType = 'increase';
-            }
-        }
-
-        res.json({
-            count: currentPeriodCount,
-            previousCount: previousPeriodCount,
-            changePercentage: changePercentage !== undefined ? parseFloat(changePercentage.toFixed(2)) : undefined,
-            changeType: changeType
-        });
-
-    } catch (error: unknown) {
-        console.error('Error fetching client stats:', error);
-        res.status(500).json({ error: 'Failed to fetch client statistics', detail: error instanceof Error ? error.message : String(error) });
-    }
-});
-
-
-// Add this new endpoint to your server.ts file, e.g., after the quotes endpoint.
-app.get('/api/stats/profitability', authMiddleware, async (req: Request, res: Response) => {
-  const user_id = req.user!.parent_user_id;
-  const { startDate, endDate } = req.query;
-
-  try {
-    let dateFilter = '';
-    const queryParams: (string | number)[] = [user_id];
-    let paramIndex = 2;
-
-    if (startDate) {
-      dateFilter += ` AND date >= $${paramIndex++}`;
-      queryParams.push(startDate as string);
-    }
-    if (endDate) {
-      dateFilter += ` AND date <= $${paramIndex++}`;
-      queryParams.push(endDate as string);
-    }
-
-    // Get total income
-    const incomeResult = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total_income FROM public.transactions WHERE user_id = $1 AND type = 'income' ${dateFilter};`,
-      queryParams
-    );
-    const totalIncome = parseFloat(incomeResult.rows[0]?.total_income || 0);
-
-    // Get total expenses
-    const expensesResult = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total_expenses FROM public.transactions WHERE user_id = $1 AND type = 'expense' ${dateFilter};`,
-      queryParams
-    );
-    const totalExpenses = parseFloat(expensesResult.rows[0]?.total_expenses || 0);
-
-    // Get previous period income
-    const { currentStart, previousStart, previousEnd } = getCurrentAndPreviousDateRanges();
-
-    const previousIncomeResult = await pool.query(
-        `SELECT COALESCE(SUM(amount), 0) AS total_income FROM public.transactions WHERE user_id = $1 AND type = 'income' AND date >= $2 AND date < $3;`,
-        [user_id, previousStart, currentStart]
-    );
-    const previousIncome = parseFloat(previousIncomeResult.rows[0]?.total_income || 0);
-
-    // Get previous period expenses
-    const previousExpensesResult = await pool.query(
-        `SELECT COALESCE(SUM(amount), 0) AS total_expenses FROM public.transactions WHERE user_id = $1 AND type = 'expense' AND date >= $2 AND date < $3;`,
-        [user_id, previousStart, currentStart]
-    );
-    const previousExpenses = parseFloat(previousExpensesResult.rows[0]?.total_expenses || 0);
-
-
-    const currentProfit = totalIncome - totalExpenses;
-    const previousProfit = previousIncome - previousExpenses;
-    const { changePercentage, changeType } = calculateChange(currentProfit, previousProfit);
-
-    res.status(200).json({
-      value: currentProfit,
-      previousValue: previousProfit,
-      changePercentage,
-      changeType,
-    });
-  } catch (error) {
-    console.error('Error fetching profitability stats:', error);
-    res.status(500).json({ error: 'Failed to fetch profitability stats.' });
-  }
-});*/}
 
 app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response) => {
     const user_id = req.user!.parent_user_id;
@@ -13546,361 +13962,42 @@ app.get('/api/stats/clients', authMiddleware, async (req: Request, res: Response
 // GET /api/my-agents - Fetch all users with the 'agent' role directly under the authenticated user
 // GET /api/my-agents - Fetch agents with core user info and some agent-specific info
 app.get('/api/my-agents', authMiddleware, async (req: Request, res: Response) => {
-  const superAgentUserId = req.user!.user_id; // ID of the logged-in Super Agent
+  const superAgentUserId = req.user!.user_id;
 
   try {
-    // Join users, user_roles, roles (for filtering) and agents (for specific data)
     const { rows } = await pool.query(
-      `SELECT u.id, u.name AS "displayName", u.email, u.user_id,
-              COALESCE(json_agg(DISTINCT r.name) FILTER (WHERE r.name IS NOT NULL), '[]') AS roles,
-              a.commission_rate, a.territory, a.agent_code -- Example agent-specific fields
-       FROM public.users u
-       LEFT JOIN public.user_roles ur ON u.user_id = ur.user_id
-       LEFT JOIN public.roles r ON ur.role = r.name
-       LEFT JOIN public.agents a ON u.user_id = a.user_id -- Join with agents table
-       WHERE u.parent_user_id = $1
-         AND LOWER(r.name) = 'agent'
-       GROUP BY u.id, u.name, u.email, u.user_id, a.commission_rate, a.territory, a.agent_code -- Include agent fields in GROUP BY
-       ORDER BY u.name`,
+      `
+      SELECT 
+        u.id,
+        u.name AS "displayName",
+        u.email,
+        u.user_id,
+        COALESCE(
+          json_agg(DISTINCT ur.role) FILTER (WHERE ur.role IS NOT NULL),
+          '[]'
+        ) AS roles,
+        a.commission_rate,
+        a.territory,
+        a.agent_code
+      FROM public.users u
+      LEFT JOIN public.user_roles ur ON ur.user_id = u.user_id
+      LEFT JOIN public.agents a      ON a.user_id  = u.user_id
+      WHERE u.parent_user_id = $1
+        AND EXISTS (
+          SELECT 1 FROM public.user_roles ur2
+          WHERE ur2.user_id = u.user_id AND LOWER(ur2.role) = 'agent'
+        )
+      GROUP BY u.id, u.name, u.email, u.user_id, a.commission_rate, a.territory, a.agent_code
+      ORDER BY LOWER(u.name)
+      `,
       [superAgentUserId]
     );
+
     res.json(rows);
   } catch (error: unknown) {
     console.error('Error fetching agents:', error);
-    res.status(500).json({ error: 'Failed to fetch agents.', detail: error instanceof Error ? error.message : String(error) });
-  }
-});
-
-
-// EDIT/UPDATE AGENT ENDPOINT
-// EDIT/UPDATE AGENT ENDPOINT
-// EDIT/UPDATE AGENT ENDPOINT
-app.patch('/api/agents/:user_id', authMiddleware, async (req: Request, res: Response) => {
-  const superAgentUserId = req.user!.user_id; // ID of the logged-in Super Agent
-  const targetUserId = req.params.user_id; // User ID of the agent to update
-  const updates = req.body; // Fields to update
-
-  try {
-    // First, verify that the agent belongs to this super agent
-    const agentCheck = await pool.query(
-      `SELECT 1 FROM public.users 
-       WHERE user_id = $1 AND parent_user_id = $2`,
-      [targetUserId, superAgentUserId]
-    );
-
-    if (agentCheck.rowCount === 0) {
-      return res.status(403).json({ 
-        error: 'Access denied. Agent does not belong to you.' 
-      });
-    }
-
-    // Start transaction
-    await pool.query('BEGIN');
-
-    // Update user information (name, email)
-    if (updates.displayName || updates.email) {
-      const userUpdates: string[] = [];
-      const userValues: any[] = [];
-      let userValueIndex = 1;
-
-      if (updates.displayName) {
-        userUpdates.push(`name = $${userValueIndex}`);
-        userValues.push(updates.displayName);
-        userValueIndex++;
-      }
-
-      if (updates.email) {
-        userUpdates.push(`email = $${userValueIndex}`);
-        userValues.push(updates.email);
-        userValueIndex++;
-      }
-
-      userValues.push(targetUserId);
-
-      await pool.query(
-        `UPDATE public.users 
-         SET ${userUpdates.join(', ')} 
-         WHERE user_id = $${userValueIndex}`,
-        userValues
-      );
-    }
-
-    // Update agent-specific information
-    if (
-      updates.commission_rate !== undefined || 
-      updates.territory !== undefined || 
-      updates.agent_code !== undefined ||
-      updates.target_monthly_registrations !== undefined ||
-      updates.target_monthly_sales !== undefined ||
-      updates.performance_score !== undefined
-    ) {
-      // First, check if agent record exists
-      const agentExists = await pool.query(
-        'SELECT user_id FROM public.agents WHERE user_id = $1',
-        [targetUserId]
-      );
-
-      if (agentExists && agentExists.rowCount && agentExists.rowCount > 0) {
-        // Update existing agent record
-        const agentUpdates: string[] = [];
-        const agentValues: any[] = [];
-        let agentValueIndex = 1;
-
-        if (updates.commission_rate !== undefined) {
-          agentUpdates.push(`commission_rate = $${agentValueIndex}`);
-          agentValues.push(updates.commission_rate);
-          agentValueIndex++;
-        }
-
-        if (updates.territory !== undefined) {
-          agentUpdates.push(`territory = $${agentValueIndex}`);
-          agentValues.push(updates.territory);
-          agentValueIndex++;
-        }
-
-        if (updates.agent_code !== undefined) {
-          agentUpdates.push(`agent_code = $${agentValueIndex}`);
-          agentValues.push(updates.agent_code);
-          agentValueIndex++;
-        }
-
-        if (updates.target_monthly_registrations !== undefined) {
-          agentUpdates.push(`target_monthly_registrations = $${agentValueIndex}`);
-          agentValues.push(updates.target_monthly_registrations);
-          agentValueIndex++;
-        }
-
-        if (updates.target_monthly_sales !== undefined) {
-          agentUpdates.push(`target_monthly_sales = $${agentValueIndex}`);
-          agentValues.push(updates.target_monthly_sales);
-          agentValueIndex++;
-        }
-
-        if (updates.performance_score !== undefined) {
-          agentUpdates.push(`performance_score = $${agentValueIndex}`);
-          agentValues.push(updates.performance_score);
-          agentValueIndex++;
-        }
-
-        // Don't update parent_user_id as it should remain unchanged
-        agentValues.push(targetUserId);
-
-        if (agentUpdates.length > 0) {
-          await pool.query(
-            `UPDATE public.agents 
-             SET ${agentUpdates.join(', ')} 
-             WHERE user_id = $${agentValueIndex}`,
-            agentValues
-          );
-        }
-      } else {
-        // Insert new agent record - but we need to get the parent_user_id
-        // The parent_user_id should be the superAgentUserId
-        const agentFields: string[] = ['user_id', 'parent_user_id'];
-        const agentValues: any[] = [targetUserId, superAgentUserId];
-        let agentValueIndex = 3; // Starting from 3 since we already have 2 values
-
-        if (updates.commission_rate !== undefined) {
-          agentFields.push('commission_rate');
-          agentValues.push(updates.commission_rate);
-          agentValueIndex++;
-        }
-
-        if (updates.territory !== undefined) {
-          agentFields.push('territory');
-          agentValues.push(updates.territory);
-          agentValueIndex++;
-        }
-
-        if (updates.agent_code !== undefined) {
-          agentFields.push('agent_code');
-          agentValues.push(updates.agent_code);
-          agentValueIndex++;
-        }
-
-        if (updates.target_monthly_registrations !== undefined) {
-          agentFields.push('target_monthly_registrations');
-          agentValues.push(updates.target_monthly_registrations);
-          agentValueIndex++;
-        }
-
-        if (updates.target_monthly_sales !== undefined) {
-          agentFields.push('target_monthly_sales');
-          agentValues.push(updates.target_monthly_sales);
-          agentValueIndex++;
-        }
-
-        if (updates.performance_score !== undefined) {
-          agentFields.push('performance_score');
-          agentValues.push(updates.performance_score);
-          agentValueIndex++;
-        }
-
-        const placeholders = agentValues.map((_, i) => `$${i + 1}`).join(', ');
-        
-        await pool.query(
-          `INSERT INTO public.agents (${agentFields.join(', ')}) 
-           VALUES (${placeholders})`,
-          agentValues
-        );
-      }
-    }
-
-    // Commit transaction
-    await pool.query('COMMIT');
-
-    res.json({ message: 'Agent updated successfully' });
-  } catch (error: unknown) {
-    // Rollback transaction on error
-    await pool.query('ROLLBACK');
-    console.error('Error updating agent:', error);
-    res.status(500).json({ 
-      error: 'Failed to update agent.', 
-      detail: error instanceof Error ? error.message : String(error) 
-    });
-  }
-});
-
-// DELETE AGENT ENDPOINT
-app.delete('/api/agents/:user_id', authMiddleware, async (req: Request, res: Response) => {
-  const superAgentUserId = req.user!.user_id; // ID of the logged-in Super Agent
-  const targetUserId = req.params.user_id; // User ID of the agent to delete
-
-  try {
-    // Verify that the agent belongs to this super agent
-    const agentCheck = await pool.query(
-      `SELECT 1 FROM public.users 
-       WHERE user_id = $1 AND parent_user_id = $2`,
-      [targetUserId, superAgentUserId]
-    );
-
-    if (agentCheck.rowCount === 0) {
-      return res.status(403).json({ 
-        error: 'Access denied. Agent does not belong to you.' 
-      });
-    }
-
-    // Start transaction
-    await pool.query('BEGIN');
-
-    // Delete from agents table first (foreign key constraint)
-    await pool.query('DELETE FROM public.agents WHERE user_id = $1', [targetUserId]);
-
-    // Delete from user_roles table
-    await pool.query('DELETE FROM public.user_roles WHERE user_id = $1', [targetUserId]);
-
-    // Delete from users table
-    await pool.query('DELETE FROM public.users WHERE user_id = $1', [targetUserId]);
-
-    // Commit transaction
-    await pool.query('COMMIT');
-
-    res.json({ message: 'Agent deleted successfully' });
-  } catch (error: unknown) {
-    // Rollback transaction on error
-    await pool.query('ROLLBACK');
-    console.error('Error deleting agent:', error);
-    res.status(500).json({ 
-      error: 'Failed to delete agent.', 
-      detail: error instanceof Error ? error.message : String(error) 
-    });
-  }
-});
-// server.ts or your routes file
-// server.ts or your routes file
-// GET /api/super-agent/dashboard/stats - Fetch dashboard statistics for the super agent
-// server.ts or your routes file
-// GET /api/super-agent/dashboard/stats - Fetch dashboard statistics for the super agent
-app.get('/api/super-agent/dashboard/stats', authMiddleware, async (req: Request, res: Response) => {
-  // Use req.user!.user_id to get the ID of the currently logged-in Super Agent
-  const superAgentUserId = req.user!.user_id;
-
-  if (!superAgentUserId) {
-      return res.status(401).json({ error: 'Unauthorized: Super Agent User ID not found.' });
-  }
-
-  try {
-    // --- Fetch Dashboard Statistics ---
-
-    // 1. Total Agents (users with role 'agent' and parent_user_id = superAgentUserId)
-    // Using LOWER for case-insensitive comparison as per previous discussions
-    const agentCountResult = await pool.query(
-      `SELECT COUNT(*) AS count FROM public.users u
-       JOIN public.user_roles ur ON u.user_id = ur.user_id
-       WHERE u.parent_user_id = $1 AND LOWER(ur.role) = 'agent'`,
-      [superAgentUserId]
-    );
-    const totalAgents = parseInt(agentCountResult.rows[0]?.count || '0', 10);
-
-    // 2. Total Registrations (applications where parent_user_id = superAgentUserId)
-    // Using the newly added parent_user_id column for efficient lookup
-    const regCountResult = await pool.query(
-       `SELECT COUNT(*) AS count FROM public.applications a
-        WHERE a.parent_user_id = $1`,
-       [superAgentUserId]
-    );
-    const totalRegistrations = parseInt(regCountResult.rows[0]?.count || '0', 10);
-
-    // 3. Total Successful Payments
-    // Based on sales table schema: Any record with a payment_type is considered an attempt.
-    // Adjust condition if you have a stricter definition (e.g., exclude certain types or check amounts).
-    const successfulPaymentsResult = await pool.query(
-       `SELECT COUNT(*) AS count FROM public.sales s
-        JOIN public.users u ON s.teller_id = u.user_id
-        WHERE u.parent_user_id = $1 AND s.payment_type IN ('Cash', 'Bank', 'Credit')`, // Use payment_type
-       [superAgentUserId]
-    );
-    const totalSuccessfulPayments = parseInt(successfulPaymentsResult.rows[0]?.count || '0', 10);
-
-    // 4. Total Commission Earned
-    // Example: Calculate 5% commission on total_amount for successful sales.
-    // Adjust calculation logic and percentage as needed.
-    const commissionResult = await pool.query(
-       `SELECT COALESCE(SUM(s.total_amount * 0.05), 0)::numeric(14, 2) AS total_commission FROM public.sales s
-        JOIN public.users u ON s.teller_id = u.user_id
-        WHERE u.parent_user_id = $1 AND s.payment_type IN ('Cash', 'Bank', 'Credit')`, // Use payment_type
-       [superAgentUserId]
-    );
-    const totalCommissionEarned = parseFloat(commissionResult.rows[0]?.total_commission || '0');
-
-    // 5. Pending Payments
-    // Example logic: Credit sales with remaining amount.
-    // Adjust based on your business definition of "pending".
-    const pendingPaymentsResult = await pool.query(
-       `SELECT COUNT(*) AS count FROM public.sales s
-        JOIN public.users u ON s.teller_id = u.user_id
-        WHERE u.parent_user_id = $1 AND s.payment_type = 'Credit' AND COALESCE(s.remaining_credit_amount, 0) > 0`,
-       [superAgentUserId]
-    );
-    const totalPendingPayments = parseInt(pendingPaymentsResult.rows[0]?.count || '0', 10);
-
-    // 6. Failed Payments
-    // The sales table doesn't explicitly track failed payments.
-    // Placeholder query that returns 0. You need to define what constitutes "failed"
-    // based on your application logic (e.g., separate table, specific flags).
-    const failedPaymentsResult = await pool.query(
-       `SELECT COUNT(*) AS count FROM public.sales s
-        JOIN public.users u ON s.teller_id = u.user_id
-        WHERE u.parent_user_id = $1 AND 1=0`, // Always false, returns 0 count
-       [superAgentUserId]
-    );
-    const totalFailedPayments = parseInt(failedPaymentsResult.rows[0]?.count || '0', 10);
-
-    // --- End Fetching Statistics ---
-
-    res.json({
-      totalAgents,
-      totalRegistrations,
-      totalSuccessfulPayments,
-      totalPendingPayments,
-      totalFailedPayments,
-      totalCommissionEarned,
-      // ... other stats
-    });
-  } catch (error: unknown) {
-    console.error('Error fetching super agent dashboard stats:', error);
     res.status(500).json({
-      error: 'Failed to fetch dashboard statistics.',
+      error: 'Failed to fetch agents.',
       detail: error instanceof Error ? error.message : String(error),
     });
   }
@@ -13908,117 +14005,382 @@ app.get('/api/super-agent/dashboard/stats', authMiddleware, async (req: Request,
 
 
 
-// GET /api/super-agent/dashboard/chart-data - Fetch chart data for the super agent dashboard
-app.get('/api/super-agent/dashboard/chart-data', authMiddleware, async (req: Request, res: Response) => {
-  // Use req.user!.user_id to get the ID of the currently logged-in Super Agent
+// EDIT/UPDATE AGENT ENDPOINT (hardened)
+app.patch('/api/agents/:user_id', authMiddleware, async (req: Request, res: Response) => {
   const superAgentUserId = req.user!.user_id;
-  const period = req.query.period as string | undefined;
+  const targetUserId     = req.params.user_id;
 
-  if (!superAgentUserId) {
-      return res.status(401).json({ error: 'Unauthorized: Super Agent User ID not found.' });
+  const updates = req.body as Partial<{
+    displayName: string;
+    email: string;
+    commission_rate: number | null; // fraction preferred; % auto-converted
+    territory: string | null;
+    agent_code: string | null;
+    target_monthly_registrations: number | null;
+    target_monthly_sales: number | null;
+    performance_score: number | null;
+  }>;
+
+  // normalize commission_rate to fraction if it's > 1
+  const toFraction = (v: any) =>
+    typeof v === 'number' && v > 1 ? v / 100 : v;
+
+  // normalize agent_code
+  let normalizedAgentCode: string | null | undefined = updates.agent_code;
+  if (typeof updates.agent_code === 'string') {
+    const t = updates.agent_code.trim();
+    normalizedAgentCode = t.length ? t.toUpperCase() : null;
   }
 
-  // Validate period parameter if needed (e.g., only allow 'last_5_months')
-  if (period !== 'last_5_months') { // Example validation
-     // You could also provide a default or handle other periods
-     return res.status(400).json({ error: 'Invalid or unsupported period parameter.' });
-  }
-
+  const client = await pool.connect();
   try {
-    // --- Logic to fetch and aggregate chart data ---
-
-    // Dynamically calculate the last 5 months labels
-    const last5MonthsLabels: string[] = [];
-    const now = new Date();
-    for (let i = 4; i >= 0; i--) {
-      const monthDate = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      // Format to short month name (e.g., "Oct")
-      last5MonthsLabels.push(monthDate.toLocaleString('default', { month: 'short' }));
+    // team ownership
+    const belongs = await client.query(
+      `SELECT 1 FROM public.users WHERE user_id = $1 AND parent_user_id = $2`,
+      [targetUserId, superAgentUserId]
+    );
+    if (!belongs.rowCount) {
+      return res.status(403).json({ error: 'Access denied. Agent does not belong to you.' });
     }
 
-    // Initialize data arrays
-    const monthlyRegistrations: number[] = new Array(5).fill(0);
-    const monthlyPayments: number[] = new Array(5).fill(0); // Initialize with 5 elements
+    await client.query('BEGIN');
 
-    // --- Fetch and Aggregate Data ---
+    // agent_code uniqueness within team (if provided)
+    if (typeof normalizedAgentCode === 'string' && normalizedAgentCode) {
+      const dupe = await client.query(
+        `
+        SELECT 1
+        FROM public.agents a
+        JOIN public.users u ON u.user_id = a.user_id
+        WHERE u.parent_user_id = $1
+          AND LOWER(a.agent_code) = LOWER($2)
+          AND a.user_id <> $3
+        `,
+        [superAgentUserId, normalizedAgentCode, targetUserId]
+      );
+      if (dupe.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Conflict: agent_code already in use in your team.' });
+      }
+    }
 
-    // 1. Fetch Registration Data (Grouped by Month)
-    // Using the parent_user_id column in applications
-    const regTrendQuery = `
+    // update public.users
+    const uParts: string[] = [];
+    const uVals: any[] = [];
+    let ui = 1;
+
+    if (typeof updates.displayName === 'string') {
+      uParts.push(`name = $${ui++}`); uVals.push(updates.displayName.trim());
+    }
+    if (typeof updates.email === 'string') {
+      uParts.push(`email = $${ui++}`); uVals.push(updates.email.trim());
+    }
+    if (uParts.length) {
+      uVals.push(targetUserId);
+      await client.query(
+        `UPDATE public.users SET ${uParts.join(', ')}, updated_at = NOW() WHERE user_id = $${ui}`,
+        uVals
+      );
+    }
+
+    // upsert public.agents
+    const exists = await client.query(`SELECT 1 FROM public.agents WHERE user_id = $1`, [targetUserId]);
+
+    if (exists.rowCount) {
+      const aParts: string[] = [];
+      const aVals: any[] = [];
+      let ai = 1;
+
+      if (updates.commission_rate !== undefined) { aParts.push(`commission_rate = $${ai++}`); aVals.push(toFraction(updates.commission_rate)); }
+      if (updates.territory !== undefined)       { aParts.push(`territory = $${ai++}`);       aVals.push(updates.territory); }
+      if (normalizedAgentCode !== undefined)     { aParts.push(`agent_code = $${ai++}`);     aVals.push(normalizedAgentCode); }
+      if (updates.target_monthly_registrations !== undefined) { aParts.push(`target_monthly_registrations = $${ai++}`); aVals.push(updates.target_monthly_registrations); }
+      if (updates.target_monthly_sales !== undefined)         { aParts.push(`target_monthly_sales = $${ai++}`);         aVals.push(updates.target_monthly_sales); }
+      if (updates.performance_score !== undefined)            { aParts.push(`performance_score = $${ai++}`);            aVals.push(updates.performance_score); }
+
+      if (aParts.length) {
+        aVals.push(targetUserId);
+        await client.query(
+          `UPDATE public.agents SET ${aParts.join(', ')}, updated_at = NOW() WHERE user_id = $${ai}`,
+          aVals
+        );
+      }
+    } else {
+      const cols = ['user_id', 'parent_user_id'];
+      const vals: any[] = [targetUserId, superAgentUserId];
+
+      if (updates.commission_rate !== undefined)                { cols.push('commission_rate');                vals.push(toFraction(updates.commission_rate)); }
+      if (updates.territory !== undefined)                      { cols.push('territory');                      vals.push(updates.territory); }
+      if (normalizedAgentCode !== undefined)                    { cols.push('agent_code');                     vals.push(normalizedAgentCode); }
+      if (updates.target_monthly_registrations !== undefined)   { cols.push('target_monthly_registrations');   vals.push(updates.target_monthly_registrations); }
+      if (updates.target_monthly_sales !== undefined)           { cols.push('target_monthly_sales');           vals.push(updates.target_monthly_sales); }
+      if (updates.performance_score !== undefined)              { cols.push('performance_score');              vals.push(updates.performance_score); }
+
+      const ph = vals.map((_, i) => `$${i + 1}`).join(', ');
+      await client.query(
+        `INSERT INTO public.agents (${cols.join(', ')}) VALUES (${ph})`,
+        vals
+      );
+    }
+
+    await client.query('COMMIT');
+
+    const out = await client.query(
+      `
       SELECT
-        EXTRACT(MONTH FROM a.created_at) as month_num,
-        EXTRACT(YEAR FROM a.created_at) as year_num,
-        COUNT(*) as count
-      FROM public.applications a
-      WHERE a.parent_user_id = $1
-        AND a.created_at >= CURRENT_DATE - INTERVAL '5 months'
-      GROUP BY year_num, month_num
-      ORDER BY year_num, month_num
-    `;
-    const regTrendResult = await pool.query(regTrendQuery, [superAgentUserId]);
+        u.user_id,
+        u.name AS display_name,
+        u.email,
+        a.agent_code,
+        a.territory,
+        a.commission_rate,
+        a.target_monthly_registrations,
+        a.target_monthly_sales,
+        a.performance_score,
+        a.is_active
+      FROM public.users u
+      LEFT JOIN public.agents a ON a.user_id = u.user_id
+      WHERE u.user_id = $1
+      `,
+      [targetUserId]
+    );
 
-    // Map registration results to the correct month index in our array
-    regTrendResult.rows.forEach(row => {
-        const dataYear = parseInt(row.year_num, 10);
-        const dataMonthZeroBased = parseInt(row.month_num, 10) - 1; // JS months are 0-based
-        const dataDate = new Date(dataYear, dataMonthZeroBased, 1);
+    res.json({ message: 'Agent updated successfully', agent: out.rows[0] });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
 
-        // Find the index in our last5MonthsLabels array
-        for (let i = 0; i < 5; i++) {
-            const labelDate = new Date(now.getFullYear(), now.getMonth() - (4 - i), 1);
-            if (dataDate.getFullYear() === labelDate.getFullYear() &&
-                dataDate.getMonth() === labelDate.getMonth()) {
-                monthlyRegistrations[i] = parseInt(row.count, 10);
-                break; // Found the month, exit the loop
-            }
-        }
+    if (error?.code === '23505') {
+      return res.status(409).json({
+        error: 'Conflict: agent_code already in use.',
+        detail: error.detail || 'Duplicate key value violates unique constraint on agent_code.',
+      });
+    }
+
+    console.error('Error updating agent:', error);
+    res.status(500).json({
+      error: 'Failed to update agent.',
+      detail: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    client.release();
+  }
+});
 
-    // 2. Fetch Payment Data (Grouped by Month)
-    // Example using 'sales' table with 'teller_id' and 'payment_type'
-    // Counts sales with any valid payment_type for the trend.
-    const paymentTrendQuery = `
-      SELECT
-        EXTRACT(MONTH FROM s.created_at) as month_num,
-        EXTRACT(YEAR FROM s.created_at) as year_num,
-        COUNT(*) as count -- Or SUM(total_amount) if you want total value
-      FROM public.sales s
-      JOIN public.users u ON s.teller_id = u.user_id -- Join to filter by agent hierarchy
+
+
+// DELETE AGENT ENDPOINT
+app.delete('/api/agents/:user_id', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id;
+  const targetUserId     = req.params.user_id;
+
+  const client = await pool.connect();
+  try {
+    const agentCheck = await client.query(
+      `SELECT 1 FROM public.users WHERE user_id = $1 AND parent_user_id = $2`,
+      [targetUserId, superAgentUserId]
+    );
+    if (!agentCheck.rowCount) {
+      return res.status(403).json({ error: 'Access denied. Agent does not belong to you.' });
+    }
+
+    await client.query('BEGIN');
+    await client.query(`UPDATE public.users  SET is_active = FALSE, updated_at = NOW() WHERE user_id = $1`, [targetUserId]);
+    await client.query(`UPDATE public.agents SET is_active = FALSE, updated_at = NOW() WHERE user_id = $1`, [targetUserId]);
+    await client.query('COMMIT');
+
+    res.json({ message: 'Agent marked inactive' });
+  } catch (error: unknown) {
+    await client.query('ROLLBACK');
+    console.error('Error deleting agent:', error);
+    res.status(500).json({
+      error: 'Failed to delete agent.',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// server.ts or your routes file
+
+// GET /api/super-agent/dashboard/stats - Fetch dashboard statistics for the super agent
+// GET /api/super-agent/dashboard/stats?month=YYYY-MM
+app.get('/api/super-agent/dashboard/stats', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id;
+  const monthQ = String(req.query.month || '');
+
+  if (!superAgentUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const now = new Date();
+  const [y, m] = monthQ && /^\d{4}-\d{2}$/.test(monthQ)
+    ? monthQ.split('-').map(Number)
+    : [now.getUTCFullYear(), now.getUTCMonth() + 1];
+
+  const startOfMonth = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0));
+  const startOfNext  = new Date(Date.UTC(y, m, 1, 0, 0, 0));
+
+  const client = await pool.connect();
+  try {
+    // 1) team base (agents under this super agent)
+    const base = await client.query(`
+      SELECT 
+        u.user_id,
+        LOWER(u.name)                      AS agent_name_lc,
+        LOWER(COALESCE(a.agent_code, ''))  AS agent_code_lc,
+        COALESCE(a.commission_rate, 0.10)  AS commission_rate
+      FROM public.users u
+      JOIN public.user_roles ur ON ur.user_id = u.user_id AND LOWER(ur.role) = 'agent'
+      LEFT JOIN public.agents a ON a.user_id = u.user_id
       WHERE u.parent_user_id = $1
-        AND s.payment_type IN ('Cash', 'Bank', 'Credit') -- Use payment_type
-        AND s.created_at >= CURRENT_DATE - INTERVAL '5 months'
-      GROUP BY year_num, month_num
-      ORDER BY year_num, month_num
-    `;
-    const paymentTrendResult = await pool.query(paymentTrendQuery, [superAgentUserId]);
+    `, [superAgentUserId]);
 
-     // Map payment results to the correct month index in our array
-    paymentTrendResult.rows.forEach(row => {
-        const dataYear = parseInt(row.year_num, 10);
-        const dataMonthZeroBased = parseInt(row.month_num, 10) - 1; // JS months are 0-based
-        const dataDate = new Date(dataYear, dataMonthZeroBased, 1);
+    const team = base.rows;
+    const totalAgents = team.length;
 
-        // Find the index in our last5MonthsLabels array
-        for (let i = 0; i < 5; i++) {
-            const labelDate = new Date(now.getFullYear(), now.getMonth() - (4 - i), 1);
-            if (dataDate.getFullYear() === labelDate.getFullYear() &&
-                dataDate.getMonth() === labelDate.getMonth()) {
-                monthlyPayments[i] = parseInt(row.count, 10); // Or parseFloat for SUM(total_amount)
-                break; // Found the month, exit the loop
-            }
-        }
+    // short-circuit when no agents
+    if (!totalAgents) {
+      return res.json({
+        totalAgents: 0,
+        totalRegistrations: 0,
+        totalSuccessfulPayments: 0,
+        totalPendingPayments: 0,
+        totalFailedPayments: 0,
+        totalCommissionEarned: 0,
+      });
+    }
+
+    // 2) total registrations in month (apps tied to agents’ user_id)
+    const regs = await client.query(`
+      SELECT COUNT(*) AS cnt
+      FROM public.applications a
+      WHERE a.user_id IN (
+        SELECT u.user_id FROM public.users u 
+        JOIN public.user_roles ur ON ur.user_id=u.user_id AND LOWER(ur.role)='agent'
+        WHERE u.parent_user_id = $1
+      )
+      AND a.created_at >= $2::timestamptz AND a.created_at < $3::timestamptz
+    `, [superAgentUserId, startOfMonth.toISOString(), startOfNext.toISOString()]);
+    const totalRegistrations = parseInt(regs.rows[0]?.cnt || '0', 10);
+
+    // 3) sales (guarded teller/branch matching) aggregated for ALL agents in month
+    const salesAgg = await client.query(`
+      WITH base AS (
+        SELECT 
+          u.user_id AS agent_user_id,
+          LOWER(u.name) AS agent_name_lc,
+          LOWER(COALESCE(a.agent_code,'')) AS agent_code_lc,
+          COALESCE(a.commission_rate, 0.10) AS commission_rate
+        FROM public.users u
+        JOIN public.user_roles ur ON ur.user_id = u.user_id AND LOWER(ur.role) = 'agent'
+        LEFT JOIN public.agents a ON a.user_id = u.user_id
+        WHERE u.parent_user_id = $1
+      ),
+      joined AS (
+        SELECT 
+          b.agent_user_id,
+          b.commission_rate,
+          s.total_amount,
+          s.payment_type,
+          s.remaining_credit_amount
+        FROM base b
+        JOIN public.sales s
+          ON (
+            s.teller_id = b.agent_user_id
+            OR (b.agent_code_lc <> '' AND LOWER(COALESCE(s.branch,'')) = b.agent_code_lc)
+            OR (b.agent_name_lc <> '' AND LOWER(COALESCE(s.branch,'')) = b.agent_name_lc)
+          )
+         AND s.created_at >= $2::timestamptz
+         AND s.created_at <  $3::timestamptz
+         AND s.payment_type IN ('Cash','Bank','Credit')
+      )
+      SELECT
+        COUNT(*)                                   AS successful_count,
+        COUNT(*) FILTER (WHERE payment_type='Credit' AND COALESCE(remaining_credit_amount,0) > 0) AS pending_count,
+        COALESCE(SUM(total_amount * commission_rate), 0)::numeric(14,2) AS commission_sum
+      FROM joined
+    `, [superAgentUserId, startOfMonth.toISOString(), startOfNext.toISOString()]);
+
+    const totalSuccessfulPayments = parseInt(salesAgg.rows[0]?.successful_count || '0', 10);
+    const totalPendingPayments    = parseInt(salesAgg.rows[0]?.pending_count || '0', 10);
+    const totalCommissionEarned   = parseFloat(salesAgg.rows[0]?.commission_sum || '0');
+
+    // No tracking of failed yet -> 0
+    res.json({
+      totalAgents,
+      totalRegistrations,
+      totalSuccessfulPayments,
+      totalPendingPayments,
+      totalFailedPayments: 0,
+      totalCommissionEarned,
     });
+  } catch (err) {
+    console.error('Error fetching dashboard stats:', err);
+    res.status(500).json({ error: 'Failed to fetch dashboard statistics.' });
+  } finally {
+    client.release();
+  }
+});
 
-    // --- Format data for the frontend ---
-    // Combine labels with data points
-    const chartDataFormatted: { month: string; registrations: number; payments: number }[] = last5MonthsLabels.map((label, index) => ({
-      month: label,
-      registrations: monthlyRegistrations[index] || 0,
-      payments: monthlyPayments[index] || 0,
+
+
+
+
+// GET /api/super-agent/dashboard/chart-data - Fetch chart data for the super agent dashboard
+app.get('/api/super-agent/dashboard/chart-data', authMiddleware, async (req: Request, res: Response) => {
+  const superAgentUserId = req.user!.user_id;
+  const period = String(req.query.period || 'last_5_months');
+  if (!superAgentUserId) return res.status(401).json({ error: 'Unauthorized' });
+  if (period !== 'last_5_months') return res.status(400).json({ error: 'Invalid or unsupported period parameter.' });
+
+  try {
+    const now = new Date();
+    // labels for the last 5 months including current
+    const labels: string[] = [];
+    const window: { start: Date; end: Date }[] = [];
+    for (let i = 4; i >= 0; i--) {
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+      const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0));
+      const end   = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1, 0, 0, 0));
+      labels.push(start.toLocaleString('en-ZA', { month: 'short' }));
+      window.push({ start, end });
+    }
+
+    const registrations: number[] = [];
+    const payments: number[] = [];
+
+    for (const { start, end } of window) {
+      // registrations
+      const r = await pool.query(
+        `SELECT COUNT(*) AS cnt
+         FROM public.applications a
+         WHERE a.parent_user_id = $1
+           AND a.created_at >= $2::timestamptz
+           AND a.created_at <  $3::timestamptz`,
+        [superAgentUserId, start.toISOString(), end.toISOString()]
+      );
+      registrations.push(parseInt(r.rows[0]?.cnt || '0', 10));
+
+      // payments (count of sales with valid payment_type)
+      const p = await pool.query(
+        `SELECT COUNT(*) AS cnt
+         FROM public.sales s
+         JOIN public.users u ON u.user_id = s.teller_id
+         WHERE u.parent_user_id = $1
+           AND s.payment_type IN ('Cash','Bank','Credit')
+           AND s.created_at >= $2::timestamptz
+           AND s.created_at <  $3::timestamptz`,
+        [superAgentUserId, start.toISOString(), end.toISOString()]
+      );
+      payments.push(parseInt(p.rows[0]?.cnt || '0', 10));
+    }
+
+    const payload = labels.map((month, i) => ({
+      month,
+      registrations: registrations[i] || 0,
+      payments: payments[i] || 0,
     }));
 
-    // --- End Logic ---
-    res.json(chartDataFormatted);
+    res.json(payload);
   } catch (error: unknown) {
     console.error('Error fetching super agent dashboard chart data:', error);
     res.status(500).json({
@@ -14027,6 +14389,7 @@ app.get('/api/super-agent/dashboard/chart-data', authMiddleware, async (req: Req
     });
   }
 });
+
 
 app.get('/api/clients', authMiddleware, async (req: Request, res: Response) => {
   // Query params
